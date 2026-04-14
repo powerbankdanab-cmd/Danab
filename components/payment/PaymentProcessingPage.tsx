@@ -90,6 +90,10 @@ export function PaymentProcessingPage() {
     () => normalizePhone(searchParams.get("phone") || ""),
     [searchParams],
   );
+  const stationCode = useMemo(
+    () => normalizePhone(searchParams.get("stationCode") || ""),
+    [searchParams],
+  );
 
   const [status, setStatus] = useState<PaymentStatus>("processing");
   const [processingStep, setProcessingStep] =
@@ -169,6 +173,7 @@ export function PaymentProcessingPage() {
             phoneNumber,
             amount,
             method,
+            stationCode,
           }),
         }).finally(() => {
           window.clearTimeout(requestTimeout);
@@ -247,7 +252,7 @@ export function PaymentProcessingPage() {
       cancelled = true;
       clearPaymentAbort();
     };
-  }, [amount, method, phoneNumber]);
+  }, [amount, method, phoneNumber, stationCode]);
 
   const activeStepIndex = PROCESSING_STEPS.findIndex(
     (step) => step.key === processingStep,

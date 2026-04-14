@@ -51,6 +51,19 @@ function getStationBaseDomain() {
   return hostname;
 }
 
+function buildStationHref(stationId: number, baseDomain: string) {
+  if (typeof window === "undefined") {
+    return `https://station${stationId}.${baseDomain}`;
+  }
+
+  const hostname = window.location.hostname.toLowerCase();
+  if (hostname === "localhost" || hostname.endsWith(".vercel.app")) {
+    return `/station?stationCode=${stationId}`;
+  }
+
+  return `https://station${stationId}.${baseDomain}`;
+}
+
 export function Stations() {
   const baseDomain = getStationBaseDomain();
 
@@ -74,9 +87,9 @@ export function Stations() {
           {STATIONS.map((station) => (
             <a
               key={station.id}
-              href={`https://station${station.id}.${baseDomain}`}
-              target="_blank"
-              rel="noopener noreferrer"
+              href={buildStationHref(station.id, baseDomain)}
+              target={buildStationHref(station.id, baseDomain).startsWith("http") ? "_blank" : undefined}
+              rel={buildStationHref(station.id, baseDomain).startsWith("http") ? "noopener noreferrer" : undefined}
               className="group flex items-center gap-4 rounded-2xl border border-gray-100 bg-gray-50 p-5 shadow-sm transition-all hover:border-pink-200 hover:bg-pink-50 hover:shadow-md"
             >
               <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-pink-500 to-purple-600 text-sm font-black text-white shadow-md">
