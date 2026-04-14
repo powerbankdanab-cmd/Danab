@@ -4,36 +4,56 @@ const STATIONS = [
   {
     id: 58,
     name: "Cafe Castello Taleex",
-    url: "https://station58.danab.site",
     area: "Taleex",
   },
   {
     id: 59,
     name: "Feynuus Bowling",
-    url: "https://station59.danab.site",
     area: "Mogadishu",
   },
   {
     id: 60,
     name: "Java Taleex",
-    url: "https://station60.danab.site",
     area: "Taleex",
   },
   {
     id: 61,
     name: "Delik Somalia",
-    url: "https://station61.danab.site",
     area: "Mogadishu",
   },
   {
     id: 62,
     name: "Arena cafe Mogadishu",
-    url: "https://station62.danab.site",
     area: "Mogadishu",
   },
 ];
 
+function getStationBaseDomain() {
+  if (typeof window === "undefined") {
+    return "danab.com";
+  }
+
+  const hostname = window.location.hostname.toLowerCase();
+
+  if (hostname === "localhost" || hostname.endsWith(".vercel.app")) {
+    return "danab.com";
+  }
+
+  if (hostname.startsWith("www.")) {
+    return hostname.slice(4);
+  }
+
+  const parts = hostname.split(".");
+  if (parts.length >= 3 && /^station\d+$/i.test(parts[0])) {
+    return parts.slice(1).join(".");
+  }
+
+  return hostname;
+}
+
 export function Stations() {
+  const baseDomain = getStationBaseDomain();
+
   return (
     <section id="stations" className="bg-white px-4 py-20 sm:px-6 lg:px-8">
       <div className="mx-auto max-w-5xl">
@@ -54,7 +74,7 @@ export function Stations() {
           {STATIONS.map((station) => (
             <a
               key={station.id}
-              href={station.url}
+              href={`https://station${station.id}.${baseDomain}`}
               target="_blank"
               rel="noopener noreferrer"
               className="group flex items-center gap-4 rounded-2xl border border-gray-100 bg-gray-50 p-5 shadow-sm transition-all hover:border-pink-200 hover:bg-pink-50 hover:shadow-md"
