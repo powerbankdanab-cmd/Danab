@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 180" fill="none">
+  <polygon points="155,5 125,75 145,75 137,125 175,50 153,50 165,5" fill="#32CD32"/>
+  <text x="15" y="105" font-family="Arial,Helvetica,sans-serif" font-weight="900" font-size="58" fill="#6C2BD9" letter-spacing="2">DA</text>
+  <text x="175" y="105" font-family="Arial,Helvetica,sans-serif" font-weight="900" font-size="58" fill="#6C2BD9" letter-spacing="2">AB</text>
+  <text x="70" y="135" font-family="Arial,Helvetica,sans-serif" font-weight="600" font-size="16" fill="#32CD32">Powerbank</text>
+  <rect x="147" y="118" width="16" height="22" rx="3" stroke="#ccc" stroke-width="1.5" fill="none"/>
+  <path d="M153,124 l-2,5 h3 l-2,5" stroke="#32CD32" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <text x="170" y="135" font-family="Arial,Helvetica,sans-serif" font-weight="600" font-size="16" fill="#32CD32">Station</text>
+</svg>
