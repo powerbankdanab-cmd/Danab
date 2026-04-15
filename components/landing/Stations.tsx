@@ -30,13 +30,13 @@ const STATIONS = [
 
 function getStationBaseDomain() {
   if (typeof window === "undefined") {
-    return "danab.com";
+    return "danab.site";
   }
 
   const hostname = window.location.hostname.toLowerCase();
 
   if (hostname === "localhost" || hostname.endsWith(".vercel.app")) {
-    return "danab.com";
+    return "danab.site";
   }
 
   if (hostname.startsWith("www.")) {
