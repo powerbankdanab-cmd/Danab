@@ -19,7 +19,7 @@ export function Hero() {
           Never Run Out
           <br />
           <span className="bg-gradient-to-r from-pink-200 to-white bg-clip-text text-transparent">
-            of Battery Again abdi one
+            of Battery Again
           </span>
         </h1>
 
