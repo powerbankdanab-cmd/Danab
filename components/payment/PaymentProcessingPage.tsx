@@ -149,8 +149,8 @@ export function PaymentProcessingPage() {
       let requestTimedOut = false;
 
       try {
-        // Step 1: Verify — show for 2 seconds
-        await wait(2000);
+        // Step 1: Verify — minimal wait for UI state transition
+        await wait(500);
         if (cancelled) return;
 
         // Step 2: Hold — request stays in-flight while backend runs
@@ -183,20 +183,20 @@ export function PaymentProcessingPage() {
 
         if (cancelled) return;
 
-        // Show unlock/commit completion states after the backend finishes.
-        setProcessingStep("unlock");
-        setStatusMessage("Furaya battery-ga...");
-
-        await wait(900);
-        if (cancelled) return;
-
-        setProcessingStep("commit");
-        setStatusMessage("Xaqiijinaya lacagta ugu dambeysa...");
-
-        await wait(900);
-        if (cancelled) return;
-
         if (paymentRes.ok && paymentData.success) {
+          // Show unlock/commit completion states after the backend finishes.
+          setProcessingStep("unlock");
+          setStatusMessage("Furaya battery-ga...");
+
+          await wait(400);
+          if (cancelled) return;
+
+          setProcessingStep("commit");
+          setStatusMessage("Xaqiijinaya lacagta ugu dambeysa...");
+
+          await wait(200);
+          if (cancelled) return;
+
           setStatus("success");
           setWaafiMessage(
             paymentData.waafiMessage ||

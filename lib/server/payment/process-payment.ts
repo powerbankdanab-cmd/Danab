@@ -37,8 +37,8 @@ import {
 } from "@/lib/server/payment/waafi";
 
 const MAX_UNLOCK_ATTEMPTS = 5;
-const UNLOCK_RETRY_DELAY_MS = 5_000;
-const UNLOCK_SUCCESS_VERIFY_DELAY_MS = 2_000;
+const UNLOCK_RETRY_DELAY_MS = 2_000;
+const UNLOCK_SUCCESS_VERIFY_DELAY_MS = 1_000;
 
 type BatteryPresence = "present" | "missing" | "unknown";
 
@@ -114,8 +114,6 @@ export async function processPayment(
     }
 
     // ── Atomic battery reservation ────────────────────────────────
-    // Try up to 3 different batteries in case another user reserves
-    // the first one between our query and our reservation attempt.
     const MAX_RESERVE_ATTEMPTS = 3;
     let battery = null;
 
@@ -129,20 +127,7 @@ export async function processPayment(
         phoneNumber,
       );
       if (reserved) {
-        const stillReady = await isSpecificBatteryReadyForRental({
-          imei,
-          batteryId: candidate.battery_id,
-          slotId: candidate.slot_id,
-        });
-
-        if (!stillReady) {
-          console.warn(
-            `Reserve attempt ${attempt + 1}: battery ${candidate.battery_id} is no longer ready before payment, trying next`,
-          );
-          await releaseReservation(imei, candidate.battery_id);
-          continue;
-        }
-
+        // Consolidated check: getAvailableBattery already verified readiness.
         battery = candidate;
         reservedBatteryId = candidate.battery_id;
         break;
@@ -182,10 +167,7 @@ export async function processPayment(
       preauthAudit.waafiConfirmedPhoneNumber.trim().length > 0
         ? preauthAudit.waafiConfirmedPhoneNumber.trim()
         : null;
-    // Keep the approved requested phone immutable for operations/calling.
-    // Waafi account data stays in dedicated audit fields because Purchase API
-    // may return a masked account string that is not safe to treat as the
-    // main customer phone number.
+    
     const canonicalPhoneNumber = phoneNumber;
     const phoneAuthority = waafiConfirmedPhoneNumber
       ? waafiConfirmedPhoneNumber === phoneNumber
@@ -200,27 +182,25 @@ export async function processPayment(
       );
     }
 
-    if (transactionId) {
-      const duplicate = await isDuplicateTransaction(transactionId);
-      if (duplicate) {
-        try {
-          await cancelWaafiPreauthorization({
-            transactionId,
-            description: "Duplicate preauthorization hold cancelled",
-          });
-        } catch (error) {
-          console.warn(
-            "Failed to cancel duplicate preauthorization hold:",
-            error instanceof Error ? error.message : error,
-          );
-        }
-
-        return {
-          success: true,
-          message: "Payment already processed",
+    const duplicate = await isDuplicateTransaction(transactionId);
+    if (duplicate) {
+      try {
+        await cancelWaafiPreauthorization({
           transactionId,
-        };
+          description: "Duplicate preauthorization hold cancelled",
+        });
+      } catch (error) {
+        console.warn(
+          "Failed to cancel duplicate preauthorization hold:",
+          error instanceof Error ? error.message : error,
+        );
       }
+
+      return {
+        success: true,
+        message: "Payment already processed",
+        transactionId,
+      };
     }
 
     let unlock: unknown = null;
@@ -283,7 +263,6 @@ export async function processPayment(
           unlock = null;
           break;
         }
-
       }
 
       if (attempt < MAX_UNLOCK_ATTEMPTS) {
