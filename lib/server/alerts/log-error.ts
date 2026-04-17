@@ -1,5 +1,8 @@
 import { getDb } from "@/lib/server/firebase-admin";
-import { sendWhatsAppAlert } from "@/lib/server/alerts/whatsapp";
+import {
+  sendWhatsAppAlertWithResult,
+  type WhatsAppAlertResult,
+} from "@/lib/server/alerts/whatsapp";
 
 export const CRITICAL_ERROR_TYPES = {
   VERIFICATION_FAILED: "VERIFICATION_FAILED",
@@ -21,6 +24,11 @@ export type LogErrorInput = {
   metadata?: Record<string, unknown>;
 };
 
+export type LogErrorResult = {
+  logged: boolean;
+  alertStatus: WhatsAppAlertResult | null;
+};
+
 function isCriticalErrorType(type: ErrorType): type is CriticalErrorType {
   return Object.values(CRITICAL_ERROR_TYPES).includes(type as CriticalErrorType);
 }
@@ -36,7 +44,8 @@ function formatAlert(input: LogErrorInput) {
   ].join("\n");
 }
 
-export async function logError(input: LogErrorInput): Promise<void> {
+export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
+  let logged = false;
   try {
     await getDb()
       .collection("errors")
@@ -49,6 +58,7 @@ export async function logError(input: LogErrorInput): Promise<void> {
         ...(input.metadata ? { metadata: input.metadata } : {}),
         createdAt: Date.now(),
       });
+    logged = true;
   } catch (error) {
     console.error(
       "Failed to write error log:",
@@ -57,16 +67,17 @@ export async function logError(input: LogErrorInput): Promise<void> {
   }
 
   if (!isCriticalErrorType(input.type)) {
-    return;
+    return { logged, alertStatus: null };
   }
 
   try {
-    await sendWhatsAppAlert(formatAlert(input));
+    const alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    return { logged, alertStatus };
   } catch (error) {
     console.error(
       "Failed to dispatch WhatsApp alert from error logger:",
       error instanceof Error ? error.message : error,
     );
+    return { logged, alertStatus: "failed" };
   }
 }
-

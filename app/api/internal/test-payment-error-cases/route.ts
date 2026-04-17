@@ -1,14 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { CRITICAL_ERROR_TYPES, logError } from "@/lib/server/alerts/log-error";
+import { validateInternalTestAccess } from "@/lib/server/alerts/internal-test-guard";
 
 export async function GET(request: NextRequest) {
+  const auth = validateInternalTestAccess(request);
+  if (!auth.allowed) {
+    const payload = { success: false, error: auth.error } as Record<string, unknown>;
+    if ("retryAfterSeconds" in auth) {
+      payload.retryAfterSeconds = auth.retryAfterSeconds;
+    }
+    return NextResponse.json(payload, { status: auth.status });
+  }
+
   const scenario = String(
     request.nextUrl.searchParams.get("case") || "",
   ).toLowerCase();
 
   if (scenario === "verification_failed") {
-    await logError({
+    const result = await logError({
       type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
       transactionId: "sim-tx-verification-failed",
       stationCode: "SIM-58",
@@ -23,11 +33,12 @@ export async function GET(request: NextRequest) {
       success: true,
       simulatedCase: "Force battery not eject",
       type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+      ...result,
     });
   }
 
   if (scenario === "capture_unknown") {
-    await logError({
+    const result = await logError({
       type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
       transactionId: "sim-tx-capture-unknown",
       stationCode: "SIM-59",
@@ -42,6 +53,7 @@ export async function GET(request: NextRequest) {
       success: true,
       simulatedCase: "Simulate capture timeout",
       type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
+      ...result,
     });
   }
 
@@ -54,4 +66,3 @@ export async function GET(request: NextRequest) {
     { status: 400 },
   );
 }
-
