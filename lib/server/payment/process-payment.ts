@@ -38,7 +38,7 @@ import {
 
 const MAX_UNLOCK_ATTEMPTS = 5;
 const UNLOCK_RETRY_DELAY_MS = 2_000;
-const UNLOCK_SUCCESS_VERIFY_DELAY_MS = 1_000;
+const UNLOCK_VERIFY_POLL_MS = [250, 350, 400] as const;
 
 type BatteryPresence = "present" | "missing" | "unknown";
 
@@ -67,6 +67,25 @@ async function checkBatteryPresence(
     );
     return "unknown";
   }
+}
+
+async function verifyEjectionAfterUnlock(
+  imei: string,
+  batteryId: string,
+  slotId: string,
+): Promise<BatteryPresence> {
+  for (const waitMs of UNLOCK_VERIFY_POLL_MS) {
+    await delay(waitMs);
+    const presence = await checkBatteryPresence(imei, batteryId, slotId);
+    if (presence === "missing") {
+      return "missing";
+    }
+    if (presence === "present") {
+      return "present";
+    }
+  }
+
+  return "unknown";
 }
 
 export async function processPayment(
@@ -221,8 +240,7 @@ export async function processPayment(
           slotId: currentBattery.slot_id,
         });
         unlockCommandAccepted = true;
-        await delay(UNLOCK_SUCCESS_VERIFY_DELAY_MS);
-        lastKnownPresence = await checkBatteryPresence(
+        lastKnownPresence = await verifyEjectionAfterUnlock(
           imei,
           currentBattery.battery_id,
           currentBattery.slot_id,
