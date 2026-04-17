@@ -26,6 +26,7 @@ import { getActiveStationCode, getStationImei } from "@/lib/server/payment/stati
 import { getStationConfigByCode } from "@/lib/server/station-config";
 import { notifyPaidButNotEjected } from "@/lib/server/payment/telegram";
 import { PaymentInput, PaymentPayload } from "@/lib/server/payment/types";
+import { CRITICAL_ERROR_TYPES, logError } from "@/lib/server/alerts/log-error";
 import {
   createOrGetPaymentTransaction,
   ensurePaymentTransactionState,
@@ -224,7 +225,29 @@ export async function processPayment(
   if (!txRecord.created) {
     if (txRecord.record.status === "captured") {
       if (!txRecord.record.rentalCreated) {
-        await reconcileTransactionById(txRecord.record.id);
+        try {
+          await reconcileTransactionById(txRecord.record.id);
+        } catch (error) {
+          await logError({
+            type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+            transactionId: txRecord.record.providerRef || txRecord.record.id,
+            stationCode,
+            phoneNumber,
+            message: "Failed to reconcile captured transaction on retry path",
+            metadata: {
+              idempotencyKey: txRecord.record.id,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          });
+
+          throw new HttpError(
+            502,
+            "Payment recovery failed while validating previous captured transaction.",
+            {
+              transactionId: txRecord.record.providerRef || txRecord.record.id,
+            },
+          );
+        }
         const refreshed = await getPaymentTransaction(txRecord.record.id);
         if (!refreshed?.rentalCreated) {
           throw new HttpError(
@@ -246,7 +269,29 @@ export async function processPayment(
     }
 
     if (txRecord.record.status === "capture_unknown") {
-      await reconcileTransactionById(txRecord.record.id);
+      try {
+        await reconcileTransactionById(txRecord.record.id);
+      } catch (error) {
+        await logError({
+          type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+          transactionId: txRecord.record.providerRef || txRecord.record.id,
+          stationCode,
+          phoneNumber,
+          message: "Failed to reconcile capture_unknown transaction on retry path",
+          metadata: {
+            idempotencyKey: txRecord.record.id,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        });
+
+        throw new HttpError(
+          502,
+          "Payment reconciliation failed. Please try again shortly or contact support.",
+          {
+            transactionId: txRecord.record.providerRef || txRecord.record.id,
+          },
+        );
+      }
       const refreshed = await getPaymentTransaction(txRecord.record.id);
       if (refreshed?.status === "captured" && refreshed.rentalCreated) {
         return {
@@ -557,6 +602,23 @@ export async function processPayment(
             ? `Unlock ${unlockCommandAccepted ? "verification" : "request"} failed after ${unlockAttempts} attempts, battery still present`
             : `Unlock ${unlockCommandAccepted ? "verification" : "request"} failed after ${unlockAttempts} attempts, slot status could not be rechecked`;
 
+        await logError({
+          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+          transactionId,
+          stationCode,
+          phoneNumber,
+          message: "Battery ejection could not be verified after unlock attempts",
+          metadata: {
+            imei,
+            batteryId: currentBattery.battery_id,
+            slotId: currentBattery.slot_id,
+            unlockAttempts,
+            unlockCommandAccepted,
+            lastKnownPresence,
+            failureNote,
+          },
+        });
+
         if (lastKnownPresence === "present") {
           try {
             await markProblemSlot(
@@ -680,6 +742,22 @@ export async function processPayment(
         },
       });
 
+      await logError({
+        type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
+        transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Waafi commit request failed after verified ejection",
+        metadata: {
+          idempotencyKey,
+          imei,
+          batteryId: currentBattery.battery_id,
+          slotId: currentBattery.slot_id,
+          unlockAttempts,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      });
+
       await notifyPaidButNotEjected({
         phoneNumber,
         amount,
@@ -716,6 +794,27 @@ export async function processPayment(
           failureReason:
             commitResponse.responseMsg ||
             "Waafi commit not approved after verified ejection",
+        },
+      });
+
+      await logError({
+        type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
+        transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Waafi commit response not approved after verified ejection",
+        metadata: {
+          idempotencyKey,
+          imei,
+          batteryId: currentBattery.battery_id,
+          slotId: currentBattery.slot_id,
+          unlockAttempts,
+          waafiResponseMsg: commitResponse.responseMsg || null,
+          waafiResponseCode:
+            commitResponse.responseCode !== undefined
+              ? String(commitResponse.responseCode)
+              : null,
+          waafiState: commitResponse.params?.state || null,
         },
       });
 
