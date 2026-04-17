@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { isHttpError, processPayment } from "@/lib/server/payment-service";
+import { reconcileTransactions } from "@/lib/server/payment/reconciliation";
 
 import { checkRateLimit } from "@/lib/server/rate-limit";
 
@@ -11,6 +12,7 @@ type PaymentRequestBody = {
 
   amount?: number;
   stationCode?: string;
+  idempotencyKey?: string;
 };
 
 function parseAndValidateBody(body: PaymentRequestBody) {
@@ -24,21 +26,34 @@ function parseAndValidateBody(body: PaymentRequestBody) {
     typeof body.stationCode === "string"
       ? body.stationCode.replace(/\D/g, "")
       : "";
+  const idempotencyKey =
+    typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
 
-  if (!phoneNumber || Number.isNaN(amount) || amount <= 0) {
-    return { error: "Missing phoneNumber or valid amount" } as const;
+  if (!phoneNumber || Number.isNaN(amount) || amount <= 0 || !idempotencyKey) {
+    return {
+      error: "Missing phoneNumber, valid amount, or idempotencyKey",
+    } as const;
   }
 
   return {
     phoneNumber,
     amount,
     ...(stationCode ? { stationCode } : {}),
+    idempotencyKey,
   } as const;
 }
 
 export const maxDuration = 300;
 
 export async function POST(request: NextRequest) {
+  // Opportunistic self-healing in case scheduled cron is delayed/down.
+  void reconcileTransactions(3).catch((error) => {
+    console.warn(
+      "Opportunistic reconciliation failed:",
+      error instanceof Error ? error.message : error,
+    );
+  });
+
   const clientIp = getClientIp(request);
 
   const rateLimitResult = checkRateLimit(`payment:${clientIp}`, {

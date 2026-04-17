@@ -27,6 +27,14 @@ const PAYMENT_FLOW_RESET_KEY = "caste:payment-flow-reset-home-form";
 const DEFAULT_AMOUNT = 0.75;
 const DEFAULT_METHOD: PaymentMethod = "EVC Plus";
 
+function createIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `pay_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function PaymentCard({
   darkMode,
   onToggleTheme,
@@ -105,10 +113,12 @@ export function PaymentCard({
     setIsSubmitting(true);
     window.sessionStorage.setItem(PAYMENT_FLOW_RESET_KEY, "1");
     const stationCode = getStationCode();
+    const idempotencyKey = createIdempotencyKey();
     const params = new URLSearchParams({
       phone: cleanPhone,
       amount: String(selectedAmount),
       method: selectedMethod,
+      idempotencyKey,
       ...(stationCode ? { stationCode } : {}),
     });
 

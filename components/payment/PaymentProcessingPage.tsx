@@ -94,6 +94,10 @@ export function PaymentProcessingPage() {
     () => normalizePhone(searchParams.get("stationCode") || ""),
     [searchParams],
   );
+  const idempotencyKey = useMemo(
+    () => (searchParams.get("idempotencyKey") || "").trim(),
+    [searchParams],
+  );
 
   const [status, setStatus] = useState<PaymentStatus>("processing");
   const [processingStep, setProcessingStep] =
@@ -121,6 +125,13 @@ export function PaymentProcessingPage() {
       setStatus("failed");
       setErrorMessage(
         "Number-ka waa khaldan yahay. Fadlan ku noqo bogga hore oo mar kale isku day.",
+      );
+      return;
+    }
+    if (!idempotencyKey) {
+      setStatus("failed");
+      setErrorMessage(
+        "Payment key lama helin. Fadlan ku noqo bogga hore oo mar kale isku day.",
       );
       return;
     }
@@ -174,6 +185,7 @@ export function PaymentProcessingPage() {
             amount,
             method,
             stationCode,
+            idempotencyKey,
           }),
         }).finally(() => {
           window.clearTimeout(requestTimeout);
@@ -252,7 +264,7 @@ export function PaymentProcessingPage() {
       cancelled = true;
       clearPaymentAbort();
     };
-  }, [amount, method, phoneNumber, stationCode]);
+  }, [amount, idempotencyKey, method, phoneNumber, stationCode]);
 
   const activeStepIndex = PROCESSING_STEPS.findIndex(
     (step) => step.key === processingStep,

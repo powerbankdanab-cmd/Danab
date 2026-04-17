@@ -9,7 +9,6 @@ import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 import { HttpError } from "@/lib/server/payment/errors";
 import {
   getAvailableBattery,
-  isSpecificBatteryReadyForRental,
   markProblemSlot,
   MIN_AVAILABLE_BATTERY_PERCENT,
   queryStationBatteries,
@@ -18,6 +17,7 @@ import {
 import { isPhoneBlacklisted } from "@/lib/server/payment/blacklist";
 import {
   createRentalLog,
+  getRentalByTransactionId,
   hasActiveRentalForPhone,
   isDuplicateTransaction,
   updateRentalUnlockStatus,
@@ -26,6 +26,14 @@ import { getActiveStationCode, getStationImei } from "@/lib/server/payment/stati
 import { getStationConfigByCode } from "@/lib/server/station-config";
 import { notifyPaidButNotEjected } from "@/lib/server/payment/telegram";
 import { PaymentInput, PaymentPayload } from "@/lib/server/payment/types";
+import {
+  createOrGetPaymentTransaction,
+  ensurePaymentTransactionState,
+  getPaymentTransaction,
+  patchPaymentTransaction,
+  transitionPaymentTransactionState,
+} from "@/lib/server/payment/transactions";
+import { reconcileTransactionById } from "@/lib/server/payment/reconciliation";
 import {
   cancelWaafiPreauthorization,
   commitWaafiPreauthorization,
@@ -41,31 +49,60 @@ const UNLOCK_RETRY_DELAY_MS = 2_000;
 const UNLOCK_VERIFY_POLL_MS = [250, 350, 400] as const;
 
 type BatteryPresence = "present" | "missing" | "unknown";
+type BatterySnapshot = {
+  presence: BatteryPresence;
+  lockStatus: string | null;
+  slotStatus: string | null;
+  batteryStatus: string | null;
+  observedAt: number;
+};
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function checkBatteryPresence(
+async function getBatterySnapshot(
   imei: string,
   batteryId: string,
   slotId: string,
-): Promise<BatteryPresence> {
+): Promise<BatterySnapshot> {
   try {
     const stationBatteries = await queryStationBatteries(imei);
-    const stillThere = stationBatteries.some(
+    const found = stationBatteries.find(
       (battery) =>
         normalizeBatteryId(battery.battery_id) === normalizeBatteryId(batteryId) &&
         battery.slot_id === slotId,
     );
 
-    return stillThere ? "present" : "missing";
+    if (!found) {
+      return {
+        presence: "missing",
+        lockStatus: null,
+        slotStatus: null,
+        batteryStatus: null,
+        observedAt: Date.now(),
+      };
+    }
+
+    return {
+      presence: "present",
+      lockStatus: found.lock_status || null,
+      slotStatus: found.slot_status || null,
+      batteryStatus: found.battery_status || null,
+      observedAt: Date.now(),
+    };
   } catch (error) {
     console.warn(
       "Failed to recheck slot status after unlock attempt:",
       error instanceof Error ? error.message : error,
     );
-    return "unknown";
+    return {
+      presence: "unknown",
+      lockStatus: null,
+      slotStatus: null,
+      batteryStatus: null,
+      observedAt: Date.now(),
+    };
   }
 }
 
@@ -73,19 +110,77 @@ async function verifyEjectionAfterUnlock(
   imei: string,
   batteryId: string,
   slotId: string,
+  preUnlock: BatterySnapshot,
 ): Promise<BatteryPresence> {
+  let sawMissing = false;
+  let missingConfirmed = 0;
+
   for (const waitMs of UNLOCK_VERIFY_POLL_MS) {
     await delay(waitMs);
-    const presence = await checkBatteryPresence(imei, batteryId, slotId);
-    if (presence === "missing") {
-      return "missing";
+    const snapshot = await getBatterySnapshot(imei, batteryId, slotId);
+
+    if (snapshot.presence === "missing") {
+      sawMissing = true;
+      missingConfirmed += 1;
+      if (missingConfirmed >= 2) {
+        return "missing";
+      }
+      continue;
     }
-    if (presence === "present") {
+
+    if (snapshot.presence === "present") {
+      missingConfirmed = 0;
+
+      // Require a clear state change from present->missing after unlock.
+      if (
+        preUnlock.presence === "present" &&
+        preUnlock.lockStatus === "1" &&
+        snapshot.lockStatus === "1" &&
+        !sawMissing
+      ) {
+        continue;
+      }
+
       return "present";
     }
   }
 
+  if (sawMissing) {
+    // One final confirm read to reduce stale single-read false positives.
+    await delay(500);
+    const confirm = await getBatterySnapshot(imei, batteryId, slotId);
+    if (confirm.presence === "missing") {
+      return "missing";
+    }
+  }
+
   return "unknown";
+}
+
+async function markTransactionFailed(
+  transactionId: string,
+  reason: string,
+): Promise<void> {
+  const tx = await getPaymentTransaction(transactionId);
+  if (!tx) return;
+
+  if (
+    tx.status === "captured" ||
+    tx.status === "capture_unknown" ||
+    tx.status === "failed"
+  ) {
+    return;
+  }
+
+  await transitionPaymentTransactionState({
+    id: transactionId,
+    from: tx.status,
+    to: "failed",
+    patch: {
+      failedAt: Date.now(),
+      failureReason: reason,
+    },
+  });
 }
 
 export async function processPayment(
@@ -94,6 +189,11 @@ export async function processPayment(
   const phoneNumber = input.phoneNumber.replace(/\D/g, "");
   const { amount } = input;
   const requestedStationCode = String(input.stationCode || "").replace(/\D/g, "");
+  const idempotencyKey = String(input.idempotencyKey || "").trim();
+
+  if (!idempotencyKey) {
+    throw new HttpError(400, "Missing idempotency key");
+  }
 
   const blacklisted = await isPhoneBlacklisted(phoneNumber);
   if (blacklisted) {
@@ -113,6 +213,78 @@ export async function processPayment(
   const imei = requestedStationConfig?.imei || (await getStationImei());
   const stationCode =
     requestedStationConfig?.code || (await getActiveStationCode());
+
+  const txRecord = await createOrGetPaymentTransaction({
+    id: idempotencyKey,
+    phone: phoneNumber,
+    station: stationCode,
+    amount,
+  });
+
+  if (!txRecord.created) {
+    if (txRecord.record.status === "captured") {
+      if (!txRecord.record.rentalCreated) {
+        await reconcileTransactionById(txRecord.record.id);
+        const refreshed = await getPaymentTransaction(txRecord.record.id);
+        if (!refreshed?.rentalCreated) {
+          throw new HttpError(
+            409,
+            "Payment was captured and is being repaired. Please wait a moment and retry.",
+            {
+              transactionId: txRecord.record.id,
+              status: txRecord.record.status,
+            },
+          );
+        }
+      }
+
+      return {
+        success: true,
+        message: "Payment already processed",
+        transactionId: txRecord.record.providerRef || txRecord.record.id,
+      };
+    }
+
+    if (txRecord.record.status === "capture_unknown") {
+      await reconcileTransactionById(txRecord.record.id);
+      const refreshed = await getPaymentTransaction(txRecord.record.id);
+      if (refreshed?.status === "captured" && refreshed.rentalCreated) {
+        return {
+          success: true,
+          message: "Payment already processed",
+          transactionId: refreshed.providerRef || refreshed.id,
+        };
+      }
+      if (refreshed?.status === "failed") {
+        throw new HttpError(409, "This payment attempt already failed.", {
+          transactionId: refreshed.id,
+          status: refreshed.status,
+        });
+      }
+
+      throw new HttpError(409, "Payment state is under reconciliation.", {
+        transactionId: txRecord.record.id,
+        status: txRecord.record.status,
+      });
+    }
+
+    if (txRecord.record.status === "failed") {
+      throw new HttpError(409, "This payment attempt already failed.", {
+        transactionId: txRecord.record.id,
+        status: txRecord.record.status,
+      });
+    }
+
+    throw new HttpError(
+      409,
+      "This payment is already being processed. Please wait.",
+      {
+        transactionId: txRecord.record.id,
+        status: txRecord.record.status,
+      },
+    );
+  }
+
   const phoneLockAcquired = await acquirePhonePaymentLock(phoneNumber);
   if (!phoneLockAcquired) {
     throw new HttpError(
@@ -201,6 +373,58 @@ export async function processPayment(
       );
     }
 
+    try {
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "initiated",
+        to: "held",
+        patch: {
+          providerRef: transactionId,
+          providerIssuerRef: issuerTransactionId,
+          providerReferenceId: referenceId || preauthReferenceId,
+          heldAt: Date.now(),
+        },
+      });
+    } catch (stateError) {
+      let cancelError: unknown = null;
+      try {
+        const cancelResponse = await cancelWaafiPreauthorization({
+          transactionId,
+          description: "Internal state sync failed after hold; hold cancelled",
+        });
+        if (!isWaafiApproved(cancelResponse)) {
+          cancelError = new Error(
+            cancelResponse.responseMsg || "Waafi cancel was not approved",
+          );
+        }
+      } catch (error) {
+        cancelError = error;
+      }
+
+      await markTransactionFailed(
+        idempotencyKey,
+        `Failed to persist held state: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+      );
+
+      if (cancelError) {
+        throw new HttpError(
+          502,
+          "Payment hold state was not persisted and hold cancellation could not be confirmed. Please contact support.",
+          {
+            transactionId,
+          },
+        );
+      }
+
+      throw new HttpError(
+        502,
+        "Payment hold state was not persisted. Hold was cancelled safely.",
+        {
+          transactionId,
+        },
+      );
+    }
+
     const duplicate = await isDuplicateTransaction(transactionId);
     if (duplicate) {
       try {
@@ -215,12 +439,16 @@ export async function processPayment(
         );
       }
 
-      return {
-        success: true,
-        message: "Payment already processed",
+      await markTransactionFailed(
+        idempotencyKey,
+        "Provider returned a transaction already used by an existing rental",
+      );
+      throw new HttpError(409, "Duplicate payment transaction detected", {
         transactionId,
-      };
+      });
     }
+
+    await ensurePaymentTransactionState(idempotencyKey, "held");
 
     let unlock: unknown = null;
     let unlockAttempts = 0;
@@ -228,6 +456,18 @@ export async function processPayment(
     const currentBattery = battery;
     let lastKnownPresence: BatteryPresence = "unknown";
     let unlockCommandAccepted = false;
+    const preUnlockSnapshot = await getBatterySnapshot(
+      imei,
+      currentBattery.battery_id,
+      currentBattery.slot_id,
+    );
+
+    if (preUnlockSnapshot.presence !== "present") {
+      throw new HttpError(
+        409,
+        "Selected battery is no longer in slot before unlock. Please retry.",
+      );
+    }
 
     for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
       unlockAttempts = attempt;
@@ -244,6 +484,7 @@ export async function processPayment(
           imei,
           currentBattery.battery_id,
           currentBattery.slot_id,
+          preUnlockSnapshot,
         );
 
         if (lastKnownPresence === "missing") {
@@ -267,11 +508,12 @@ export async function processPayment(
           unlockError instanceof Error ? unlockError.message : unlockError,
         );
 
-        lastKnownPresence = await checkBatteryPresence(
+        const snapshot = await getBatterySnapshot(
           imei,
           currentBattery.battery_id,
           currentBattery.slot_id,
         );
+        lastKnownPresence = snapshot.presence;
 
         if (lastKnownPresence === "missing") {
           console.error(
@@ -293,11 +535,12 @@ export async function processPayment(
 
     if (lastUnlockError) {
       if (lastKnownPresence !== "present") {
-        lastKnownPresence = await checkBatteryPresence(
+        const snapshot = await getBatterySnapshot(
           imei,
           currentBattery.battery_id,
           currentBattery.slot_id,
         );
+        lastKnownPresence = snapshot.presence;
       }
 
       if (lastKnownPresence === "missing") {
@@ -364,6 +607,10 @@ export async function processPayment(
         }
 
         if (cancelError) {
+          await markTransactionFailed(
+            idempotencyKey,
+            `Unlock failed and hold cancel not confirmed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+          );
           throw new HttpError(
             502,
             "Battery could not be released and payment hold cancellation could not be confirmed. Please contact support.",
@@ -375,6 +622,11 @@ export async function processPayment(
             },
           );
         }
+
+        await markTransactionFailed(
+          idempotencyKey,
+          "Unlock failed and payment hold was cancelled",
+        );
 
         throw new HttpError(
           502,
@@ -390,13 +642,44 @@ export async function processPayment(
       }
     }
 
+    await transitionPaymentTransactionState({
+      id: idempotencyKey,
+      from: "held",
+      to: "verified",
+      patch: {
+        verifiedAt: Date.now(),
+        delivery: {
+          imei,
+          stationCode,
+          batteryId: currentBattery.battery_id,
+          slotId: currentBattery.slot_id,
+          phoneAuthority,
+          unlockAttempts,
+          requestedPhoneNumber: phoneNumber,
+          canonicalPhoneNumber,
+        },
+        waafiAudit: preauthAudit,
+      },
+    });
+
     let commitResponse;
     try {
+      await ensurePaymentTransactionState(idempotencyKey, "verified");
       commitResponse = await commitWaafiPreauthorization({
         transactionId,
         description: "Powerbank rental committed after successful eject",
       });
     } catch (error) {
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "verified",
+        to: "capture_unknown",
+        patch: {
+          captureUnknownAt: Date.now(),
+          failureReason: `Waafi commit request failed: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      });
+
       await notifyPaidButNotEjected({
         phoneNumber,
         amount,
@@ -424,6 +707,18 @@ export async function processPayment(
     }
 
     if (!isWaafiApproved(commitResponse)) {
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "verified",
+        to: "capture_unknown",
+        patch: {
+          captureUnknownAt: Date.now(),
+          failureReason:
+            commitResponse.responseMsg ||
+            "Waafi commit not approved after verified ejection",
+        },
+      });
+
       await notifyPaidButNotEjected({
         phoneNumber,
         amount,
@@ -450,14 +745,39 @@ export async function processPayment(
       );
     }
 
+    await transitionPaymentTransactionState({
+      id: idempotencyKey,
+      from: "verified",
+      to: "captured",
+      patch: {
+        capturedAt: Date.now(),
+        providerRef: transactionId,
+        rentalCreated: false,
+      },
+    });
+
     const commitIds = extractWaafiIds(commitResponse);
     const waafiAudit = mergeWaafiAuditRecords(
       preauthAudit,
       extractWaafiAudit(commitResponse),
     );
 
+    await patchPaymentTransaction({
+      id: idempotencyKey,
+      patch: {
+        providerRef: commitIds.transactionId || transactionId,
+        providerIssuerRef: commitIds.issuerTransactionId || issuerTransactionId,
+        providerReferenceId: commitIds.referenceId || referenceId || preauthReferenceId,
+      },
+    });
+
     let rentalRef;
+    const resolvedTransactionId = commitIds.transactionId || transactionId;
     try {
+      const existingRental = await getRentalByTransactionId(resolvedTransactionId);
+      if (existingRental) {
+        rentalRef = { id: existingRental.id };
+      } else {
       rentalRef = await createRentalLog({
         imei,
         stationCode,
@@ -466,12 +786,13 @@ export async function processPayment(
         phoneNumber: canonicalPhoneNumber,
         requestedPhoneNumber: phoneNumber,
         amount,
-        transactionId: commitIds.transactionId || transactionId,
+        transactionId: resolvedTransactionId,
         issuerTransactionId,
         referenceId: commitIds.referenceId || referenceId || preauthReferenceId,
         phoneAuthority,
         waafiAudit,
       });
+      }
     } catch (error) {
       if (error instanceof BatteryStateConflictError) {
         await notifyPaidButNotEjected({
@@ -502,6 +823,14 @@ export async function processPayment(
       throw error;
     }
 
+    await patchPaymentTransaction({
+      id: idempotencyKey,
+      patch: {
+        rentalCreated: true,
+        rentalId: rentalRef.id,
+      },
+    });
+
     await releaseReservation(imei, currentBattery.battery_id);
     reservedBatteryId = null;
     await updateRentalUnlockStatus(rentalRef.id, "unlocked");
@@ -514,6 +843,12 @@ export async function processPayment(
       waafiMessage: "Battery released and payment confirmed",
       waafiResponse: commitResponse,
     };
+  } catch (error) {
+    await markTransactionFailed(
+      idempotencyKey,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw error;
   } finally {
     if (reservedBatteryId) {
       await releaseReservation(imei, reservedBatteryId);

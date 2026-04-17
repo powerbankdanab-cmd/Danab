@@ -21,6 +21,21 @@ export async function isDuplicateTransaction(transactionId: string) {
   return !snapshot.empty;
 }
 
+export async function getRentalByTransactionId(transactionId: string) {
+  const snapshot = await getDb()
+    .collection(RENTALS_COLLECTION)
+    .where("transactionId", "==", transactionId)
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc = snapshot.docs[0];
+  return { id: doc.id, data: doc.data() };
+}
+
 export async function createRentalLog({
   imei,
   stationCode,

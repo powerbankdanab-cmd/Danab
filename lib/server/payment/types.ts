@@ -35,6 +35,7 @@ export type PaymentInput = {
   phoneNumber: string;
   amount: number;
   stationCode?: string;
+  idempotencyKey: string;
 };
 
 export type PaymentSuccessPayload = {

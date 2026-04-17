@@ -1,4 +1,4 @@
-import { getRequiredEnv } from "@/lib/server/env";
+import { getOptionalEnv, getRequiredEnv } from "@/lib/server/env";
 
 import { parseResponseBody, toErrorMessage } from "@/lib/server/payment/http";
 import { WaafiResponse } from "@/lib/server/payment/types";
@@ -9,7 +9,8 @@ type WaafiServiceName =
   | "API_PURCHASE"
   | "API_PREAUTHORIZE"
   | "API_PREAUTHORIZE_COMMIT"
-  | "API_PREAUTHORIZE_CANCEL";
+  | "API_PREAUTHORIZE_CANCEL"
+  | "API_QUERY_TRANSACTION";
 
 function normalizePhoneDigits(value: string) {
   const digits = value.replace(/\D/g, "");
@@ -133,6 +134,35 @@ export async function cancelWaafiPreauthorization({
   });
 }
 
+export async function queryWaafiTransactionStatus({
+  transactionId,
+  referenceId,
+}: {
+  transactionId?: string | null;
+  referenceId?: string | null;
+}) {
+  const serviceName =
+    (getOptionalEnv("WAAFI_TRANSACTION_STATUS_SERVICE") as WaafiServiceName | null) ||
+    "API_QUERY_TRANSACTION";
+
+  const serviceParams: Record<string, unknown> = {};
+  if (transactionId) {
+    serviceParams.transactionId = transactionId;
+  }
+  if (referenceId) {
+    serviceParams.referenceId = referenceId;
+  }
+
+  if (!serviceParams.transactionId && !serviceParams.referenceId) {
+    throw new Error("Missing transactionId/referenceId for Waafi status query");
+  }
+
+  return requestWaafiAction({
+    serviceName,
+    serviceParams,
+  });
+}
+
 export function isWaafiApproved(waafiResponse: WaafiResponse) {
   const responseCodeApproved =
     waafiResponse.responseCode === "2001" || waafiResponse.responseCode === 2001;
@@ -193,4 +223,20 @@ export function mergeWaafiAuditRecords(
   }
 
   return merged;
+}
+
+export function getWaafiLifecycleState(waafiResponse: WaafiResponse): string {
+  return String(waafiResponse.params?.state || "")
+    .trim()
+    .toUpperCase();
+}
+
+export function isWaafiCaptured(waafiResponse: WaafiResponse): boolean {
+  const state = getWaafiLifecycleState(waafiResponse);
+  return state === "APPROVED" || state === "COMMITTED" || state === "SUCCESS";
+}
+
+export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
+  const state = getWaafiLifecycleState(waafiResponse);
+  return state === "CANCELLED" || state === "REVERSED" || state === "FAILED";
 }

@@ -124,3 +124,105 @@ export async function clearBatteryStateForRental({
     );
   });
 }
+
+export async function ensureBatteryReturnedForTransaction(input: {
+  batteryId: string;
+  transactionId: string;
+  note?: string;
+}) {
+  const db = getDb();
+  const normalizedBatteryId = batteryStateDocId(input.batteryId);
+  const stateRef = db.collection(BATTERY_STATE_COLLECTION).doc(normalizedBatteryId);
+  const now = Timestamp.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(stateRef);
+    if (!snap.exists) {
+      tx.set(
+        stateRef,
+        {
+          battery_id: normalizedBatteryId,
+          status: "returned",
+          updatedAt: now,
+          lastReturnedAt: now,
+          note: input.note || "Recovered returned state after failed payment",
+        },
+        { merge: true },
+      );
+      return;
+    }
+
+    const data = snap.data() || {};
+    const linkedTransactionId = String(data.transactionId || "");
+    if (linkedTransactionId && linkedTransactionId !== input.transactionId) {
+      return;
+    }
+
+    tx.set(
+      stateRef,
+      {
+        battery_id: normalizedBatteryId,
+        status: "returned",
+        updatedAt: now,
+        lastReturnedAt: now,
+        note: input.note || "Recovered returned state after failed payment",
+        activeRentalId: FieldValue.delete(),
+        imei: FieldValue.delete(),
+        stationCode: FieldValue.delete(),
+        slot_id: FieldValue.delete(),
+        phoneNumber: FieldValue.delete(),
+        requestedPhoneNumber: FieldValue.delete(),
+        phoneAuthority: FieldValue.delete(),
+        transactionId: FieldValue.delete(),
+        issuerTransactionId: FieldValue.delete(),
+        referenceId: FieldValue.delete(),
+        amount: FieldValue.delete(),
+        claimedAt: FieldValue.delete(),
+        waafiAccountNo: FieldValue.delete(),
+        waafiConfirmedPhoneNumber: FieldValue.delete(),
+      },
+      { merge: true },
+    );
+  });
+}
+
+export async function ensureBatteryRentedForTransaction(input: {
+  batteryId: string;
+  imei: string;
+  stationCode: string;
+  slotId: string;
+  rentalId: string;
+  transactionId: string;
+  phoneNumber: string;
+  requestedPhoneNumber: string;
+  phoneAuthority: string;
+  amount: number;
+  issuerTransactionId?: string | null;
+  referenceId?: string | null;
+}) {
+  const db = getDb();
+  const normalizedBatteryId = batteryStateDocId(input.batteryId);
+  const stateRef = db.collection(BATTERY_STATE_COLLECTION).doc(normalizedBatteryId);
+  const now = Timestamp.now();
+
+  await stateRef.set(
+    {
+      battery_id: normalizedBatteryId,
+      imei: input.imei,
+      stationCode: input.stationCode,
+      slot_id: input.slotId,
+      activeRentalId: input.rentalId,
+      phoneNumber: input.phoneNumber,
+      requestedPhoneNumber: input.requestedPhoneNumber,
+      phoneAuthority: input.phoneAuthority,
+      transactionId: input.transactionId,
+      issuerTransactionId: input.issuerTransactionId || null,
+      referenceId: input.referenceId || null,
+      amount: input.amount,
+      status: "rented",
+      updatedAt: now,
+      claimedAt: now,
+    },
+    { merge: true },
+  );
+}
