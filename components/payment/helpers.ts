@@ -31,6 +31,11 @@ export function validatePaymentInput(
 }
 
 export function mapBackendErrorMessage(message: string, waafiMsg?: string) {
+  // If backend already returned Somali text, display it directly.
+  if (/[\u0600-\u06FF]/.test(message) || message.includes("Fadlan") || message.includes("Khalad")) {
+    return message;
+  }
+
   const lowerMessage = message.toLowerCase();
 
   if (message.includes("No available battery")) {
@@ -106,5 +111,5 @@ export function mapBackendErrorMessage(message: string, waafiMsg?: string) {
     return "Codsiga waa la joojiyay. Fadlan mar kale isku day.";
   }
 
-  return message || "Khalad dhacay, fadlan mar kale isku day";
+  return "Khalad ayaa dhacay. Fadlan mar kale isku day ama la xiriir support-ka Danab.";
 }
