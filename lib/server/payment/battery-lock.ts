@@ -1,6 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 
 import { getDb } from "@/lib/server/firebase-admin";
+import { logError } from "@/lib/server/alerts/log-error";
 import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 
 /**
@@ -72,10 +73,16 @@ export async function reserveBattery(
 
     return success;
   } catch (error) {
-    console.error(
-      `Failed to reserve battery ${batteryId} for phone ${phoneNumber}:`,
-      error instanceof Error ? error.message : error,
-    );
+    await logError({
+      type: "BATTERY_RESERVE_FAILED",
+      message: `Failed to reserve battery ${batteryId} for phone ${phoneNumber}`,
+      metadata: {
+        imei,
+        batteryId,
+        phoneNumber,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
     return false;
   }
 }
@@ -96,10 +103,15 @@ export async function releaseReservation(
     await docRef.delete();
   } catch (error) {
     // Non-fatal: reservation will expire via TTL anyway
-    console.warn(
-      `Failed to release reservation for battery ${batteryId}:`,
-      error instanceof Error ? error.message : error,
-    );
+    await logError({
+      type: "BATTERY_RESERVE_RELEASE_FAILED",
+      message: `Failed to release reservation for battery ${batteryId}`,
+      metadata: {
+        imei,
+        batteryId,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
 }
 
@@ -168,10 +180,14 @@ export async function acquirePhonePaymentLock(
       return true;
     });
   } catch (error) {
-    console.error(
-      `Failed to acquire payment lock for phone ${phoneNumber}:`,
-      error instanceof Error ? error.message : error,
-    );
+    await logError({
+      type: "PHONE_LOCK_ACQUIRE_FAILED",
+      message: `Failed to acquire payment lock for phone ${phoneNumber}`,
+      metadata: {
+        phoneNumber,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
     return false;
   }
 }
@@ -190,9 +206,13 @@ export async function releasePhonePaymentLock(
   try {
     await docRef.delete();
   } catch (error) {
-    console.warn(
-      `Failed to release payment lock for phone ${phoneNumber}:`,
-      error instanceof Error ? error.message : error,
-    );
+    await logError({
+      type: "PHONE_LOCK_RELEASE_FAILED",
+      message: `Failed to release payment lock for phone ${phoneNumber}`,
+      metadata: {
+        phoneNumber,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
 }

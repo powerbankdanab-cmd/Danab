@@ -1,3 +1,4 @@
+import { CRITICAL_ERROR_TYPES, logError } from "@/lib/server/alerts/log-error";
 import { BatteryStateConflictError } from "@/lib/server/payment/battery-state";
 import {
   ensureBatteryRentedForTransaction,
@@ -226,6 +227,18 @@ async function reconcileCaptureUnknown(
       referenceId: transaction.providerReferenceId || null,
     });
   } catch (error) {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+      transactionId: transaction.providerRef || transaction.id,
+      message: "Waafi status query failed during capture_unknown reconciliation",
+      metadata: {
+        transactionId: transaction.id,
+        providerRef: transaction.providerRef || null,
+        retryCount: transaction.unknownRetryCount || 0,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    });
+
     await scheduleUnknownRetry(
       transaction,
       fence,
@@ -369,9 +382,22 @@ export async function reconcileTransactions(limit = 50): Promise<ReconcileSummar
         }
       }
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      await logError({
+        type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+        transactionId: candidate.id,
+        message: "Reconciliation failed for transaction",
+        metadata: {
+          transactionId: candidate.id,
+          status: candidate.status,
+          reason: errorMessage,
+        },
+      });
+
       summary.errors.push({
         id: candidate.id,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: errorMessage,
       });
     } finally {
       await releaseTransactionRecovery(
