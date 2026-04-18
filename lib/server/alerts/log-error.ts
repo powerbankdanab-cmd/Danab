@@ -8,6 +8,7 @@ export const CRITICAL_ERROR_TYPES = {
   VERIFICATION_FAILED: "VERIFICATION_FAILED",
   CAPTURE_UNKNOWN: "CAPTURE_UNKNOWN",
   RECONCILIATION_FAILED: "RECONCILIATION_FAILED",
+  SYSTEM_INCONSISTENCY: "SYSTEM_INCONSISTENCY",
 } as const;
 
 export type CriticalErrorType =
@@ -28,6 +29,51 @@ export type LogErrorResult = {
   logged: boolean;
   alertStatus: WhatsAppAlertResult | null;
 };
+
+// --- In-memory tracking for rate-limiting and station failures ---
+const lastAlertSent = new Map<string, number>();
+const stationFailures = new Map<string, number[]>();
+
+function isDuplicateAlert(transactionId: string | undefined, type: ErrorType): boolean {
+  if (!transactionId) return false;
+  
+  const key = `${transactionId}_${type}`;
+  const now = Date.now();
+  const last = lastAlertSent.get(key);
+  
+  if (last && now - last < 10000) {
+    return true;
+  }
+  
+  lastAlertSent.set(key, now);
+  
+  if (lastAlertSent.size > 500) {
+    for (const [k, v] of lastAlertSent.entries()) {
+      if (now - v > 60000) lastAlertSent.delete(k);
+    }
+  }
+  
+  return false;
+}
+
+async function detectStationFailures(stationCode: string | undefined) {
+  if (!stationCode) return;
+  
+  const now = Date.now();
+  let failures = stationFailures.get(stationCode) || [];
+  
+  failures = failures.filter(t => now - t <= 10 * 60 * 1000);
+  failures.push(now);
+  stationFailures.set(stationCode, failures);
+  
+  if (failures.length === 5) {
+    try {
+      await sendWhatsAppAlertWithResult(`⚠️ Station ${stationCode} likely broken (${failures.length} failures in 10 min)`);
+    } catch (err) {
+      console.error(`[ALERT_EXCEPTION] Failed to send station broken alert for ${stationCode}:`, err);
+    }
+  }
+}
 
 function isCriticalErrorType(type: ErrorType): type is CriticalErrorType {
   return Object.values(CRITICAL_ERROR_TYPES).includes(type as CriticalErrorType);
@@ -98,19 +144,34 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
     );
   }
 
+  if (input.stationCode) {
+    void detectStationFailures(input.stationCode);
+  }
+
   // Only attempt WhatsApp alert for critical error types
   if (!isCritical) {
     return { logged, alertStatus: null };
   }
 
+  if (isDuplicateAlert(input.transactionId, input.type)) {
+    console.warn(`[ALERT_DEDUPLICATED] Skipping duplicate alert for Tx: ${input.transactionId}, Type: ${input.type}`);
+    return { logged, alertStatus: "rate_limited" as WhatsAppAlertResult };
+  }
+
   try {
-    const alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    let alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    
+    // Step 3: Implement retry queue for WhatsApp alerts
+    if (alertStatus === "rate_limited" || alertStatus === "failed") {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    }
 
     // If WhatsApp was rate-limited, the alert was NOT delivered.
     // Log the full alert content to console so it's captured in server logs.
     if (alertStatus === "rate_limited") {
       console.error(
-        "[ALERT_RATE_LIMITED] WhatsApp alert was rate-limited — alert content logged for visibility:",
+        "[ALERT_RATE_LIMITED] WhatsApp alert was rate-limited (after retry) — alert content logged for visibility:",
         formatAlert(input),
       );
     } else if (alertStatus === "missing_config") {

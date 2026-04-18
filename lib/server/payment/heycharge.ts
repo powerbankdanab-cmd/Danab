@@ -2,6 +2,7 @@ import { getRequiredEnv } from "@/lib/server/env";
 
 import { getDb } from "@/lib/server/firebase-admin";
 import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
+import { logError } from "@/lib/server/alerts/log-error";
 import { getReservedBatteryIds } from "@/lib/server/payment/battery-lock";
 import { parseResponseBody, toErrorMessage } from "@/lib/server/payment/http";
 import { Battery } from "@/lib/server/payment/types";
@@ -105,9 +106,11 @@ export async function markProblemSlot(
     resolved: false,
     createdAt: new Date(),
   });
-  console.error(
-    `⚠️ Marked slot ${slotId} on station ${imei} as problem: ${reason}`,
-  );
+  await logError({
+    type: "SYSTEM_INCONSISTENCY",
+    message: `Marked slot ${slotId} on station ${imei} as problem: ${reason}`,
+    metadata: { imei, slotId, batteryId, reason }
+  });
 }
 
 function normalizeHeyChargeState(value?: string | null): string {

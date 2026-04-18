@@ -372,6 +372,8 @@ export async function processPayment(
   }
 
   let reservedBatteryId: string | null = null;
+  let holdCreated = false;
+  let holdTransactionId: string | null = null;
 
   try {
     const hasActiveRental = await hasActiveRentalForPhone(phoneNumber);
@@ -438,6 +440,12 @@ export async function processPayment(
 
     const { transactionId, issuerTransactionId, referenceId } =
       extractWaafiIds(preauthResponse);
+      
+    if (transactionId) {
+      holdCreated = true;
+      holdTransactionId = transactionId;
+    }
+    
     const preauthAudit = extractWaafiAudit(preauthResponse);
     const waafiConfirmedPhoneNumber =
       typeof preauthAudit.waafiConfirmedPhoneNumber === "string" &&
@@ -478,6 +486,7 @@ export async function processPayment(
           transactionId,
           description: "Internal state sync failed after hold; hold cancelled",
         });
+        holdTransactionId = null;
         if (!isWaafiApproved(cancelResponse)) {
           cancelError = new Error(
             cancelResponse.responseMsg || "Waafi cancel was not approved",
@@ -534,6 +543,7 @@ export async function processPayment(
           transactionId,
           description: "Duplicate preauthorization hold cancelled",
         });
+        holdTransactionId = null;
       } catch (error) {
         duplicateCancelFailed = true;
         await logError({
@@ -606,6 +616,7 @@ export async function processPayment(
           transactionId,
           description: "Battery not in slot before unlock, hold cancelled",
         });
+        holdTransactionId = null;
       } catch (cancelErr) {
         await logError({
           type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
@@ -813,6 +824,7 @@ export async function processPayment(
           transactionId,
           description: "Battery ejection not verified, hold cancelled",
         });
+        holdTransactionId = null;
 
         if (!isWaafiApproved(cancelResponse)) {
           cancelError = new Error(
@@ -896,6 +908,15 @@ export async function processPayment(
     let commitResponse;
     try {
       await ensurePaymentTransactionState(idempotencyKey, "verified");
+      
+      // Step 7 - final assurance check
+      if (!verifiedEjection) {
+        throw new Error("Invariant violation: capture without verified ejection");
+      }
+      
+      // Successfully reached commit phase — clear hold tracking
+      holdTransactionId = null;
+      
       commitResponse = await commitWaafiPreauthorization({
         transactionId,
         description: "Powerbank rental committed after successful eject",
@@ -1128,6 +1149,22 @@ export async function processPayment(
       waafiResponse: commitResponse,
     };
   } catch (error) {
+    if (holdCreated && holdTransactionId) {
+      try {
+        await cancelWaafiPreauthorization({
+          transactionId: holdTransactionId,
+          description: "Payment failed before ejection, automatic early exit cleanup",
+        });
+      } catch (err) {
+        await logError({
+          type: "SYSTEM_INCONSISTENCY",
+          transactionId: holdTransactionId,
+          message: "Failed to cancel Waafi hold on early exit",
+          metadata: { error: String(err) },
+        });
+      }
+    }
+
     await markTransactionFailed(
       idempotencyKey,
       error instanceof Error ? error.message : String(error),

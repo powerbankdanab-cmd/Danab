@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { isHttpError, processPayment } from "@/lib/server/payment-service";
 import { reconcileTransactions } from "@/lib/server/payment/reconciliation";
+import { logError } from "@/lib/server/alerts/log-error";
 
 import { checkRateLimit } from "@/lib/server/rate-limit";
 
@@ -44,11 +45,11 @@ function toSomaliPaymentError(message: string) {
   }
 
   if (lower.includes("already have an active rental")) {
-    return "Waxaad hore u haysataa battery firfircoon. Fadlan soo celi ka hor intaadan mid kale qaadan.";
+    return "Waxaad hore u haysataa battery active ah. Fadlan soo celi ka hor intaadan mid kale qaadan.";
   }
 
   if (lower.includes("blocked from renting") || lower.includes("blacklist")) {
-    return "Lambarkan waa la xannibay. Fadlan la xiriir taageerada Danab.";
+    return "Lambarkan waa la xannibay. Fadlan la xiriir team-ka Danab.";
   }
 
   if (lower.includes("no available battery")) {
@@ -149,10 +150,11 @@ export const maxDuration = 300;
 export async function POST(request: NextRequest) {
   // Opportunistic self-healing in case scheduled cron is delayed/down.
   void reconcileTransactions(3).catch((error) => {
-    console.warn(
-      "Opportunistic reconciliation failed:",
-      error instanceof Error ? error.message : error,
-    );
+    void logError({
+      type: "SYSTEM_INCONSISTENCY",
+      message: "Opportunistic reconciliation failed",
+      metadata: { error: error instanceof Error ? error.message : String(error) },
+    });
   });
 
   const clientIp = getClientIp(request);
@@ -202,10 +204,10 @@ export async function POST(request: NextRequest) {
     if (isHttpError(error)) {
       const payload = error.details
         ? {
-            error: toSomaliPaymentError(error.message),
+          error: toSomaliPaymentError(error.message),
 
-            ...(error.details as Record<string, unknown>),
-          }
+          ...(error.details as Record<string, unknown>),
+        }
         : { error: toSomaliPaymentError(error.message) };
 
       return NextResponse.json(payload, { status: error.status });
