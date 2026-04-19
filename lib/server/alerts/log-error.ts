@@ -19,6 +19,7 @@ export type ErrorType = CriticalErrorType | string;
 export type LogErrorInput = {
   type: ErrorType;
   transactionId?: string;
+  providerRef?: string;
   stationCode?: string;
   phoneNumber?: string;
   message: string;
@@ -30,9 +31,8 @@ export type LogErrorResult = {
   alertStatus: WhatsAppAlertResult | null;
 };
 
-// --- In-memory tracking for rate-limiting and station failures ---
+// --- In-memory tracking for deduplication ---
 const lastAlertSent = new Map<string, number>();
-const stationFailures = new Map<string, number[]>();
 
 function isDuplicateAlert(transactionId: string | undefined, type: ErrorType): boolean {
   if (!transactionId) return false;
@@ -45,8 +45,7 @@ function isDuplicateAlert(transactionId: string | undefined, type: ErrorType): b
     return true;
   }
   
-  lastAlertSent.set(key, now);
-  
+  // Cleanup memory map
   if (lastAlertSent.size > 500) {
     for (const [k, v] of lastAlertSent.entries()) {
       if (now - v > 60000) lastAlertSent.delete(k);
@@ -56,22 +55,62 @@ function isDuplicateAlert(transactionId: string | undefined, type: ErrorType): b
   return false;
 }
 
+function markAlertSent(transactionId: string | undefined, type: ErrorType) {
+  if (!transactionId) return;
+  const key = `${transactionId}_${type}`;
+  lastAlertSent.set(key, Date.now());
+}
+
 async function detectStationFailures(stationCode: string | undefined) {
   if (!stationCode) return;
   
   const now = Date.now();
-  let failures = stationFailures.get(stationCode) || [];
-  
-  failures = failures.filter(t => now - t <= 10 * 60 * 1000);
-  failures.push(now);
-  stationFailures.set(stationCode, failures);
-  
-  if (failures.length === 5) {
-    try {
-      await sendWhatsAppAlertWithResult(`⚠️ Station ${stationCode} likely broken (${failures.length} failures in 10 min)`);
-    } catch (err) {
-      console.error(`[ALERT_EXCEPTION] Failed to send station broken alert for ${stationCode}:`, err);
+  const db = getDb();
+  const ref = db.collection("station_failures").doc(stationCode);
+
+  try {
+    const alertTriggered = await db.runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      let failures: number[] = [];
+      if (doc.exists) {
+        failures = doc.data()?.timestamps || [];
+      }
+
+      failures = failures.filter(t => now - t <= 10 * 60 * 1000);
+      failures.push(now);
+
+      tx.set(ref, { stationCode, timestamps: failures }, { merge: true });
+
+      return failures.length === 5; // Exactly 5 triggers the alert to prevent spam
+    });
+
+    if (alertTriggered) {
+      await sendWhatsAppAlertWithResult(`⚠️ Station ${stationCode} likely broken (5+ failures in 10 min)`);
     }
+  } catch (err) {
+    console.error(`[ALERT_EXCEPTION] Failed to track/send station broken alert for ${stationCode}:`, err);
+  }
+}
+
+async function queueDurableAlert(input: LogErrorInput) {
+  try {
+    await getDb()
+      .collection("alerts_queue")
+      .add({
+        type: input.type,
+        transactionId: input.transactionId || null,
+        message: formatAlert(input),
+        retries: 0,
+        nextAttemptAt: Date.now() + 5000,
+        createdAt: Date.now(),
+      });
+  } catch (error) {
+    console.error(
+      "[CRITICAL] Failed to enqueue durable alert:",
+      error instanceof Error ? error.message : String(error),
+      "Payload:",
+      formatAlert(input)
+    );
   }
 }
 
@@ -85,7 +124,8 @@ function formatAlert(input: LogErrorInput) {
     `Type: ${input.type}`,
     `Station: ${input.stationCode || "-"}`,
     `Phone: ${input.phoneNumber || "-"}`,
-    `Tx: ${input.transactionId || "-"}`,
+    `Tx (Idempotency): ${input.transactionId || "-"}`,
+    `Provider Ref: ${input.providerRef || "-"}`,
     `Message: ${input.message}`,
   ].join("\n");
 }
@@ -120,6 +160,7 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
       .add({
         type: input.type,
         ...(input.transactionId ? { transactionId: input.transactionId } : {}),
+        ...(input.providerRef ? { providerRef: input.providerRef } : {}),
         ...(input.stationCode ? { stationCode: input.stationCode } : {}),
         ...(input.phoneNumber ? { phoneNumber: input.phoneNumber } : {}),
         message: input.message,
@@ -135,6 +176,7 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
       JSON.stringify({
         type: input.type,
         transactionId: input.transactionId,
+        providerRef: input.providerRef,
         stationCode: input.stationCode,
         phoneNumber: input.phoneNumber,
         message: input.message,
@@ -155,23 +197,23 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
 
   if (isDuplicateAlert(input.transactionId, input.type)) {
     console.warn(`[ALERT_DEDUPLICATED] Skipping duplicate alert for Tx: ${input.transactionId}, Type: ${input.type}`);
-    return { logged, alertStatus: "rate_limited" as WhatsAppAlertResult };
+    return { logged, alertStatus: null };
   }
 
   try {
-    let alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    const alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
     
-    // Step 3: Implement retry queue for WhatsApp alerts
-    if (alertStatus === "rate_limited" || alertStatus === "failed") {
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      alertStatus = await sendWhatsAppAlertWithResult(formatAlert(input));
+    if (alertStatus === "sent") {
+      markAlertSent(input.transactionId, input.type);
+    } else if (alertStatus === "rate_limited" || alertStatus === "failed") {
+      // Step 5: Queue durable alert for retry
+      await queueDurableAlert(input);
     }
 
-    // If WhatsApp was rate-limited, the alert was NOT delivered.
-    // Log the full alert content to console so it's captured in server logs.
+    // Logging side-effects
     if (alertStatus === "rate_limited") {
       console.error(
-        "[ALERT_RATE_LIMITED] WhatsApp alert was rate-limited (after retry) — alert content logged for visibility:",
+        "[ALERT_RATE_LIMITED] WhatsApp alert rate-limited — enqueued for eventual delivery:",
         formatAlert(input),
       );
     } else if (alertStatus === "missing_config") {
@@ -181,7 +223,7 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
       );
     } else if (alertStatus === "failed") {
       console.error(
-        "[ALERT_FAILED] WhatsApp alert delivery failed — alert content:",
+        "[ALERT_FAILED] WhatsApp alert delivery failed — enqueued for eventual delivery:",
         formatAlert(input),
       );
     }
@@ -189,11 +231,12 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
     return { logged, alertStatus };
   } catch (error) {
     console.error(
-      "[ALERT_EXCEPTION] Unexpected WhatsApp alert failure:",
+      "[ALERT_EXCEPTION] Unexpected WhatsApp alert failure. Enqueuing for eventual delivery. Error:",
       error instanceof Error ? error.message : error,
       "— alert content:",
       formatAlert(input),
     );
+    await queueDurableAlert(input);
     return { logged, alertStatus: "failed" };
   }
 }

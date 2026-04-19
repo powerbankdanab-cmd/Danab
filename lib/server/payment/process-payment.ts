@@ -503,7 +503,8 @@ export async function processPayment(
 
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Failed to persist held state after Waafi preauthorization",
@@ -547,8 +548,9 @@ export async function processPayment(
       } catch (error) {
         duplicateCancelFailed = true;
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Failed to cancel duplicate preauthorization hold",
@@ -561,7 +563,8 @@ export async function processPayment(
 
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Duplicate payment transaction detected — hold cancellation attempted",
@@ -599,7 +602,8 @@ export async function processPayment(
       // Hold is already placed — must cancel it to release user's funds
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Battery not present in slot before unlock — hold will be cancelled",
@@ -619,8 +623,9 @@ export async function processPayment(
         holdTransactionId = null;
       } catch (cancelErr) {
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Failed to cancel hold after battery-not-in-slot — REQUIRES MANUAL INTERVENTION",
@@ -676,8 +681,9 @@ export async function processPayment(
         );
 
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: `Unlock attempt ${attempt}/${MAX_UNLOCK_ATTEMPTS}: command succeeded but ejection not confirmed`,
@@ -705,8 +711,9 @@ export async function processPayment(
         lastKnownPresence = snapshot.presence;
 
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: `Unlock attempt ${attempt}/${MAX_UNLOCK_ATTEMPTS}: command failed`,
@@ -728,8 +735,9 @@ export async function processPayment(
 
       if (attempt < MAX_UNLOCK_ATTEMPTS) {
         await logError({
-          type: "UNLOCK_RETRY",
-          transactionId,
+        type: "UNLOCK_RETRY",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: `Retrying unlock for battery ${currentBattery.battery_id} after attempt ${attempt}`,
@@ -758,7 +766,8 @@ export async function processPayment(
 
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Battery ejection could not be verified — payment NOT captured",
@@ -786,8 +795,9 @@ export async function processPayment(
           );
         } catch (recoveryError) {
           await logError({
-            type: "PROBLEM_SLOT_MARK_FAILED",
-            transactionId,
+        type: "PROBLEM_SLOT_MARK_FAILED",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
             stationCode,
             phoneNumber,
             message: "Failed to mark problem slot after ejection verification failure",
@@ -837,8 +847,9 @@ export async function processPayment(
 
       if (cancelError) {
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Ejection failed AND hold cancellation failed — REQUIRES MANUAL INTERVENTION",
@@ -934,7 +945,8 @@ export async function processPayment(
 
       await logError({
         type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Waafi commit request failed after verified ejection",
@@ -989,7 +1001,8 @@ export async function processPayment(
 
       await logError({
         type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
-        transactionId,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
         phoneNumber,
         message: "Waafi commit response not approved after verified ejection",
@@ -1034,16 +1047,29 @@ export async function processPayment(
       );
     }
 
-    await transitionPaymentTransactionState({
-      id: idempotencyKey,
-      from: "verified",
-      to: "captured",
-      patch: {
-        capturedAt: Date.now(),
+    try {
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "verified",
+        to: "captured",
+        patch: {
+          capturedAt: Date.now(),
+          providerRef: transactionId,
+          rentalCreated: false,
+        },
+      });
+    } catch (err) {
+      await logError({
+        type: "SYSTEM_INCONSISTENCY",
+        transactionId: idempotencyKey,
         providerRef: transactionId,
-        rentalCreated: false,
-      },
-    });
+        stationCode,
+        phoneNumber,
+        message: "Post-capture failure: transition to captured state failed",
+        metadata: { error: String(err) }
+      });
+      throw err;
+    }
 
     const commitIds = extractWaafiIds(commitResponse);
     const waafiAudit = mergeWaafiAuditRecords(
@@ -1051,14 +1077,27 @@ export async function processPayment(
       extractWaafiAudit(commitResponse),
     );
 
-    await patchPaymentTransaction({
-      id: idempotencyKey,
-      patch: {
-        providerRef: commitIds.transactionId || transactionId,
-        providerIssuerRef: commitIds.issuerTransactionId || issuerTransactionId,
-        providerReferenceId: commitIds.referenceId || referenceId || preauthReferenceId,
-      },
-    });
+    try {
+      await patchPaymentTransaction({
+        id: idempotencyKey,
+        patch: {
+          providerRef: commitIds.transactionId || transactionId,
+          providerIssuerRef: commitIds.issuerTransactionId || issuerTransactionId,
+          providerReferenceId: commitIds.referenceId || referenceId || preauthReferenceId,
+        },
+      });
+    } catch (err) {
+      await logError({
+        type: "SYSTEM_INCONSISTENCY",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Post-capture failure: patch Waafi IDs failed",
+        metadata: { error: String(err) }
+      });
+      throw err;
+    }
 
     let rentalRef;
     const resolvedTransactionId = commitIds.transactionId || transactionId;
@@ -1085,8 +1124,9 @@ export async function processPayment(
     } catch (error) {
       if (error instanceof BatteryStateConflictError) {
         await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-          transactionId,
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Payment captured but battery already linked to another active rental",
@@ -1125,20 +1165,68 @@ export async function processPayment(
         );
       }
 
+      if (error instanceof BatteryStateConflictError) {
+        // ... (previous error handled above this line)
+        throw new HttpError(
+          409,
+          "Payment was confirmed, but this battery was already linked to another active rental. Please contact support.",
+          {
+            batteryId: error.batteryId,
+            activeRentalId: error.activeRentalId,
+            transactionId,
+          },
+        );
+      }
+
+      await logError({
+        type: "SYSTEM_INCONSISTENCY",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Post-capture failure: createRentalLog failed",
+        metadata: { error: String(error) }
+      });
       throw error;
     }
 
-    await patchPaymentTransaction({
-      id: idempotencyKey,
-      patch: {
-        rentalCreated: true,
-        rentalId: rentalRef.id,
-      },
-    });
+    try {
+      await patchPaymentTransaction({
+        id: idempotencyKey,
+        patch: {
+          rentalCreated: true,
+          rentalId: rentalRef.id,
+        },
+      });
+    } catch (err) {
+      await logError({
+        type: "SYSTEM_INCONSISTENCY",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Post-capture failure: rentalCreated patch failed",
+        metadata: { error: String(err) }
+      });
+      throw err;
+    }
 
-    await releaseReservation(imei, currentBattery.battery_id);
-    reservedBatteryId = null;
-    await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+    try {
+      await releaseReservation(imei, currentBattery.battery_id);
+      reservedBatteryId = null;
+      await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+    } catch (err) {
+      await logError({
+        type: "SYSTEM_INCONSISTENCY",
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
+        stationCode,
+        phoneNumber,
+        message: "Post-capture failure: updateRentalUnlockStatus failed",
+        metadata: { error: String(err) }
+      });
+      throw err;
+    }
 
     return {
       success: true,
