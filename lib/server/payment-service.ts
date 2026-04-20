@@ -5,6 +5,13 @@ ensureServerEnvLoaded();
 export { isPhoneBlacklisted } from "@/lib/server/payment/blacklist";
 export { HttpError, isHttpError } from "@/lib/server/payment/errors";
 export { 
+  createOrGetPaymentTransaction,
+  getPaymentTransaction,
+  patchPaymentTransaction,
+  transitionPaymentTransactionState,
+  listStaleTransactionsForReconciliation
+} from "@/lib/server/payment/transactions";
+export { 
   processPayment, 
   handleUserConfirmation,
   finalizeCapture,

@@ -11,6 +11,7 @@ export type PaymentTransactionStatus =
   | "verified"
   | "captured"
   | "failed"
+  | "confirm_required"
   | "capture_unknown";
 
 export type PaymentDeliveryContext = {
@@ -226,6 +227,47 @@ export async function listTransactionsForReconciliation(limit = 50) {
   }
 
   return Array.from(byId.values());
+}
+
+export async function listStaleTransactionsForReconciliation(limit = 20) {
+  const db = getDb();
+  const now = Date.now();
+  const sixtySecondsAgo = now - 60000;
+
+  // Query 1: confirm_required that are older than 60s
+  const confirmSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "confirm_required")
+    .where("updatedAt", "<", sixtySecondsAgo)
+    .limit(limit)
+    .get();
+
+  // Query 2: captured that are missing rentals
+  // Firestore doesn't support != for boolean efficiently with limit combined with other filters here,
+  // so we'll filter in JS or just get more.
+  const capturedSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "captured")
+    .limit(limit * 2) // Get a bit more to account for those already linked
+    .get();
+
+  const results: PaymentTransactionRecord[] = [];
+  
+  // Add confirm_required
+  for (const doc of confirmSnap.docs) {
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
+  // Add captured without rental (only up to limit)
+  for (const doc of capturedSnap.docs) {
+    if (results.length >= limit) break;
+    const tx = doc.data() as PaymentTransactionRecord;
+    if (!tx.rentalCreated) {
+      results.push(tx);
+    }
+  }
+
+  return results;
 }
 
 export async function claimTransactionRecovery(input: {

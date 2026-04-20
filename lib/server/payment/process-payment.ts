@@ -818,10 +818,32 @@ export async function processPayment(
 
     return finalizeCapture(idempotencyKey);
   } catch (error) {
-/**
- * Finalizes the payment by committing the preauthorization and creating the rental log.
- * This is called for both automatic (HIGH confidence) and manual (user confirmed) paths.
- */
+    if (holdCreated && holdTransactionId) {
+      try {
+        await cancelHold(holdTransactionId, "Payment failed before ejection, automatic early exit cleanup");
+      } catch (err) {
+        await logError({
+          type: "SYSTEM_INCONSISTENCY",
+          transactionId: holdTransactionId,
+          message: "Failed to cancel Waafi hold on early exit",
+          metadata: { error: String(err) },
+        });
+      }
+    }
+
+    await markTransactionFailed(
+      idempotencyKey,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw error;
+  } finally {
+    if (reservedBatteryId) {
+      await releaseReservation(imei, reservedBatteryId);
+    }
+    await releasePhonePaymentLock(phoneNumber);
+  }
+}
+
 /**
  * Finalizes capture and rental creation for a verified delivery.
  * IDEMPOTENT: returns success if already captured.
@@ -1007,34 +1029,5 @@ export async function handleUserConfirmation(
     return finalizeCapture(idempotencyKey);
   } else {
     return cancelHold(idempotencyKey, "User reported battery did not come out");
-  }
-}
-  } catch (error) {
-    if (holdCreated && holdTransactionId) {
-      try {
-        await cancelWaafiPreauthorization({
-          transactionId: holdTransactionId,
-          description: "Payment failed before ejection, automatic early exit cleanup",
-        });
-      } catch (err) {
-        await logError({
-          type: "SYSTEM_INCONSISTENCY",
-          transactionId: holdTransactionId,
-          message: "Failed to cancel Waafi hold on early exit",
-          metadata: { error: String(err) },
-        });
-      }
-    }
-
-    await markTransactionFailed(
-      idempotencyKey,
-      error instanceof Error ? error.message : String(error),
-    );
-    throw error;
-  } finally {
-    if (reservedBatteryId) {
-      await releaseReservation(imei, reservedBatteryId);
-    }
-    await releasePhonePaymentLock(phoneNumber);
   }
 }
