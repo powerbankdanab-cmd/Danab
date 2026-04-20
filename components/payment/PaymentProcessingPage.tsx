@@ -125,6 +125,44 @@ export function PaymentProcessingPage() {
       return "Lacag bixin wali ma dhicin. Fadlan sug wax yar ama mar kale isku day. Payment is still being verified.";
     }
 
+    const normalizedError = String(backendError || "").toLowerCase();
+
+    if (
+      normalizedError.includes("insufficient") ||
+      normalizedError.includes("low balance") ||
+      normalizedError.includes("not enough balance") ||
+      normalizedError.includes("haraaga")
+    ) {
+      return "Lacag kugu filan ma jirto. Fadlan hubi haraagaga ama lambarka aad bixinta ka isticmaaleyso, kadibna mar kale isku day. Insufficient balance.";
+    }
+
+    if (
+      normalizedError.includes("payment not approved") ||
+      normalizedError.includes("payment hold not approved") ||
+      normalizedError.includes("not approved") ||
+      normalizedError.includes("declined") ||
+      normalizedError.includes("rejected")
+    ) {
+      return "Bixinta lama oggolaan. Fadlan hubi haraagaga ama lambarka, kadibna mar kale isku day. Payment was not approved.";
+    }
+
+    if (
+      normalizedError.includes("wrong pin") ||
+      normalizedError.includes("invalid pin") ||
+      normalizedError.includes("pin")
+    ) {
+      return "PIN-ka aad gelisay ma saxna ama lama xaqiijin. Fadlan hubi PIN-ka oo mar kale isku day.";
+    }
+
+    if (
+      normalizedError.includes("number") ||
+      normalizedError.includes("phone") ||
+      normalizedError.includes("accountno") ||
+      normalizedError.includes("account no")
+    ) {
+      return "Lambarka bixinta waa khaldan yahay ama lama aqoonsan. Fadlan hubi lambarka oo mar kale isku day.";
+    }
+
     if (backendError) {
       const mapped = mapBackendErrorMessage(backendError);
       if (mapped && mapped.trim().length > 0 && !mapped.toLowerCase().includes("khalad")) {
