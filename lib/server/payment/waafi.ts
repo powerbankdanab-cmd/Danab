@@ -241,6 +241,83 @@ export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
   return state === "CANCELLED" || state === "REVERSED" || state === "FAILED";
 }
 
+function classifyWaafiPaymentStatus(
+  statusResponse: WaafiResponse,
+): "pending" | "paid" | "cancelled" | "failed" | "unknown" {
+  if (isWaafiApproved(statusResponse)) {
+    return "paid";
+  }
+
+  const state = getWaafiLifecycleState(statusResponse);
+  const responseCode = String(statusResponse.responseCode || "").trim();
+  const responseMsg = String(statusResponse.responseMsg || "").toLowerCase();
+  const errorCode = String(statusResponse.errorCode || "").toLowerCase();
+  const combinedReason = `${responseMsg} ${errorCode}`;
+
+  const cancelledTerms = [
+    "cancel",
+    "dismiss",
+    "abandon",
+    "abort",
+    "user cancelled",
+    "closed by user",
+    "timeout waiting pin",
+  ];
+  const failedTerms = [
+    "wrong pin",
+    "invalid pin",
+    "rejected",
+    "declined",
+    "denied",
+    "insufficient",
+    "failed",
+  ];
+
+  if (
+    state === "CANCELLED" ||
+    state === "REVERSED" ||
+    state === "ABANDONED" ||
+    state === "EXPIRED" ||
+    cancelledTerms.some((term) => combinedReason.includes(term))
+  ) {
+    return "cancelled";
+  }
+
+  if (
+    state === "FAILED" ||
+    state === "DECLINED" ||
+    state === "REJECTED" ||
+    failedTerms.some((term) => combinedReason.includes(term))
+  ) {
+    return "failed";
+  }
+
+  if (responseCode === "2001") {
+    return "paid";
+  }
+
+  if (
+    responseCode === "2002" ||
+    responseCode === "2003" ||
+    state === "INITIATED" ||
+    state === "PENDING" ||
+    state === "PROCESSING" ||
+    combinedReason.includes("pending") ||
+    combinedReason.includes("processing") ||
+    combinedReason.includes("waiting")
+  ) {
+    return "pending";
+  }
+
+  // Defensive fallback: if provider returned a concrete terminal-like response
+  // we don't recognize, prefer failed over "pending forever".
+  if (responseCode && responseCode !== "2002" && responseCode !== "2003") {
+    return "failed";
+  }
+
+  return "unknown";
+}
+
 export async function checkPaymentStatus(
   providerRef?: string | null,
   providerReferenceId?: string | null,
@@ -250,59 +327,21 @@ export async function checkPaymentStatus(
   }
 
   try {
-    const statusResponse = await queryWaafiTransactionStatus({
-      transactionId: providerRef,
-      referenceId: providerReferenceId,
-    });
-
-    if (isWaafiApproved(statusResponse)) {
-      return "paid";
+    if (providerRef) {
+      const byTransactionId = await queryWaafiTransactionStatus({
+        transactionId: providerRef,
+      });
+      const transactionStatus = classifyWaafiPaymentStatus(byTransactionId);
+      if (transactionStatus !== "unknown") {
+        return transactionStatus;
+      }
     }
 
-    const state = getWaafiLifecycleState(statusResponse);
-    const responseCode = String(statusResponse.responseCode || "").trim();
-    const responseMsg = String(statusResponse.responseMsg || "").toLowerCase();
-    const errorCode = String(statusResponse.errorCode || "").toLowerCase();
-    const combinedReason = `${responseMsg} ${errorCode}`;
-
-    if (
-      state === "CANCELLED" ||
-      state === "REVERSED" ||
-      state === "ABANDONED" ||
-      state === "EXPIRED" ||
-      combinedReason.includes("cancel") ||
-      combinedReason.includes("dismiss") ||
-      combinedReason.includes("user cancelled")
-    ) {
-      return "cancelled";
-    }
-
-    if (
-      state === "FAILED" ||
-      state === "DECLINED" ||
-      state === "REJECTED" ||
-      combinedReason.includes("wrong pin") ||
-      combinedReason.includes("invalid pin") ||
-      combinedReason.includes("rejected") ||
-      combinedReason.includes("declined")
-    ) {
-      return "failed";
-    }
-
-    if (responseCode === "2001") {
-      return "paid";
-    }
-
-    if (
-      responseCode === "2002" ||
-      responseCode === "2003" ||
-      state === "INITIATED" ||
-      state === "PENDING" ||
-      state === "PROCESSING" ||
-      combinedReason.includes("pending") ||
-      combinedReason.includes("processing")
-    ) {
-      return "pending";
+    if (providerReferenceId) {
+      const byReferenceId = await queryWaafiTransactionStatus({
+        referenceId: providerReferenceId,
+      });
+      return classifyWaafiPaymentStatus(byReferenceId);
     }
 
     return "unknown";
