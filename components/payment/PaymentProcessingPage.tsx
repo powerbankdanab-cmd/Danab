@@ -88,6 +88,28 @@ export function PaymentProcessingPage() {
     ));
   };
 
+  const getFriendlyFailureMessage = (
+    reason?: ApiResponse["reason"],
+    backendError?: string,
+  ) => {
+    if (reason === "user_cancelled") {
+      return "Waad joojisay bixinta. Lacag lagama jarin. Payment cancelled. No money charged.";
+    }
+
+    if (reason === "timeout") {
+      return "Lacag bixin wali ma dhicin. Fadlan sug wax yar ama mar kale isku day. Payment is still being verified.";
+    }
+
+    if (backendError) {
+      const mapped = mapBackendErrorMessage(backendError);
+      if (mapped && mapped.trim().length > 0 && !mapped.toLowerCase().includes("khalad")) {
+        return mapped;
+      }
+    }
+
+    return "Lacag bixin ma dhicin. Lacag lagama jarin. Fadlan mar kale isku day. Payment did not complete. No money charged. Please try again.";
+  };
+
   const stopPolling = () => {
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
@@ -166,7 +188,7 @@ export function PaymentProcessingPage() {
           stopPolling();
         } else {
           setStatus("FAILED");
-          setErrorMessage(mapBackendErrorMessage(data.error || "Khalad ayaa dhacay"));
+          setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
           updateStepStatus("confirmed", "failed");
           stopPolling();
         }
@@ -241,10 +263,10 @@ export function PaymentProcessingPage() {
         if (data.status === "failed") {
           setFailureReason(data.reason);
           if (data.reason === "user_cancelled") {
-            setErrorMessage("Waad joojisay bixinta. Lacag lagama jarin. Payment cancelled. No money charged.");
+            setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
             console.info("PAYMENT_USER_CANCELLED", { transactionId });
           } else {
-            setErrorMessage(mapBackendErrorMessage(data.error || "Khalad ayaa dhacay."));
+            setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
             console.info("PAYMENT_FAILED", { transactionId, reason: data.reason || "unknown" });
           }
           updateStepStatus("confirmed", "failed");
