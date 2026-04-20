@@ -45,11 +45,11 @@ import {
   requestWaafiPreauthorization,
 } from "@/lib/server/payment/waafi";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
-import { 
-  BatteryPresence, 
-  BatterySnapshot, 
-  DeliveryConfidence, 
-  VerificationResult 
+import {
+  BatteryPresence,
+  BatterySnapshot,
+  DeliveryConfidence,
+  VerificationResult
 } from "@/lib/server/payment/types";
 
 const MAX_UNLOCK_ATTEMPTS = 5;
@@ -348,7 +348,7 @@ export async function processPayment(
     // ── Waafi hold first, then eject, then commit/cancel ─────────
     const preauthReferenceId = `ref-${Date.now()}`;
     let preauthResponse;
-    
+
     try {
       preauthResponse = await requestWaafiPreauthorization({
         phoneNumber,
@@ -356,9 +356,9 @@ export async function processPayment(
         referenceId: preauthReferenceId,
       });
     } catch (error) {
-      const isTimeout = error instanceof Error && 
+      const isTimeout = error instanceof Error &&
         (error.message.includes("timed out") || error.message.includes("timeout"));
-        
+
       if (isTimeout) {
         await transitionPaymentTransactionState({
           id: idempotencyKey,
@@ -370,7 +370,7 @@ export async function processPayment(
             updatedAt: Date.now(),
           }
         });
-        
+
         await logError({
           type: "ASYNC_PAYMENT_PENDING",
           transactionId: idempotencyKey,
@@ -378,10 +378,10 @@ export async function processPayment(
           metadata: { phoneNumber, amount, referenceId: preauthReferenceId }
         });
 
-        return { 
-          status: "pending", 
+        return {
+          status: "pending",
           message: "waiting_for_user_payment",
-          transactionId: idempotencyKey 
+          transactionId: idempotencyKey
         };
       }
       throw error;
@@ -392,11 +392,11 @@ export async function processPayment(
       // based on Waafi response codes, but for now we follow the instruction:
       // "IF Waafi does not immediately confirm success -> move to pending_payment"
       // or at least handle the "waiting for user payment" UX.
-      
+
       const responseCode = String(preauthResponse.responseCode);
       // Some providers use specific codes for "Pending/Processing"
       // If we are unsure, we move to pending_payment anyway to be safe.
-      
+
       await transitionPaymentTransactionState({
         id: idempotencyKey,
         from: "initiated",
@@ -410,35 +410,35 @@ export async function processPayment(
             imei,
             stationCode,
             batteryId: reservedBatteryId,
-            slotId: candidate.slot_id,
+            slotId: battery.slot_id,
             phoneNumber,
             // phoneAuthority and other fields can be updated later if needed
           }
         }
       });
 
-      return { 
-        status: "pending", 
+      return {
+        status: "pending",
         message: "waiting_for_user_payment",
-        transactionId: idempotencyKey 
+        transactionId: idempotencyKey
       };
     }
 
     const { transactionId, issuerTransactionId, referenceId } =
       extractWaafiIds(preauthResponse);
-      
+
     if (transactionId) {
       holdCreated = true;
       holdTransactionId = transactionId;
     }
-    
+
     const preauthAudit = extractWaafiAudit(preauthResponse);
     const waafiConfirmedPhoneNumber =
       typeof preauthAudit.waafiConfirmedPhoneNumber === "string" &&
-      preauthAudit.waafiConfirmedPhoneNumber.trim().length > 0
+        preauthAudit.waafiConfirmedPhoneNumber.trim().length > 0
         ? preauthAudit.waafiConfirmedPhoneNumber.trim()
         : null;
-    
+
     const canonicalPhoneNumber = phoneNumber;
     const phoneAuthority = waafiConfirmedPhoneNumber
       ? waafiConfirmedPhoneNumber === phoneNumber
@@ -534,9 +534,9 @@ export async function processPayment(
       } catch (error) {
         duplicateCancelFailed = true;
         await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+          transactionId: idempotencyKey,
+          providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Failed to cancel duplicate preauthorization hold",
@@ -609,9 +609,9 @@ export async function processPayment(
         holdTransactionId = null;
       } catch (cancelErr) {
         await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+          transactionId: idempotencyKey,
+          providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Failed to cancel hold after battery-not-in-slot — REQUIRES MANUAL INTERVENTION",
@@ -637,7 +637,7 @@ export async function processPayment(
 
     const processStartTime = Date.now();
     const VERIFICATION_TIMEOUT_MS = 12000;
-    
+
     let confidence: DeliveryConfidence = "LOW";
     let verification: VerificationResult | null = null;
 
@@ -652,7 +652,7 @@ export async function processPayment(
           slotId: currentBattery.slot_id,
         });
         unlockCommandAccepted = true;
-        
+
         verification = await verifyDeliveryWithConfidence(
           imei,
           currentBattery.battery_id,
@@ -714,7 +714,7 @@ export async function processPayment(
     }
 
     // --- Capture Rules ---
-    
+
     if (confidence === "MEDIUM") {
       // Step 4: Optional User Confirmation for MEDIUM
       // Transition to confirm_required state and persist metadata for later resolution
@@ -779,9 +779,9 @@ export async function processPayment(
           );
         } catch (recoveryError) {
           await logError({
-        type: "PROBLEM_SLOT_MARK_FAILED",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+            type: "PROBLEM_SLOT_MARK_FAILED",
+            transactionId: idempotencyKey,
+            providerRef: transactionId,
             stationCode,
             phoneNumber,
             message: "Failed to mark problem slot after ejection verification failure",
@@ -831,9 +831,9 @@ export async function processPayment(
 
       if (cancelError) {
         await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+          transactionId: idempotencyKey,
+          providerRef: transactionId,
           stationCode,
           phoneNumber,
           message: "Ejection failed AND hold cancellation failed — REQUIRES MANUAL INTERVENTION",
@@ -913,18 +913,18 @@ export async function processPayment(
  */
 export async function finalizeCapture(idempotencyKey: string): Promise<any> {
   const tx = await getPaymentTransaction(idempotencyKey);
-  
+
   if (!tx || (tx.status !== "held" && tx.status !== "confirm_required" && tx.status !== "captured" && tx.status !== "verified")) {
     throw new HttpError(400, `Transaction in invalid state for capture: ${tx?.status}`);
   }
 
   // Idempotency: If already captured and rental created, return success
   if (tx.status === "captured" && tx.rentalCreated) {
-    return { 
-      status: "captured", 
-      success: true, 
-      battery_id: tx.delivery?.batteryId, 
-      slot_id: tx.delivery?.slotId 
+    return {
+      status: "captured",
+      success: true,
+      battery_id: tx.delivery?.batteryId,
+      slot_id: tx.delivery?.slotId
     };
   }
 
@@ -1028,7 +1028,7 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
  */
 export async function cancelHold(idempotencyKey: string, reason: string): Promise<any> {
   const tx = await getPaymentTransaction(idempotencyKey);
-  
+
   if (tx?.status === "failed") {
     return { status: "failed", success: true };
   }
@@ -1056,7 +1056,7 @@ export async function handleUserConfirmation(
   confirmed: boolean,
 ): Promise<any> {
   const tx = await getPaymentTransaction(idempotencyKey);
-  
+
   // 1. Idempotency Check
   if (tx?.status === "captured" || tx?.status === "failed") {
     return { status: tx.status };
@@ -1109,16 +1109,16 @@ async function performEjectionAndVerification(input: {
   phoneAuthority: string;
   canonicalPhoneNumber: string;
 }) {
-  const { 
-    idempotencyKey, 
-    transactionId, 
-    stationCode, 
-    phoneNumber, 
-    imei, 
-    battery, 
-    preauthAudit, 
-    phoneAuthority, 
-    canonicalPhoneNumber 
+  const {
+    idempotencyKey,
+    transactionId,
+    stationCode,
+    phoneNumber,
+    imei,
+    battery,
+    preauthAudit,
+    phoneAuthority,
+    canonicalPhoneNumber
   } = input;
 
   await ensurePaymentTransactionState(idempotencyKey, "held");
@@ -1128,7 +1128,7 @@ async function performEjectionAndVerification(input: {
   const currentBattery = battery;
   let confidence: DeliveryConfidence = "LOW";
   let verification: VerificationResult | null = null;
-  
+
   const preUnlockSnapshot = await getBatterySnapshot(imei, currentBattery.battery_id, currentBattery.slot_id);
 
   if (preUnlockSnapshot.presence !== "present") {
@@ -1219,7 +1219,7 @@ async function performEjectionAndVerification(input: {
  */
 export async function resumePendingPayment(transaction: PaymentTransactionRecord) {
   const { id: idempotencyKey, phone: phoneNumber, station: stationCode, delivery, waafiAudit } = transaction;
-  
+
   if (!delivery || !waafiAudit) {
     throw new Error("Cannot resume pending payment: missing delivery/audit metadata");
   }
