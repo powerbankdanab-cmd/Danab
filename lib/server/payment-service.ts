@@ -9,7 +9,9 @@ export {
   getPaymentTransaction,
   patchPaymentTransaction,
   transitionPaymentTransactionState,
-  listStaleTransactionsForReconciliation
+  listStaleTransactionsForReconciliation,
+  claimTransactionRecovery,
+  releaseTransactionRecovery
 } from "@/lib/server/payment/transactions";
 export { 
   processPayment, 

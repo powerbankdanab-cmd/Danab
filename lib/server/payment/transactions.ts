@@ -239,16 +239,16 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .collection(PAYMENT_TRANSACTIONS_COLLECTION)
     .where("status", "==", "confirm_required")
     .where("updatedAt", "<", sixtySecondsAgo)
+    .orderBy("updatedAt")
     .limit(limit)
     .get();
 
   // Query 2: captured that are missing rentals
-  // Firestore doesn't support != for boolean efficiently with limit combined with other filters here,
-  // so we'll filter in JS or just get more.
   const capturedSnap = await db
     .collection(PAYMENT_TRANSACTIONS_COLLECTION)
     .where("status", "==", "captured")
-    .limit(limit * 2) // Get a bit more to account for those already linked
+    .orderBy("updatedAt")
+    .limit(limit * 2)
     .get();
 
   const results: PaymentTransactionRecord[] = [];

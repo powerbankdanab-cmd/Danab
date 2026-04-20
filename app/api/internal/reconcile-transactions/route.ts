@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { 
   listStaleTransactionsForReconciliation,
-  patchPaymentTransaction,
+  claimTransactionRecovery,
+  releaseTransactionRecovery,
   finalizeCapture,
   cancelHold
 } from "@/lib/server/payment-service";
-import { logError } from "@/lib/server/alerts/log-error";
+import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 
 export const dynamic = "force-dynamic";
 
@@ -27,67 +28,74 @@ async function reconcile(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // 2. Fetch Stale Transactions
+    // 2. Fetch Stale Transactions (Ordered by updatedAt)
     const staleTransactions = await listStaleTransactionsForReconciliation(20);
     
-    const results = {
+    const stats = {
       processed: staleTransactions.length,
       cancelled: 0,
       repaired: 0,
+      locked: 0,
       errors: 0
     };
 
-    const workerId = `recon-worker-${Date.now()}`;
+    const workerId = `recon-${Date.now()}`;
 
     // 3. Process Batch
-    for (const tx of staleTransactions) {
+    for (const staleTx of staleTransactions) {
+      // Step 6: Atomic Safety Lock (30s lease)
+      const claim = await claimTransactionRecovery({
+        id: staleTx.id,
+        workerId,
+        leaseMs: 30000
+      });
+
+      if (!claim) {
+        stats.locked++;
+        continue;
+      }
+
+      const { record: tx, recoveryVersion } = claim;
+
       try {
-        // Step 6: Safety Lock (30s)
-        const now = Date.now();
-        if (tx.recoveryLeaseUntil && tx.recoveryLeaseUntil > now) {
-          continue; // Skip if already locked
-        }
-
-        // Apply lock
-        await patchPaymentTransaction({
-          id: tx.id,
-          patch: {
-            recoveryLeaseUntil: now + 30000, // 30s lock
-            recoveryWorkerId: workerId,
-          }
-        });
-
         if (tx.status === "confirm_required") {
-          // Rule: now - updatedAt > 60s (already filtered by query)
-          await cancelHold(tx.id, "CONFIRM_TIMEOUT (Automatic reconciliation)");
-          results.cancelled++;
+          await cancelHold(tx.id, "AUTO_CANCEL_TIMEOUT (Distributed reconciliation)");
+          stats.cancelled++;
           
           await logError({
             type: "CONFIRM_TIMEOUT_AUTO_CANCEL",
             transactionId: tx.id,
             stationCode: tx.station,
-            message: "Transaction timed out on user confirmation screen and was auto-cancelled."
+            message: `[RECON] Auto-cancelled stale confirmation (${Math.floor((Date.now() - tx.updatedAt)/1000)}s old)`,
+            metadata: { action: "AUTO_CANCEL_TIMEOUT", station: tx.station, slotId: tx.delivery?.slotId }
           });
         } 
         else if (tx.status === "captured" && !tx.rentalCreated) {
-          // Rule: Status captured but no rental log created
           await finalizeCapture(tx.id);
-          results.repaired++;
+          stats.repaired++;
 
           await logError({
             type: "REPAIR_MISSING_RENTAL",
             transactionId: tx.id,
             stationCode: tx.station,
-            message: "Captured transaction was missing a rental log. Repaired via reconciliation."
+            message: "[RECON] Repaired missing rental for captured transaction",
+            metadata: { action: "REPAIR_MISSING_RENTAL", station: tx.station, slotId: tx.delivery?.slotId }
           });
         }
       } catch (err) {
-        results.errors++;
-        console.error(`Reconciliation error for ${tx.id}:`, err);
+        stats.errors++;
+        console.error(`Reconciliation failed for ${tx.id}:`, err);
+      } finally {
+        await releaseTransactionRecovery(tx.id, workerId, recoveryVersion);
       }
     }
 
-    return NextResponse.json(results);
+    return NextResponse.json(stats);
+  } catch (error) {
+    console.error("Reconciliation worker crashed:", error);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}
   } catch (error) {
     console.error("Reconciliation worker crashed:", error);
     return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
