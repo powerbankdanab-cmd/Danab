@@ -142,3 +142,23 @@ export function ArrowRightIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+export function HelpCircleIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3m0 4h.01"
+      />
+    </svg>
+  );
+}

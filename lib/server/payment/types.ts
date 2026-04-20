@@ -53,4 +53,32 @@ export type PaymentDuplicatePayload = {
   transactionId: string;
 };
 
-export type PaymentPayload = PaymentSuccessPayload | PaymentDuplicatePayload;
+export type PaymentConfirmRequiredPayload = {
+  status: "confirm_required";
+  message: string;
+  transactionId: string;
+};
+
+export type PaymentPayload = 
+  | PaymentSuccessPayload 
+  | PaymentDuplicatePayload 
+  | PaymentConfirmRequiredPayload;
+
+export type BatteryPresence = "present" | "missing" | "unknown";
+
+export type BatterySnapshot = {
+  presence: BatteryPresence;
+  lockStatus: string | null;
+  slotStatus: string | null;
+  batteryStatus: string | null;
+  observedAt: number;
+};
+
+export type DeliveryConfidence = "HIGH" | "MEDIUM" | "LOW";
+
+export type VerificationResult = {
+  confidence: DeliveryConfidence;
+  snapshots: BatterySnapshot[];
+  phase1Result: BatteryPresence;
+  phase2Result: BatteryPresence;
+};

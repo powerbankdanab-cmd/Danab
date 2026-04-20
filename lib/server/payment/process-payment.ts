@@ -44,22 +44,16 @@ import {
   mergeWaafiAuditRecords,
   requestWaafiPreauthorization,
 } from "@/lib/server/payment/waafi";
+import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
+import { 
+  BatteryPresence, 
+  BatterySnapshot, 
+  DeliveryConfidence, 
+  VerificationResult 
+} from "@/lib/server/payment/types";
 
 const MAX_UNLOCK_ATTEMPTS = 5;
 const UNLOCK_RETRY_DELAY_MS = 2_000;
-// Increased poll rounds for more confident detection.
-// Each poll is a full HeyCharge station query.
-const UNLOCK_VERIFY_POLL_MS = [250, 350, 400, 500] as const;
-const REQUIRED_CONSECUTIVE_MISSING = 2;
-
-type BatteryPresence = "present" | "missing" | "unknown";
-type BatterySnapshot = {
-  presence: BatteryPresence;
-  lockStatus: string | null;
-  slotStatus: string | null;
-  batteryStatus: string | null;
-  observedAt: number;
-};
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,78 +112,6 @@ async function getBatterySnapshot(
   }
 }
 
-/**
- * Verify battery ejection after a successful unlock command.
- *
- * STRICT RULES:
- * 1. Requires REQUIRED_CONSECUTIVE_MISSING (2) consecutive "missing" reads
- *    to confirm ejection. A single "missing" read is NOT sufficient.
- * 2. Any "present" read between "missing" reads resets the counter.
- * 3. An "unknown" read does NOT count as "missing" — only definitive
- *    "missing" reads (battery not found in station query) count.
- * 4. If we finish the main polling without 2 consecutive missing reads,
- *    we do additional confirmation reads ONLY if we saw at least one
- *    missing. Both additional reads must return "missing".
- */
-async function verifyEjectionAfterUnlock(
-  imei: string,
-  batteryId: string,
-  slotId: string,
-  preUnlock: BatterySnapshot,
-): Promise<BatteryPresence> {
-  let consecutiveMissing = 0;
-
-  for (const waitMs of UNLOCK_VERIFY_POLL_MS) {
-    await delay(waitMs);
-    const snapshot = await getBatterySnapshot(imei, batteryId, slotId);
-
-    if (snapshot.presence === "missing") {
-      consecutiveMissing += 1;
-      if (consecutiveMissing >= REQUIRED_CONSECUTIVE_MISSING) {
-        return "missing";
-      }
-      continue;
-    }
-
-    if (snapshot.presence === "present") {
-      // Battery is confirmed still in slot. Reset consecutive counter.
-      consecutiveMissing = 0;
-
-      // If pre-unlock was locked (lock_status "1") and still locked,
-      // and we haven't confirmed any missing reads, the unlock may
-      // not have taken effect yet — allow the loop to continue.
-      if (
-        preUnlock.presence === "present" &&
-        preUnlock.lockStatus === "1" &&
-        snapshot.lockStatus === "1"
-      ) {
-        continue;
-      }
-
-      return "present";
-    }
-
-    // "unknown" — API error; treat as inconclusive (do NOT count as missing)
-    consecutiveMissing = 0;
-  }
-
-  // If we saw exactly 1 missing at the end of the loop, do 2 additional
-  // confirmation reads. BOTH must return "missing" to confirm.
-  if (consecutiveMissing === 1) {
-    for (let confirm = 0; confirm < REQUIRED_CONSECUTIVE_MISSING; confirm++) {
-      await delay(500);
-      const snapshot = await getBatterySnapshot(imei, batteryId, slotId);
-      if (snapshot.presence !== "missing") {
-        // Confirmation failed — battery may still be present or state is indeterminate
-        return snapshot.presence === "present" ? "present" : "unknown";
-      }
-    }
-    // Both confirmation reads returned "missing" — now confident
-    return "missing";
-  }
-
-  return "unknown";
-}
 
 async function markTransactionFailed(
   transactionId: string,
@@ -649,6 +571,12 @@ export async function processPayment(
       );
     }
 
+    const processStartTime = Date.now();
+    const VERIFICATION_TIMEOUT_MS = 12000;
+    
+    let confidence: DeliveryConfidence = "LOW";
+    let verification: VerificationResult | null = null;
+
     for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
       unlockAttempts = attempt;
       unlockCommandAccepted = false;
@@ -660,109 +588,101 @@ export async function processPayment(
           slotId: currentBattery.slot_id,
         });
         unlockCommandAccepted = true;
-        lastKnownPresence = await verifyEjectionAfterUnlock(
+        
+        verification = await verifyDeliveryWithConfidence(
           imei,
           currentBattery.battery_id,
           currentBattery.slot_id,
-          preUnlockSnapshot,
+          {
+            stationCode,
+            phoneNumber,
+            transactionId: idempotencyKey
+          }
         );
 
-        if (lastKnownPresence === "missing") {
-          // Unlock command succeeded AND battery confirmed missing — verified ejection
+        confidence = verification.confidence;
+
+        if (confidence === "HIGH") {
           verifiedEjection = true;
           lastUnlockError = null;
           break;
         }
 
-        lastUnlockError = new Error(
-          lastKnownPresence === "present"
-            ? "Battery unlock command succeeded, but battery is still present in slot"
-            : "Battery unlock command succeeded, but eject could not be verified",
-        );
+        if (confidence === "MEDIUM") {
+          // Rule: If MEDIUM, we stop retrying and ask user for confirmation
+          lastUnlockError = new Error("Delivery confidence is MEDIUM - user confirmation required");
+          break;
+        }
 
-        await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-          stationCode,
-          phoneNumber,
-          message: `Unlock attempt ${attempt}/${MAX_UNLOCK_ATTEMPTS}: command succeeded but ejection not confirmed`,
-          metadata: {
-            imei,
-            batteryId: currentBattery.battery_id,
-            slotId: currentBattery.slot_id,
-            attempt,
-            maxAttempts: MAX_UNLOCK_ATTEMPTS,
-            presence: lastKnownPresence,
-            unlockCommandAccepted: true,
-          },
-        });
+        // Logic for LOW confidence: retry if time permits
+        const elapsed = Date.now() - processStartTime;
+        if (elapsed > VERIFICATION_TIMEOUT_MS) {
+          await logError({
+            type: "VERIFICATION_TIMEOUT",
+            transactionId: idempotencyKey,
+            stationCode,
+            phoneNumber,
+            message: "Max time exceeded during unlock/verification",
+            metadata: { elapsed, attempt }
+          });
+          break;
+        }
+
+        lastUnlockError = new Error(`Verification confidence is ${confidence}`);
       } catch (unlockError) {
-        // STRICT RULE: If the unlock command itself failed, NEVER treat as success.
-        // A "missing" snapshot after a failed command is unreliable (stale reads, transient HeyCharge errors).
         lastUnlockError = unlockError;
-
-        // Record presence for diagnostics only — do NOT use it to override the error
-        const snapshot = await getBatterySnapshot(
-          imei,
-          currentBattery.battery_id,
-          currentBattery.slot_id,
-        );
-        lastKnownPresence = snapshot.presence;
-
         await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+          type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+          transactionId: idempotencyKey,
+          providerRef: transactionId,
           stationCode,
           phoneNumber,
-          message: `Unlock attempt ${attempt}/${MAX_UNLOCK_ATTEMPTS}: command failed`,
+          message: `Unlock attempt ${attempt}/${MAX_UNLOCK_ATTEMPTS} failed`,
           metadata: {
-            imei,
-            batteryId: currentBattery.battery_id,
-            slotId: currentBattery.slot_id,
-            attempt,
-            maxAttempts: MAX_UNLOCK_ATTEMPTS,
-            unlockCommandAccepted: false,
-            presence: lastKnownPresence,
-            error: unlockError instanceof Error ? unlockError.message : String(unlockError),
-            presenceAfterError: lastKnownPresence === "missing"
-              ? "missing_but_NOT_treated_as_success"
-              : lastKnownPresence,
-          },
+            error: unlockError instanceof Error ? unlockError.message : String(unlockError)
+          }
         });
       }
 
-      if (attempt < MAX_UNLOCK_ATTEMPTS) {
-        await logError({
-        type: "UNLOCK_RETRY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-          stationCode,
-          phoneNumber,
-          message: `Retrying unlock for battery ${currentBattery.battery_id} after attempt ${attempt}`,
-          metadata: {
-            imei,
-            batteryId: currentBattery.battery_id,
-            slotId: currentBattery.slot_id,
-            attempt,
-            maxAttempts: MAX_UNLOCK_ATTEMPTS,
-            retryDelayMs: UNLOCK_RETRY_DELAY_MS,
-          },
-        });
+      if (attempt < MAX_UNLOCK_ATTEMPTS && confidence === "LOW") {
         await delay(UNLOCK_RETRY_DELAY_MS);
       }
     }
 
-    // STRICT GATE: Only proceed to payment if ejection was verified via
-    // a successful unlock command + confirmed "missing" polls.
-    // There are NO fallback paths that convert failure into success.
-    if (!verifiedEjection) {
-      const failureNote = lastUnlockError
-        ? lastKnownPresence === "present"
-          ? `Unlock ${unlockCommandAccepted ? "verification" : "request"} failed after ${unlockAttempts} attempts, battery still present`
-          : `Unlock ${unlockCommandAccepted ? "verification" : "request"} failed after ${unlockAttempts} attempts, presence=${lastKnownPresence}`
-        : `Battery ejection not confirmed after ${unlockAttempts} attempts, presence=${lastKnownPresence}`;
+    // --- Capture Rules ---
+    
+    if (confidence === "MEDIUM") {
+      // Step 4: Optional User Confirmation for MEDIUM
+      // Transition to confirm_required state and persist metadata for later resolution
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "held",
+        to: "confirm_required",
+        patch: {
+          confirmRequiredAt: Date.now(),
+          delivery: {
+            imei,
+            stationCode,
+            batteryId: currentBattery.battery_id,
+            slotId: currentBattery.slot_id,
+            phoneAuthority,
+            unlockAttempts,
+            requestedPhoneNumber: phoneNumber,
+            canonicalPhoneNumber,
+          },
+          waafiAudit: preauthAudit,
+        },
+      });
+
+      return {
+        status: "confirm_required",
+        message: "Did the power bank come out?",
+        transactionId: idempotencyKey
+      };
+    }
+
+    if (confidence !== "HIGH") {
+      const failureNote = lastUnlockError?.message || `Verification failed with ${confidence} confidence`;
 
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
@@ -776,8 +696,8 @@ export async function processPayment(
           batteryId: currentBattery.battery_id,
           slotId: currentBattery.slot_id,
           unlockAttempts,
-          unlockCommandAccepted,
-          lastKnownPresence,
+          confidence,
+          verification,
           failureNote,
           lastUnlockError: lastUnlockError instanceof Error
             ? lastUnlockError.message
@@ -785,7 +705,7 @@ export async function processPayment(
         },
       });
 
-      if (lastKnownPresence === "present" || lastKnownPresence === "unknown") {
+      if (confidence === "LOW") {
         try {
           await markProblemSlot(
             imei,
@@ -896,346 +816,199 @@ export async function processPayment(
       );
     }
 
+    return finalizeCapture(idempotencyKey);
+  } catch (error) {
+/**
+ * Finalizes the payment by committing the preauthorization and creating the rental log.
+ * This is called for both automatic (HIGH confidence) and manual (user confirmed) paths.
+ */
+/**
+ * Finalizes capture and rental creation for a verified delivery.
+ * IDEMPOTENT: returns success if already captured.
+ */
+export async function finalizeCapture(idempotencyKey: string): Promise<any> {
+  const tx = await getPaymentTransaction(idempotencyKey);
+  
+  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required" && tx.status !== "captured" && tx.status !== "verified")) {
+    throw new HttpError(400, `Transaction in invalid state for capture: ${tx?.status}`);
+  }
+
+  // Idempotency: If already captured and rental created, return success
+  if (tx.status === "captured" && tx.rentalCreated) {
+    return { 
+      status: "captured", 
+      success: true, 
+      battery_id: tx.delivery?.batteryId, 
+      slot_id: tx.delivery?.slotId 
+    };
+  }
+
+  const {
+    providerRef: transactionId,
+    providerIssuerRef: issuerTransactionId,
+    providerReferenceId: referenceId,
+    waafiAudit: preauthAudit,
+    delivery,
+    phone: phoneNumber,
+    amount,
+    station: stationCode,
+  } = tx;
+
+  if (!delivery) {
+    throw new HttpError(500, "Missing delivery metadata for capture");
+  }
+
+  const {
+    imei,
+    batteryId,
+    slotId,
+    phoneAuthority,
+    unlockAttempts,
+    canonicalPhoneNumber,
+  } = delivery;
+
+  // 1. Move to 'verified' state if not already past it
+  if (tx.status !== "verified" && tx.status !== "captured") {
     await transitionPaymentTransactionState({
       id: idempotencyKey,
-      from: "held",
+      from: tx.status,
       to: "verified",
-      patch: {
-        verifiedAt: Date.now(),
-        delivery: {
-          imei,
-          stationCode,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          phoneAuthority,
-          unlockAttempts,
-          requestedPhoneNumber: phoneNumber,
-          canonicalPhoneNumber,
-        },
-        waafiAudit: preauthAudit,
-      },
+      patch: { verifiedAt: Date.now() },
     });
+  }
 
+  // 2. Commit Waafi (Only if not already captured)
+  if (tx.status !== "captured") {
     let commitResponse;
     try {
-      await ensurePaymentTransactionState(idempotencyKey, "verified");
-      
-      // Step 7 - final assurance check
-      if (!verifiedEjection) {
-        throw new Error("Invariant violation: capture without verified ejection");
-      }
-      
-      // Successfully reached commit phase — clear hold tracking
-      holdTransactionId = null;
-      
       commitResponse = await commitWaafiPreauthorization({
-        transactionId,
-        description: "Powerbank rental committed after successful eject",
+        transactionId: transactionId!,
+        description: "Powerbank rental committed after delivery verification",
       });
     } catch (error) {
-      await transitionPaymentTransactionState({
-        id: idempotencyKey,
-        from: "verified",
-        to: "capture_unknown",
-        patch: {
-          captureUnknownAt: Date.now(),
-          failureReason: `Waafi commit request failed: ${error instanceof Error ? error.message : String(error)}`,
-        },
-      });
-
       await logError({
-        type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
+        type: CRITICAL_ERROR_TYPES.SYSTEM_INCONSISTENCY,
         transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Waafi commit request failed after verified ejection",
-        metadata: {
-          idempotencyKey,
-          imei,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          unlockAttempts,
-          reason: error instanceof Error ? error.message : String(error),
-        },
-      });
-
-      await notifyPaidButNotEjected({
-        phoneNumber,
-        amount,
-        imei,
-        stationCode,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
-        transactionId,
-        issuerTransactionId,
-        referenceId,
-        unlockAttempts,
-        reason: `Battery released, but Waafi commit request failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
-
-      throw new HttpError(
-        502,
-        "Battery was released, but payment confirmation could not be completed. Please contact support.",
-        {
-          transactionId,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          unlockAttempts,
-        },
-      );
-    }
-
-    if (!isWaafiApproved(commitResponse)) {
-      await transitionPaymentTransactionState({
-        id: idempotencyKey,
-        from: "verified",
-        to: "capture_unknown",
-        patch: {
-          captureUnknownAt: Date.now(),
-          failureReason:
-            commitResponse.responseMsg ||
-            "Waafi commit not approved after verified ejection",
-        },
-      });
-
-      await logError({
-        type: CRITICAL_ERROR_TYPES.CAPTURE_UNKNOWN,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Waafi commit response not approved after verified ejection",
-        metadata: {
-          idempotencyKey,
-          imei,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          unlockAttempts,
-          waafiResponseMsg: commitResponse.responseMsg || null,
-          waafiResponseCode:
-            commitResponse.responseCode !== undefined
-              ? String(commitResponse.responseCode)
-              : null,
-          waafiState: commitResponse.params?.state || null,
-        },
-      });
-
-      await notifyPaidButNotEjected({
-        phoneNumber,
-        amount,
-        imei,
-        stationCode,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
-        transactionId,
-        issuerTransactionId,
-        referenceId,
-        unlockAttempts,
-        reason: "Battery likely ejected, but Waafi commit was not approved",
-      });
-
-      throw new HttpError(
-        502,
-        "Battery was released, but payment confirmation could not be completed. Please contact support.",
-        {
-          transactionId,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          unlockAttempts,
-        },
-      );
-    }
-
-    try {
-      await transitionPaymentTransactionState({
-        id: idempotencyKey,
-        from: "verified",
-        to: "captured",
-        patch: {
-          capturedAt: Date.now(),
-          providerRef: transactionId,
-          rentalCreated: false,
-        },
-      });
-    } catch (err) {
-      await logError({
-        type: "SYSTEM_INCONSISTENCY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Post-capture failure: transition to captured state failed",
-        metadata: { error: String(err) }
-      });
-      throw err;
-    }
-
-    const commitIds = extractWaafiIds(commitResponse);
-    const waafiAudit = mergeWaafiAuditRecords(
-      preauthAudit,
-      extractWaafiAudit(commitResponse),
-    );
-
-    try {
-      await patchPaymentTransaction({
-        id: idempotencyKey,
-        patch: {
-          providerRef: commitIds.transactionId || transactionId,
-          providerIssuerRef: commitIds.issuerTransactionId || issuerTransactionId,
-          providerReferenceId: commitIds.referenceId || referenceId || preauthReferenceId,
-        },
-      });
-    } catch (err) {
-      await logError({
-        type: "SYSTEM_INCONSISTENCY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Post-capture failure: patch Waafi IDs failed",
-        metadata: { error: String(err) }
-      });
-      throw err;
-    }
-
-    let rentalRef;
-    const resolvedTransactionId = commitIds.transactionId || transactionId;
-    try {
-      const existingRental = await getRentalByTransactionId(resolvedTransactionId);
-      if (existingRental) {
-        rentalRef = { id: existingRental.id };
-      } else {
-      rentalRef = await createRentalLog({
-        imei,
-        stationCode,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
-        phoneNumber: canonicalPhoneNumber,
-        requestedPhoneNumber: phoneNumber,
-        amount,
-        transactionId: resolvedTransactionId,
-        issuerTransactionId,
-        referenceId: commitIds.referenceId || referenceId || preauthReferenceId,
-        phoneAuthority,
-        waafiAudit,
-      });
-      }
-    } catch (error) {
-      if (error instanceof BatteryStateConflictError) {
-        await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-          stationCode,
-          phoneNumber,
-          message: "Payment captured but battery already linked to another active rental",
-          metadata: {
-            idempotencyKey,
-            imei,
-            batteryId: currentBattery.battery_id,
-            slotId: currentBattery.slot_id,
-            conflictBatteryId: error.batteryId,
-            activeRentalId: error.activeRentalId,
-          },
-        });
-
-        await notifyPaidButNotEjected({
-          phoneNumber,
-          amount,
-          imei,
-          stationCode,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
-          transactionId,
-          issuerTransactionId,
-          referenceId: commitIds.referenceId || referenceId || preauthReferenceId,
-          unlockAttempts,
-          reason: `Payment committed but battery already linked to active rental ${error.activeRentalId || "unknown"}`,
-        });
-
-        throw new HttpError(
-          409,
-          "Payment was confirmed, but this battery was already linked to another active rental. Please contact support.",
-          {
-            batteryId: error.batteryId,
-            activeRentalId: error.activeRentalId,
-            transactionId,
-          },
-        );
-      }
-
-      if (error instanceof BatteryStateConflictError) {
-        // ... (previous error handled above this line)
-        throw new HttpError(
-          409,
-          "Payment was confirmed, but this battery was already linked to another active rental. Please contact support.",
-          {
-            batteryId: error.batteryId,
-            activeRentalId: error.activeRentalId,
-            transactionId,
-          },
-        );
-      }
-
-      await logError({
-        type: "SYSTEM_INCONSISTENCY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Post-capture failure: createRentalLog failed",
+        message: "Waafi capture retry or failure",
         metadata: { error: String(error) }
       });
       throw error;
     }
 
-    try {
-      await patchPaymentTransaction({
-        id: idempotencyKey,
-        patch: {
-          rentalCreated: true,
-          rentalId: rentalRef.id,
-        },
-      });
-    } catch (err) {
-      await logError({
-        type: "SYSTEM_INCONSISTENCY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Post-capture failure: rentalCreated patch failed",
-        metadata: { error: String(err) }
-      });
-      throw err;
+    if (!isWaafiApproved(commitResponse)) {
+      throw new Error("Waafi capture not approved");
     }
 
-    try {
-      await releaseReservation(imei, currentBattery.battery_id);
-      reservedBatteryId = null;
-      await updateRentalUnlockStatus(rentalRef.id, "unlocked");
-    } catch (err) {
-      await logError({
-        type: "SYSTEM_INCONSISTENCY",
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
-        stationCode,
-        phoneNumber,
-        message: "Post-capture failure: updateRentalUnlockStatus failed",
-        metadata: { error: String(err) }
-      });
-      throw err;
-    }
+    // Move to 'captured' state
+    await transitionPaymentTransactionState({
+      id: idempotencyKey,
+      from: "verified",
+      to: "captured",
+      patch: { capturedAt: Date.now(), rentalCreated: false },
+    });
+  }
 
-    return {
-      success: true,
-      battery_id: currentBattery.battery_id,
-      slot_id: currentBattery.slot_id,
-      unlock,
-      waafiMessage: "Battery released and payment confirmed",
-      waafiResponse: commitResponse,
-    };
+  // 3. Create Rental Log (Only if not already created)
+  if (!tx.rentalCreated) {
+    const rentalRef = await createRentalLog({
+      imei,
+      stationCode,
+      batteryId,
+      slotId,
+      phoneNumber: canonicalPhoneNumber,
+      requestedPhoneNumber: phoneNumber,
+      amount,
+      transactionId: transactionId!,
+      issuerTransactionId: issuerTransactionId || null,
+      referenceId: referenceId || "manual",
+      phoneAuthority,
+      waafiAudit: preauthAudit || {},
+    });
+
+    await patchPaymentTransaction({
+      id: idempotencyKey,
+      patch: { rentalCreated: true, rentalId: rentalRef.id },
+    });
+
+    await releaseReservation(imei, batteryId);
+    await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+  }
+
+  return { status: "captured", success: true, battery_id: batteryId, slot_id: slotId };
+}
+
+/**
+ * Cancels a hold safely.
+ * IDEMPOTENT: returns success if already failed.
+ */
+export async function cancelHold(idempotencyKey: string, reason: string): Promise<any> {
+  const tx = await getPaymentTransaction(idempotencyKey);
+  
+  if (tx?.status === "failed") {
+    return { status: "failed", success: true };
+  }
+
+  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required")) {
+    throw new HttpError(400, "Transaction in invalid state for cancellation");
+  }
+
+  if (tx.providerRef) {
+    await cancelWaafiPreauthorization({
+      transactionId: tx.providerRef,
+      description: reason,
+    });
+  }
+
+  await markTransactionFailed(idempotencyKey, reason);
+  return { status: "failed", success: true };
+}
+
+/**
+ * Handles user confirmation (YES/NO) from the frontend for MEDIUM confidence cases.
+ */
+export async function handleUserConfirmation(
+  idempotencyKey: string,
+  confirmed: boolean,
+): Promise<any> {
+  const tx = await getPaymentTransaction(idempotencyKey);
+  
+  // 1. Idempotency Check
+  if (tx?.status === "captured" || tx?.status === "failed") {
+    return { status: tx.status };
+  }
+
+  // 2. Timeout Check (60 seconds)
+  if (tx?.status === "confirm_required" && tx.updatedAt) {
+    const elapsedSeconds = (Date.now() - tx.updatedAt) / 1000;
+    if (elapsedSeconds > 60) {
+      await logError({
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_TIMEOUT,
+        transactionId: idempotencyKey,
+        message: "Confirmation timeout - auto-cancelling hold",
+      });
+      return cancelHold(idempotencyKey, "Confirmation timed out (60s)");
+    }
+  }
+
+  // 3. State Check
+  if (!tx || tx.status !== "confirm_required") {
+    throw new HttpError(400, `Confirmation not allowed for status: ${tx?.status || "unknown"}`);
+  }
+
+  await logError({
+    type: "USER_CONFIRMATION",
+    transactionId: idempotencyKey,
+    stationCode: tx.station,
+    message: `User confirmed delivery: ${confirmed}`,
+    metadata: { confirmed }
+  });
+
+  if (confirmed) {
+    return finalizeCapture(idempotencyKey);
+  } else {
+    return cancelHold(idempotencyKey, "User reported battery did not come out");
+  }
+}
   } catch (error) {
     if (holdCreated && holdTransactionId) {
       try {
