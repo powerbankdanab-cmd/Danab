@@ -36,4 +36,18 @@ export async function GET(request: NextRequest) {
             case "held":
             case "verified":
             case "capture_unknown":
+            default:
+                status = "pending";
         }
+
+        return NextResponse.json({
+            status,
+            transactionId: transaction.id,
+            battery_id: transaction.delivery?.batteryId,
+            slot_id: transaction.delivery?.slotId,
+        });
+    } catch (error) {
+        console.error("Status check error:", error);
+        return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    }
+}

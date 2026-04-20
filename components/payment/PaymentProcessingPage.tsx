@@ -601,3 +601,10 @@ export function PaymentProcessingPage() {
           {renderContent()}
         </main>
 
+        <p className="mt-8 text-center text-xs font-semibold text-slate-400 uppercase tracking-widest">
+          Danab Smart Ejection System v2.0
+        </p>
+      </div>
+    </div>
+  );
+}
