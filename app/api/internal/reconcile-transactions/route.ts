@@ -6,11 +6,9 @@ import {
   finalizeCapture,
   cancelHold,
   transitionPaymentTransactionState
-}
-
-export async function POST(request: NextRequest) {
-  return reconcile(request);
-}
+} from "@/lib/server/payment-service";
+import { checkPaymentStatus } from "@/lib/server/payment/waafi";
+import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 
 async function reconcile(request: NextRequest) {
   try {
