@@ -33,6 +33,7 @@ import {
   getPaymentTransaction,
   patchPaymentTransaction,
   transitionPaymentTransactionState,
+  PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";
 import { reconcileTransactionById } from "@/lib/server/payment/reconciliation";
 import {
