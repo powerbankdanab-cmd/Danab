@@ -1,13 +1,11 @@
 export type PaymentMethod = "EVC Plus" | "ZAAD" | "SAHAL";
 
 export type PaymentStatus =
-  | "INITIAL"
   | "CONNECTING"
-  | "UNLOCKING"
-  | "VERIFYING"
-  | "SUCCESS"
+  | "PENDING_PAYMENT"
+  | "PROCESSING"
   | "CONFIRM_REQUIRED"
-  | "PENDING"
+  | "SUCCESS"
   | "FAILED";
 
 export type ProcessingStep = "verify" | "hold" | "unlock" | "commit";

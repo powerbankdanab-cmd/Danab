@@ -401,7 +401,7 @@ export async function processPayment(
       const pendingAudit = extractWaafiAudit(preauthResponse);
       const waafiConfirmedPhoneNumber =
         typeof pendingAudit.waafiConfirmedPhoneNumber === "string" &&
-        pendingAudit.waafiConfirmedPhoneNumber.trim().length > 0
+          pendingAudit.waafiConfirmedPhoneNumber.trim().length > 0
           ? pendingAudit.waafiConfirmedPhoneNumber.trim()
           : null;
       const canonicalPhoneNumber = phoneNumber;
@@ -932,7 +932,7 @@ export async function processPayment(
 export async function finalizeCapture(idempotencyKey: string): Promise<any> {
   const tx = await getPaymentTransaction(idempotencyKey);
 
-  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required" && tx.status !== "captured" && tx.status !== "verified")) {
+  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required" && tx.status !== "captured" && tx.status !== "verified" && tx.status !== "resolving")) {
     throw new HttpError(400, `Transaction in invalid state for capture: ${tx?.status}`);
   }
 
@@ -979,65 +979,66 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
       patch: { verifiedAt: Date.now() },
     });
   }
+}
 
-  // 2. Commit Waafi (Only if not already captured)
-  if (tx.status !== "captured") {
-    let commitResponse;
-    try {
-      commitResponse = await commitWaafiPreauthorization({
-        transactionId: transactionId!,
-        description: "Powerbank rental committed after delivery verification",
-      });
-    } catch (error) {
-      await logError({
-        type: CRITICAL_ERROR_TYPES.SYSTEM_INCONSISTENCY,
-        transactionId: idempotencyKey,
-        message: "Waafi capture retry or failure",
-        metadata: { error: String(error) }
-      });
-      throw error;
-    }
-
-    if (!isWaafiApproved(commitResponse)) {
-      throw new Error("Waafi capture not approved");
-    }
-
-    // Move to 'captured' state
-    await transitionPaymentTransactionState({
-      id: idempotencyKey,
-      from: "verified",
-      to: "captured",
-      patch: { capturedAt: Date.now(), rentalCreated: false },
-    });
-  }
-
-  // 3. Create Rental Log (Only if not already created)
-  if (!tx.rentalCreated) {
-    const rentalRef = await createRentalLog({
-      imei,
-      stationCode,
-      batteryId,
-      slotId,
-      phoneNumber: canonicalPhoneNumber,
-      requestedPhoneNumber: phoneNumber,
-      amount,
+// 2. Commit Waafi (Only if not already captured)
+if (tx.status !== "captured") {
+  let commitResponse;
+  try {
+    commitResponse = await commitWaafiPreauthorization({
       transactionId: transactionId!,
-      issuerTransactionId: issuerTransactionId || null,
-      referenceId: referenceId || "manual",
-      phoneAuthority,
-      waafiAudit: preauthAudit || {},
+      description: "Powerbank rental committed after delivery verification",
     });
-
-    await patchPaymentTransaction({
-      id: idempotencyKey,
-      patch: { rentalCreated: true, rentalId: rentalRef.id },
+  } catch (error) {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.SYSTEM_INCONSISTENCY,
+      transactionId: idempotencyKey,
+      message: "Waafi capture retry or failure",
+      metadata: { error: String(error) }
     });
-
-    await releaseReservation(imei, batteryId);
-    await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+    throw error;
   }
 
-  return { status: "captured", success: true, battery_id: batteryId, slot_id: slotId };
+  if (!isWaafiApproved(commitResponse)) {
+    throw new Error("Waafi capture not approved");
+  }
+
+  // Move to 'captured' state
+  await transitionPaymentTransactionState({
+    id: idempotencyKey,
+    from: "verified",
+    to: "captured",
+    patch: { capturedAt: Date.now(), rentalCreated: false },
+  });
+}
+
+// 3. Create Rental Log (Only if not already created)
+if (!tx.rentalCreated) {
+  const rentalRef = await createRentalLog({
+    imei,
+    stationCode,
+    batteryId,
+    slotId,
+    phoneNumber: canonicalPhoneNumber,
+    requestedPhoneNumber: phoneNumber,
+    amount,
+    transactionId: transactionId!,
+    issuerTransactionId: issuerTransactionId || null,
+    referenceId: referenceId || "manual",
+    phoneAuthority,
+    waafiAudit: preauthAudit || {},
+  });
+
+  await patchPaymentTransaction({
+    id: idempotencyKey,
+    patch: { rentalCreated: true, rentalId: rentalRef.id },
+  });
+
+  await releaseReservation(imei, batteryId);
+  await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+}
+
+return { status: "captured", success: true, battery_id: batteryId, slot_id: slotId };
 }
 
 /**
@@ -1106,10 +1107,27 @@ export async function handleUserConfirmation(
     metadata: { confirmed }
   });
 
-  if (confirmed) {
-    return finalizeCapture(idempotencyKey);
-  } else {
-    return cancelHold(idempotencyKey, "User reported battery did not come out");
+  // 4. Set state to resolving (transactional)
+  await transitionPaymentTransactionState({
+    id: idempotencyKey,
+    from: "confirm_required",
+    to: "resolving",
+  });
+
+  try {
+    if (confirmed) {
+      return await finalizeCapture(idempotencyKey);
+    } else {
+      return await cancelHold(idempotencyKey, "User reported battery did not come out");
+    }
+  } catch (error) {
+    // If provider call fails, transition back to confirm_required to allow retry
+    await transitionPaymentTransactionState({
+      id: idempotencyKey,
+      from: "resolving",
+      to: "confirm_required",
+    }).catch(() => undefined); // Don't throw on cleanup
+    throw error;
   }
 }
 

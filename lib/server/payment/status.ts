@@ -8,11 +8,12 @@ import {
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatus } from "@/lib/server/payment/waafi";
 
-export type PaymentStatusReason = "user_cancelled" | "timeout" | "error";
+export type PaymentStatusReason = "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
 
 export type PaymentStatusResponse = {
-  status: "pending_payment" | "payment_confirmed" | "failed";
-  reason?: PaymentStatusReason;
+  status: "pending_payment" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
+  reason_code?: PaymentStatusReason;
+  message?: string;
   transactionId: string;
   battery_id?: string;
   slot_id?: string;
@@ -21,23 +22,17 @@ export type PaymentStatusResponse = {
 function toFinalResponse(transaction: PaymentTransactionRecord): PaymentStatusResponse {
   if (transaction.status === "failed") {
     const reason = String(transaction.failureReason || "").toLowerCase().includes("cancel")
-      ? "user_cancelled"
-      : undefined;
+      ? "USER_CANCELLED"
+      : "PROVIDER_ERROR";
 
     return {
       status: "failed",
-      reason,
+      reason_code: reason,
       transactionId: transaction.id,
     };
   }
 
-  if (
-    transaction.status === "captured" ||
-    transaction.status === "verified" ||
-    transaction.status === "held" ||
-    transaction.status === "confirm_required" ||
-    transaction.status === "capture_unknown"
-  ) {
+  if (transaction.status === "captured") {
     return {
       status: "payment_confirmed",
       transactionId: transaction.id,
@@ -46,8 +41,23 @@ function toFinalResponse(transaction: PaymentTransactionRecord): PaymentStatusRe
     };
   }
 
+  if (transaction.status === "confirm_required") {
+    return {
+      status: "confirm_required",
+      transactionId: transaction.id,
+    };
+  }
+
+  if (transaction.status === "pending_payment") {
+    return {
+      status: "pending_payment",
+      transactionId: transaction.id,
+    };
+  }
+
+  // held, verified, capture_unknown, resolving → processing
   return {
-    status: "pending_payment",
+    status: "processing",
     transactionId: transaction.id,
   };
 }
@@ -85,7 +95,7 @@ export async function getProviderDrivenPaymentStatus(
       to: "failed",
       patch: {
         failedAt: Date.now(),
-        failureReason: "user_cancelled",
+        failureReason: "USER_CANCELLED",
       },
     }).catch(() => undefined);
 
@@ -93,7 +103,7 @@ export async function getProviderDrivenPaymentStatus(
 
     return {
       status: "failed",
-      reason: "user_cancelled",
+      reason_code: "USER_CANCELLED",
       transactionId,
     };
   }
@@ -105,7 +115,7 @@ export async function getProviderDrivenPaymentStatus(
       to: "failed",
       patch: {
         failedAt: Date.now(),
-        failureReason: "provider_failed",
+        failureReason: "PROVIDER_ERROR",
       },
     }).catch(() => undefined);
 
@@ -113,7 +123,7 @@ export async function getProviderDrivenPaymentStatus(
 
     return {
       status: "failed",
-      reason: "error",
+      reason_code: "PROVIDER_ERROR",
       transactionId,
     };
   }

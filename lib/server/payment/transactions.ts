@@ -13,7 +13,8 @@ export type PaymentTransactionStatus =
   | "captured"
   | "failed"
   | "confirm_required"
-  | "capture_unknown";
+  | "capture_unknown"
+  | "resolving";
 
 export type PaymentDeliveryContext = {
   imei: string;
@@ -261,7 +262,7 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .get();
 
   const results: PaymentTransactionRecord[] = [];
-  
+
   // Add confirm_required
   for (const doc of confirmSnap.docs) {
     results.push(doc.data() as PaymentTransactionRecord);

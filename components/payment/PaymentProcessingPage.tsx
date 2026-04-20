@@ -24,9 +24,8 @@ import {
 } from "@/components/payment/types";
 
 type ApiResponse = {
-  success?: boolean;
-  status?: "confirm_required" | "success" | "failed" | "pending" | "pending_payment" | "payment_confirmed";
-  reason?: "user_cancelled" | "timeout" | "error";
+  status?: "pending_payment" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
+  reason_code?: "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
   message?: string;
   transactionId?: string;
   error?: string;
@@ -92,8 +91,8 @@ export function PaymentProcessingPage() {
   const [status, setStatus] = useState<PaymentStatus>("CONNECTING");
   const [errorMessage, setErrorMessage] = useState("");
   const [transactionId, setTransactionId] = useState("");
-  const [failureReason, setFailureReason] = useState<ApiResponse["reason"]>();
-  const [isPollingTimeout, setIsPollingTimeout] = useState(false);
+  const [failureReason, setFailureReason] = useState<ApiResponse["reason_code"]>();
+  const [isSlowPolling, setIsSlowPolling] = useState(false);
   const [batteryInfo, setBatteryInfo] = useState<{
     batteryId: string;
     slotId: string;
@@ -114,14 +113,14 @@ export function PaymentProcessingPage() {
   };
 
   const getFriendlyFailureMessage = (
-    reason?: ApiResponse["reason"],
+    reason?: ApiResponse["reason_code"],
     backendError?: string,
   ) => {
-    if (reason === "user_cancelled") {
+    if (reason === "USER_CANCELLED") {
       return "Waad joojisay bixinta. Lacag lagama jarin. Payment cancelled. No money charged.";
     }
 
-    if (reason === "timeout") {
+    if (reason === "TIMEOUT") {
       return "Lacag bixin wali ma dhicin. Fadlan sug wax yar ama mar kale isku day. Payment is still being verified.";
     }
 
@@ -173,6 +172,45 @@ export function PaymentProcessingPage() {
     return "Lacag bixin ma dhicin. Lacag lagama jarin. Fadlan mar kale isku day. Payment did not complete. No money charged. Please try again.";
   };
 
+  const getFailureHeading = (
+    reason?: ApiResponse["reason_code"],
+    message?: string,
+  ) => {
+    if (reason === "USER_CANCELLED") {
+      return "Bixinta waa la joojiyay";
+    }
+
+    const normalized = String(message || "").toLowerCase();
+
+    if (
+      normalized.includes("insufficient balance") ||
+      normalized.includes("lacag kugu filan ma jirto")
+    ) {
+      return "Haraaga kuma filna";
+    }
+
+    if (
+      normalized.includes("pin") &&
+      (normalized.includes("khaldan") || normalized.includes("invalid") || normalized.includes("wrong"))
+    ) {
+      return "PIN-ka lama xaqiijin";
+    }
+
+    if (
+      normalized.includes("lambarka") ||
+      normalized.includes("phone") ||
+      normalized.includes("account")
+    ) {
+      return "Lambarka bixinta waa khaldan";
+    }
+
+    if (reason === "TIMEOUT") {
+      return "Xaqiijinta lacagta way daahday";
+    }
+
+    return "Lacag bixinta ma dhicin";
+  };
+
   const stopPolling = () => {
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
@@ -184,6 +222,7 @@ export function PaymentProcessingPage() {
   useEffect(() => {
     if (!phoneNumber || !idempotencyKey) {
       setStatus("FAILED");
+      setFailureReason("PROVIDER_ERROR");
       setErrorMessage("Macluumaad sax ah lama helin. Fadlan mar kale isku day.");
       return;
     }
@@ -214,51 +253,31 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
 
-        updateStepStatus("init", "completed");
-
-        if (data.status === "pending") {
-          setTransactionId(data.transactionId || idempotencyKey);
-          updateStepStatus("pending", "active");
-          setIsPollingTimeout(false);
-          setFailureReason(undefined);
-          console.info("PAYMENT_PENDING_STARTED", {
-            transactionId: data.transactionId || idempotencyKey,
-          });
-          setStatus("PENDING");
-          return;
-        }
-
-        if (data.status === "confirm_required") {
-          setTransactionId(data.transactionId || idempotencyKey);
-          updateStepStatus("confirmed", "completed");
-          updateStepStatus("unlocking", "completed");
-          updateStepStatus("verifying", "active");
-          setStatus("CONFIRM_REQUIRED");
-          return;
-        }
-
-        if (response.ok && (data.success || data.status === "success")) {
-          updateStepStatus("confirmed", "completed");
-          updateStepStatus("unlocking", "completed");
-          updateStepStatus("verifying", "completed");
-          updateStepStatus("success", "completed");
-          setBatteryInfo(
-            data.battery_id && data.slot_id
-              ? { batteryId: data.battery_id, slotId: data.slot_id }
-              : null
-          );
-          setStatus("SUCCESS");
-          stopPolling();
-        } else {
+        if (!response.ok) {
           setStatus("FAILED");
-          setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
-          updateStepStatus("confirmed", "failed");
-          stopPolling();
+          setFailureReason("PROVIDER_ERROR");
+          setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", data.error || "Bixinta lama bilaabin."));
+          updateStepStatus("init", "failed");
+          return;
         }
+
+        updateStepStatus("init", "completed");
+        setTransactionId(data.transactionId || idempotencyKey);
+        updateStepStatus("pending", "active");
+        setStatus("PENDING_PAYMENT");
+        console.info("PAYMENT_PENDING_STARTED", {
+          transactionId: data.transactionId || idempotencyKey,
+        });
       } catch (error) {
         if (!isCancelled) {
           setStatus("FAILED");
-          setErrorMessage(error instanceof Error ? error.message : "Cillad farsamo ayaa dhacday.");
+          setFailureReason("PROVIDER_ERROR");
+          setErrorMessage(
+            getFriendlyFailureMessage(
+              "PROVIDER_ERROR",
+              error instanceof Error ? error.message : "Cillad farsamo ayaa dhacday.",
+            ),
+          );
           updateStepStatus("init", "failed");
         }
       }
@@ -276,12 +295,12 @@ export function PaymentProcessingPage() {
   }, [amount, idempotencyKey, phoneNumber, stationCode]);
 
   useEffect(() => {
-    if (status !== "PENDING" || !transactionId) {
+    if (status !== "PENDING_PAYMENT" || !transactionId) {
       return;
     }
 
     pollingStartedAtRef.current = Date.now();
-    setIsPollingTimeout(false);
+    setIsSlowPolling(false);
 
     const poll = async () => {
       if (pollingRequestInFlightRef.current) {
@@ -289,19 +308,26 @@ export function PaymentProcessingPage() {
       }
 
       const startedAt = pollingStartedAtRef.current || Date.now();
-      if (Date.now() - startedAt >= 60_000) {
-        stopPolling();
-        setIsPollingTimeout(true);
-        console.info("PAYMENT_TIMEOUT", { transactionId });
-        return;
+      const elapsedMs = Date.now() - startedAt;
+      const isSlowPolling = elapsedMs >= 60_000; // After 60s, switch to slow polling
+
+      if (isSlowPolling !== isSlowPolling) {
+        setIsSlowPolling(isSlowPolling);
       }
 
       pollingRequestInFlightRef.current = true;
 
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
+
         const response = await fetch(`/api/payment/status?transactionId=${transactionId}`, {
           cache: "no-store",
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
+
         if (!response.ok) {
           return;
         }
@@ -316,7 +342,7 @@ export function PaymentProcessingPage() {
           if (data.battery_id && data.slot_id) {
             setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
           }
-          setIsPollingTimeout(false);
+          setIsSlowPolling(false);
           console.info("PAYMENT_CONFIRMED", { transactionId });
           setStatus("SUCCESS");
           stopPolling();
@@ -324,39 +350,56 @@ export function PaymentProcessingPage() {
         }
 
         if (data.status === "failed") {
-          setFailureReason(data.reason);
-          if (data.reason === "user_cancelled") {
-            setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
+          setFailureReason(data.reason_code);
+          setErrorMessage(getFriendlyFailureMessage(data.reason_code, data.error));
+          if (data.reason_code === "USER_CANCELLED") {
             console.info("PAYMENT_USER_CANCELLED", { transactionId });
           } else {
-            setErrorMessage(getFriendlyFailureMessage(data.reason, data.error));
-            console.info("PAYMENT_FAILED", { transactionId, reason: data.reason || "unknown" });
+            console.info("PAYMENT_FAILED", { transactionId, reason: data.reason_code || "unknown" });
           }
           updateStepStatus("confirmed", "failed");
-          setIsPollingTimeout(false);
+          setIsSlowPolling(false);
           setStatus("FAILED");
           stopPolling();
+          return;
         }
-      } catch {
-        // Keep polling on transient network failure.
+
+        if (data.status === "processing") {
+          updateStepStatus("pending", "completed");
+          updateStepStatus("confirmed", "active");
+          setStatus("PROCESSING");
+        }
+
+        // Continue polling for other states (pending_payment, etc.)
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          console.warn("PAYMENT_STATUS_REQUEST_TIMEOUT", { transactionId });
+          // Continue polling on timeout
+        } else {
+          console.warn("PAYMENT_STATUS_REQUEST_ERROR", { transactionId, error });
+          // Continue polling on other errors
+        }
       } finally {
         pollingRequestInFlightRef.current = false;
       }
     };
 
     void poll();
+
+    // Set interval based on polling phase
+    const intervalMs = isSlowPolling ? 10000 : 2000; // 10s for slow polling, 2s for fast
     pollingIntervalRef.current = setInterval(() => {
       void poll();
-    }, 2000);
+    }, intervalMs);
 
     return () => {
       stopPolling();
     };
-  }, [status, transactionId]);
+  }, [status, transactionId, isSlowPolling]);
 
   const handleConfirm = async (confirmed: boolean) => {
     try {
-      setStatus(confirmed ? "SUCCESS" : "FAILED");
+      setStatus("PROCESSING");
 
       const res = await fetch("/api/pay/confirm", {
         method: "POST",
@@ -371,7 +414,8 @@ export function PaymentProcessingPage() {
 
       if (!res.ok) {
         setStatus("FAILED");
-        setErrorMessage(data.error || "Xaqiijinta waa fashilantay.");
+        setFailureReason("PROVIDER_ERROR");
+        setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", data.error || "Xaqiijinta waa fashilantay."));
         return;
       }
 
@@ -385,11 +429,20 @@ export function PaymentProcessingPage() {
         }
       } else {
         setStatus("FAILED");
-        setErrorMessage("Waad mahadsantahay. Hold-ka lacagta waa la joojiyay.");
+        setFailureReason("USER_CANCELLED");
+        setErrorMessage(getFriendlyFailureMessage("USER_CANCELLED"));
       }
     } catch (error) {
       setStatus("FAILED");
-      setErrorMessage("Cillad farsamo ayaa dhacday inta lagu guda jiray xaqiijinta.");
+      setFailureReason("PROVIDER_ERROR");
+      setErrorMessage(
+        getFriendlyFailureMessage(
+          "PROVIDER_ERROR",
+          error instanceof Error
+            ? error.message
+            : "Cillad farsamo ayaa dhacday inta lagu guda jiray xaqiijinta.",
+        ),
+      );
     }
   };
 
@@ -462,7 +515,7 @@ export function PaymentProcessingPage() {
           </div>
         );
 
-      case "PENDING":
+      case "PENDING_PAYMENT":
         return (
           <div className="space-y-6 py-4">
             <div className="text-center">
@@ -488,7 +541,7 @@ export function PaymentProcessingPage() {
                   Waxaan sugaynaa xaqiijinta bixinta.
                 </p>
               </div>
-              {isPollingTimeout && (
+              {isSlowPolling && (
                 <div className="mt-4 rounded-xl bg-amber-50 p-4 border border-amber-100">
                   <p className="text-sm font-medium text-amber-700">
                     Waxaan wali hubinaynaa lacagta. Fadlan sug.
@@ -535,6 +588,74 @@ export function PaymentProcessingPage() {
               </p>
               <p className="mt-1 text-xs text-slate-400">
                 Lacagta lama jarin weli. Waxaan sugaynaa jawaabta bixinta ee provider-ka.
+              </p>
+            </div>
+          </div>
+        );
+
+      case "PROCESSING":
+        return (
+          <div className="space-y-6 py-4">
+            <div className="text-center">
+              <p className="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                {method} • {formatAmount(amount)} • {formatPhone(phoneNumber)}
+              </p>
+              <div className="flex justify-center mb-4">
+                <div className="relative h-16 w-16">
+                  <div className="absolute inset-0 animate-ping rounded-full bg-violet-400/20" />
+                  <div className="relative flex h-16 w-16 items-center justify-center rounded-full bg-white shadow-xl">
+                    <span className="h-8 w-8 animate-spin rounded-full border-4 border-violet-500 border-t-transparent" />
+                  </div>
+                </div>
+              </div>
+              <h1 className="text-xl font-bold text-slate-900 mb-2">
+                Waxaan xaqiijinaynaa lacagta...
+              </h1>
+              <p className="text-sm text-slate-600 mb-4">
+                Verifying payment and releasing power bank...
+              </p>
+              <div className="rounded-xl bg-violet-50 p-4 border border-violet-100">
+                <p className="text-sm font-medium text-violet-700">
+                  Waxaan hubinaynaa bixinta oo aan sii deynaynaa power bank-ga.
+                </p>
+              </div>
+            </div>
+
+            {/* Step Progress */}
+            <div className="space-y-3">
+              {steps.map((step, index) => (
+                <div key={step.id} className="flex items-center gap-3">
+                  <div className="flex-shrink-0">
+                    {renderStepIcon(step.status)}
+                  </div>
+                  <div className="flex-1 text-left">
+                    <p className={cn(
+                      "text-sm font-medium",
+                      step.status === "active" ? "text-violet-700" :
+                        step.status === "completed" ? "text-emerald-700" :
+                          step.status === "failed" ? "text-red-700" : "text-gray-500"
+                    )}>
+                      {step.label}
+                    </p>
+                    <p className={cn(
+                      "text-xs",
+                      step.status === "active" ? "text-violet-600" :
+                        step.status === "completed" ? "text-emerald-600" :
+                          step.status === "failed" ? "text-red-600" : "text-gray-400"
+                    )}>
+                      {step.somaliLabel}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="rounded-xl bg-slate-50 p-4 border border-slate-100">
+              <p className="text-sm text-slate-500">
+                Money Status: <span className="font-bold text-violet-700">PROCESSING</span>
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Lacagta waa la xaqiijiyay. Waxaan sii deynaynaa power bank-ga.
               </p>
             </div>
           </div>
@@ -682,9 +803,7 @@ export function PaymentProcessingPage() {
                 </div>
               </div>
               <h1 className="text-xl font-bold text-slate-900 mb-2">
-                {failureReason === "user_cancelled"
-                  ? "Bixinta waa la joojiyay"
-                  : "Lacag bixinta ma dhicin"}
+                {getFailureHeading(failureReason, errorMessage)}
               </h1>
               <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
                 <p className="text-sm font-medium text-rose-700">
@@ -722,7 +841,7 @@ export function PaymentProcessingPage() {
               ))}
             </div>
 
-            {failureReason === "user_cancelled" && (
+            {failureReason === "USER_CANCELLED" && (
               <div className="rounded-xl bg-emerald-50 p-4 border border-emerald-100">
                 <p className="text-sm font-bold text-emerald-700">
                   Waad joojisay bixinta. Lacag lagama jarin.
