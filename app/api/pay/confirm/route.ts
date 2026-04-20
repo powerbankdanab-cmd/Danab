@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { confirmPaymentDelivery, isHttpError } from "@/lib/server/payment-service";
+import { handleUserConfirmation, isHttpError } from "@/lib/server/payment-service";
 import { logError } from "@/lib/server/alerts/log-error";
 
 export async function POST(request: NextRequest) {
