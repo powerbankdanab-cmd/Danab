@@ -8,8 +8,6 @@ import {
 } from "@/lib/server/payment-service";
 import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 
-export const dynamic = "force-dynamic";
-
 export async function GET(request: NextRequest) {
   return reconcile(request);
 }
@@ -91,11 +89,6 @@ async function reconcile(request: NextRequest) {
     }
 
     return NextResponse.json(stats);
-  } catch (error) {
-    console.error("Reconciliation worker crashed:", error);
-    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
-  }
-}
   } catch (error) {
     console.error("Reconciliation worker crashed:", error);
     return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
