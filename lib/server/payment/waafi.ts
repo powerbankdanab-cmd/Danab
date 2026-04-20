@@ -254,22 +254,22 @@ export async function checkPaymentStatus(transaction: {
     const { transactionId } = extractWaafiIds(statusResponse);
 
     if (isWaafiApproved(statusResponse)) {
-      return { status: "paid", transactionId };
+      return { status: "paid", transactionId: transactionId || undefined };
     }
 
     // Check for specific failure states
     const state = getWaafiLifecycleState(statusResponse);
     if (state === "FAILED" || state === "CANCELLED" || state === "REVERSED") {
-      return { status: "not_paid", transactionId };
+      return { status: "not_paid", transactionId: transactionId || undefined };
     }
 
     // If response code indicates processing/pending
     const responseCode = String(statusResponse.responseCode);
     if (responseCode === "2002" || responseCode === "2003") { // Common pending codes
-      return { status: "unknown", transactionId }; // Still processing
+      return { status: "unknown", transactionId: transactionId || undefined }; // Still processing
     }
 
-    return { status: "unknown", transactionId };
+    return { status: "unknown", transactionId: transactionId || undefined };
   } catch (error) {
     console.error("Failed to check payment status:", error);
     return { status: "unknown" };
