@@ -148,7 +148,8 @@ export async function getProviderDrivenPaymentStatus(
 
       return {
         status: "pending_payment",
-        reason: "error",
+        reason_code: "PROVIDER_ERROR",
+        message: "Provider status reconciliation pending after resume failure",
         transactionId,
       };
     }
@@ -156,7 +157,8 @@ export async function getProviderDrivenPaymentStatus(
 
   return {
     status: "pending_payment",
-    reason: "error",
+    reason_code: "PROVIDER_ERROR",
+    message: "Provider status returned unknown; keeping transaction pending",
     transactionId,
   };
 }

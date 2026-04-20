@@ -4,7 +4,7 @@ import { isHttpError } from "@/lib/server/payment-service";
 
 export async function GET(request: NextRequest) {
   try {
-    const { searchParams } = new URL(request.url);
+    const { searchParams } = request.nextUrl;
     const transactionId = searchParams.get("transactionId");
 
     if (!transactionId) {
@@ -14,6 +14,15 @@ export async function GET(request: NextRequest) {
     const payload = await getProviderDrivenPaymentStatus(transactionId);
     return NextResponse.json(payload);
   } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "digest" in error &&
+      (error as { digest?: string }).digest === "NEXT_PRERENDER_INTERRUPTED"
+    ) {
+      throw error;
+    }
+
     if (isHttpError(error)) {
       return NextResponse.json({ error: error.message }, { status: error.status });
     }
