@@ -23,4 +23,10 @@ export {
   getActiveStationCode,
   getStationImei,
 } from "@/lib/server/payment/station";
+export {
+  queryWaafiTransactionStatus,
+  isWaafiApproved,
+  extractWaafiIds,
+  extractWaafiAudit
+} from "@/lib/server/payment/waafi";
 export type { PaymentInput, PaymentPayload } from "@/lib/server/payment/types";

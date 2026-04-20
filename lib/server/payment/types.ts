@@ -59,10 +59,17 @@ export type PaymentConfirmRequiredPayload = {
   transactionId: string;
 };
 
-export type PaymentPayload = 
-  | PaymentSuccessPayload 
-  | PaymentDuplicatePayload 
-  | PaymentConfirmRequiredPayload;
+export type PaymentPendingPayload = {
+  status: "pending";
+  message: string;
+  transactionId: string;
+};
+
+export type PaymentPayload =
+  | PaymentSuccessPayload
+  | PaymentDuplicatePayload
+  | PaymentConfirmRequiredPayload
+  | PaymentPendingPayload;
 
 export type BatteryPresence = "present" | "missing" | "unknown";
 

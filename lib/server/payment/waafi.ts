@@ -240,3 +240,38 @@ export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
   const state = getWaafiLifecycleState(waafiResponse);
   return state === "CANCELLED" || state === "REVERSED" || state === "FAILED";
 }
+
+export async function checkPaymentStatus(transaction: {
+  providerRef?: string | null;
+  providerReferenceId?: string | null;
+}): Promise<{ status: "paid" | "not_paid" | "unknown"; transactionId?: string }> {
+  try {
+    const statusResponse = await queryWaafiTransactionStatus({
+      transactionId: transaction.providerRef,
+      referenceId: transaction.providerReferenceId,
+    });
+
+    const { transactionId } = extractWaafiIds(statusResponse);
+
+    if (isWaafiApproved(statusResponse)) {
+      return { status: "paid", transactionId };
+    }
+
+    // Check for specific failure states
+    const state = getWaafiLifecycleState(statusResponse);
+    if (state === "FAILED" || state === "CANCELLED" || state === "REVERSED") {
+      return { status: "not_paid", transactionId };
+    }
+
+    // If response code indicates processing/pending
+    const responseCode = String(statusResponse.responseCode);
+    if (responseCode === "2002" || responseCode === "2003") { // Common pending codes
+      return { status: "unknown", transactionId }; // Still processing
+    }
+
+    return { status: "unknown", transactionId };
+  } catch (error) {
+    console.error("Failed to check payment status:", error);
+    return { status: "unknown" };
+  }
+}

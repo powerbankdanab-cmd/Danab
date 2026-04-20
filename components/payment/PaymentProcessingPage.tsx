@@ -4,11 +4,11 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { 
-  CheckIcon, 
-  CloseIcon, 
-  ArrowRightIcon, 
-  HelpCircleIcon 
+import {
+  CheckIcon,
+  CloseIcon,
+  ArrowRightIcon,
+  HelpCircleIcon
 } from "@/components/payment/Icons";
 import {
   cn,
@@ -21,7 +21,7 @@ import {
 
 type ApiResponse = {
   success?: boolean;
-  status?: "confirm_required" | "success" | "failed";
+  status?: "confirm_required" | "success" | "failed" | "pending";
   message?: string;
   transactionId?: string;
   error?: string;
@@ -73,7 +73,7 @@ export function PaymentProcessingPage() {
 
     const runPayment = async () => {
       setStatus("CONNECTING");
-      
+
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
@@ -83,7 +83,7 @@ export function PaymentProcessingPage() {
             setErrorMessage("Waqtiga codsiga wuu dhamaaday. Fadlan mar kale isku day.");
           }
         }, PAYMENT_REQUEST_TIMEOUT_MS);
-        
+
         paymentRequestAbortRef.current = controller;
 
         // Transitions based on time/progress (simulated steps during the long POST)
@@ -118,6 +118,12 @@ export function PaymentProcessingPage() {
           return;
         }
 
+        if (data.status === "pending") {
+          setTransactionId(data.transactionId || idempotencyKey);
+          setStatus("PENDING");
+          return;
+        }
+
         if (response.ok && (data.success || data.status === "success")) {
           setBatteryInfo(
             data.battery_id && data.slot_id
@@ -148,7 +154,7 @@ export function PaymentProcessingPage() {
   const handleConfirm = async (confirmed: boolean) => {
     try {
       setStatus(confirmed ? "SUCCESS" : "FAILED");
-      
+
       const res = await fetch("/api/pay/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -159,7 +165,7 @@ export function PaymentProcessingPage() {
       });
 
       const data = await res.json();
-      
+
       if (!res.ok) {
         setStatus("FAILED");
         setErrorMessage(data.error || "Xaqiijinta waa fashilantay.");
@@ -199,12 +205,12 @@ export function PaymentProcessingPage() {
                 </div>
               </div>
             </div>
-            
+
             <div className="space-y-3">
               <h1 className="text-2xl font-bold text-slate-900">
                 Fadlan sug, waxaan diyaarinaynaa power bank-gaaga
               </h1>
-              
+
               <div className="flex flex-col items-center gap-2">
                 <p className={cn(
                   "text-lg font-semibold transition-colors duration-500",
@@ -294,7 +300,7 @@ export function PaymentProcessingPage() {
                 Waxaan rabnaa inaad lacag bixiso kaliya marka aad hesho.
               </p>
             </div>
-            
+
             <div className="flex flex-col gap-3">
               <button
                 onClick={() => handleConfirm(true)}
@@ -312,36 +318,40 @@ export function PaymentProcessingPage() {
           </div>
         );
 
-      case "FAILED":
+      case "PENDING":
         return (
-          <div className="space-y-6 py-4 text-center">
-            <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-rose-100">
-              <CloseIcon className="h-10 w-10 text-rose-600" />
-            </div>
-            <div className="space-y-2">
-              <h1 className="text-2xl font-bold text-slate-900">
-                Ma suuragelin in la sii daayo power bank
-              </h1>
-              <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
-                <p className="text-sm font-medium text-rose-700">
-                  {errorMessage || "Cillad farsamo ayaa dhacday."}
-                </p>
+          <div className="space-y-8 py-4 text-center">
+            <div className="flex justify-center">
+              <div className="relative h-20 w-20">
+                <div className="absolute inset-0 animate-ping rounded-full bg-blue-400/20" />
+                <div className="relative flex h-20 w-20 items-center justify-center rounded-full bg-white shadow-xl">
+                  <span className="h-10 w-10 animate-spin rounded-full border-4 border-blue-500 border-t-transparent" />
+                </div>
               </div>
             </div>
-            <div className="rounded-2xl bg-emerald-50 p-4 border border-emerald-100">
-              <p className="text-sm font-bold text-emerald-700">
-                Lacag lagama jarin (No payment charged)
+            <div className="space-y-3">
+              <h1 className="text-2xl font-bold text-slate-900">
+                Fadlan dhammee PIN-ka taleefankaaga
+              </h1>
+              <p className="text-lg text-slate-600">
+                Waxaan sugaynaa xaqiijin.
               </p>
             </div>
-            <Link
-              href="/"
-              className="flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-900 px-6 py-4 text-lg font-bold text-white hover:bg-slate-800"
-            >
-              Mar kale isku day
-            </Link>
+            <div className="rounded-2xl bg-blue-50 p-4 border border-blue-100">
+              <p className="text-sm font-medium text-blue-700">
+                Please complete the payment on your phone. We are waiting for confirmation.
+              </p>
+            </div>
+            <div className="rounded-2xl bg-slate-50 p-4 border border-slate-100">
+              <p className="text-sm text-slate-500">
+                Money Status: <span className="font-bold text-slate-700">PENDING</span>
+              </p>
+              <p className="mt-1 text-[10px] text-slate-400">
+                Lacagta lama jarin weli. Waxaan sugaynaa xaqiijintaada.
+              </p>
+            </div>
           </div>
         );
-
       default:
         return null;
     }
@@ -359,7 +369,7 @@ export function PaymentProcessingPage() {
         <main className="overflow-hidden rounded-[32px] border border-white bg-white/80 p-6 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.14)] backdrop-blur-2xl">
           {renderContent()}
         </main>
-        
+
         <p className="mt-8 text-center text-xs font-semibold text-slate-400 uppercase tracking-widest">
           Danab Smart Ejection System v2.0
         </p>

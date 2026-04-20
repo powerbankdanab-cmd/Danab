@@ -8,6 +8,7 @@ export const PAYMENT_TRANSACTIONS_COLLECTION = "transactions";
 export type PaymentTransactionStatus =
   | "initiated"
   | "held"
+  | "pending_payment"
   | "verified"
   | "captured"
   | "failed"
@@ -251,10 +252,24 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .limit(limit * 2)
     .get();
 
+  // Query 3: pending_payment transactions
+  const pendingSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "pending_payment")
+    .orderBy("updatedAt")
+    .limit(limit)
+    .get();
+
   const results: PaymentTransactionRecord[] = [];
   
   // Add confirm_required
   for (const doc of confirmSnap.docs) {
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
+  // Add pending_payment
+  for (const doc of pendingSnap.docs) {
+    if (results.length >= limit) break;
     results.push(doc.data() as PaymentTransactionRecord);
   }
 
