@@ -17,10 +17,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(result);
   } catch (error) {
     if (isHttpError(error)) {
-      return NextResponse.json(
-        { error: error.message, ...error.details },
-        { status: error.status }
-      );
+      const payload = { error: error.message };
+      if (error.details && typeof error.details === "object") {
+        Object.assign(payload, error.details);
+      }
+      return NextResponse.json(payload, { status: error.status });
     }
 
     await logError({

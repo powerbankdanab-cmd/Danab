@@ -682,7 +682,7 @@ export async function processPayment(
     }
 
     if (confidence !== "HIGH") {
-      const failureNote = lastUnlockError?.message || `Verification failed with ${confidence} confidence`;
+      const failureNote = (lastUnlockError instanceof Error ? lastUnlockError.message : String(lastUnlockError || "")) || `Verification failed with ${confidence} confidence`;
 
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
