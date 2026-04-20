@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { PAYMENT_METHODS } from "@/components/payment/constants";
 
 import {
   CheckIcon,
@@ -13,10 +14,12 @@ import {
 } from "@/components/payment/Icons";
 import {
   cn,
+  formatAmount,
   mapBackendErrorMessage,
   normalizePhone,
 } from "@/components/payment/helpers";
 import {
+  PaymentMethod,
   PaymentStatus,
 } from "@/components/payment/types";
 
@@ -39,6 +42,24 @@ type PaymentStep = {
   status: "pending" | "active" | "completed" | "failed";
 };
 
+function parseMethod(value: string | null): PaymentMethod {
+  if (value && PAYMENT_METHODS.includes(value as PaymentMethod)) {
+    return value as PaymentMethod;
+  }
+  return "EVC Plus";
+}
+
+function formatPhone(phoneNumber: string) {
+  const cleaned = phoneNumber.replace(/\D/g, "");
+  if (!cleaned) {
+    return "--";
+  }
+  if (cleaned.startsWith("252")) {
+    return `+${cleaned}`;
+  }
+  return `+252${cleaned}`;
+}
+
 export function PaymentProcessingPage() {
   const searchParams = useSearchParams();
   const paymentRequestAbortRef = useRef<AbortController | null>(null);
@@ -46,6 +67,10 @@ export function PaymentProcessingPage() {
   const pollingStartedAtRef = useRef<number | null>(null);
   const pollingRequestInFlightRef = useRef(false);
 
+  const method = useMemo(
+    () => parseMethod(searchParams.get("method")),
+    [searchParams],
+  );
   const amount = useMemo(() => {
     const raw = Number(searchParams.get("amount"));
     return Number.isFinite(raw) && raw > 0 ? raw : 0.5;
@@ -349,6 +374,9 @@ export function PaymentProcessingPage() {
         return (
           <div className="space-y-6 py-4">
             <div className="text-center">
+              <p className="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                {method} • {formatAmount(amount)} • {formatPhone(phoneNumber)}
+              </p>
               <div className="flex justify-center mb-4">
                 <div className="relative h-16 w-16">
                   <div className="absolute inset-0 animate-ping rounded-full bg-violet-400/20" />
@@ -400,6 +428,9 @@ export function PaymentProcessingPage() {
         return (
           <div className="space-y-6 py-4">
             <div className="text-center">
+              <p className="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                {method} • {formatAmount(amount)} • {formatPhone(phoneNumber)}
+              </p>
               <div className="flex justify-center mb-4">
                 <div className="relative h-16 w-16">
                   <div className="absolute inset-0 animate-ping rounded-full bg-blue-400/20" />
@@ -465,7 +496,7 @@ export function PaymentProcessingPage() {
                 Money Status: <span className="font-bold text-slate-700">PENDING</span>
               </p>
               <p className="mt-1 text-xs text-slate-400">
-                Lacagta lama jarin weli. Waxaan sugaynaa xaqiijintaada.
+                Lacagta lama jarin weli. Waxaan sugaynaa jawaabta bixinta ee provider-ka.
               </p>
             </div>
           </div>
@@ -615,7 +646,7 @@ export function PaymentProcessingPage() {
               <h1 className="text-xl font-bold text-slate-900 mb-2">
                 {failureReason === "user_cancelled"
                   ? "Bixinta waa la joojiyay"
-                  : "Ma suuragelin in la sii daayo power bank"}
+                  : "Lacag bixinta ma dhicin"}
               </h1>
               <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
                 <p className="text-sm font-medium text-rose-700">
@@ -668,7 +699,7 @@ export function PaymentProcessingPage() {
               href="/"
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-900 px-6 py-4 text-lg font-bold text-white hover:bg-slate-800"
             >
-              Mar kale isku day
+              Dib u isku day
             </Link>
           </div>
         );
