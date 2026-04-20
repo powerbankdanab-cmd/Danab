@@ -22,7 +22,8 @@ import {
 
 type ApiResponse = {
   success?: boolean;
-  status?: "confirm_required" | "success" | "failed" | "pending";
+  status?: "confirm_required" | "success" | "failed" | "pending" | "pending_payment" | "payment_confirmed";
+  reason?: "user_cancelled" | "timeout" | "error";
   message?: string;
   transactionId?: string;
   error?: string;
@@ -42,6 +43,8 @@ export function PaymentProcessingPage() {
   const searchParams = useSearchParams();
   const paymentRequestAbortRef = useRef<AbortController | null>(null);
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingStartedAtRef = useRef<number | null>(null);
+  const pollingRequestInFlightRef = useRef(false);
 
   const amount = useMemo(() => {
     const raw = Number(searchParams.get("amount"));
@@ -64,6 +67,8 @@ export function PaymentProcessingPage() {
   const [status, setStatus] = useState<PaymentStatus>("CONNECTING");
   const [errorMessage, setErrorMessage] = useState("");
   const [transactionId, setTransactionId] = useState("");
+  const [failureReason, setFailureReason] = useState<ApiResponse["reason"]>();
+  const [isPollingTimeout, setIsPollingTimeout] = useState(false);
   const [batteryInfo, setBatteryInfo] = useState<{
     batteryId: string;
     slotId: string;
@@ -83,51 +88,12 @@ export function PaymentProcessingPage() {
     ));
   };
 
-  const startPolling = (txId: string) => {
+  const stopPolling = () => {
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
     }
-
-    pollingIntervalRef.current = setInterval(async () => {
-      try {
-        const response = await fetch(`/api/pay/status?transactionId=${txId}`);
-        if (!response.ok) return;
-
-        const data: ApiResponse = await response.json();
-
-        if (data.status === "success") {
-          updateStepStatus("confirmed", "completed");
-          updateStepStatus("unlocking", "completed");
-          updateStepStatus("verifying", "completed");
-          updateStepStatus("success", "completed");
-          setStatus("SUCCESS");
-          if (data.battery_id && data.slot_id) {
-            setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
-          }
-          if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current);
-          }
-        } else if (data.status === "confirm_required") {
-          updateStepStatus("confirmed", "completed");
-          updateStepStatus("unlocking", "completed");
-          updateStepStatus("verifying", "active");
-          setStatus("CONFIRM_REQUIRED");
-          if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current);
-          }
-        } else if (data.status === "failed") {
-          setStatus("FAILED");
-          setErrorMessage(mapBackendErrorMessage(data.error || "Khalad ayaa dhacay"));
-          updateStepStatus("confirmed", "failed");
-          if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current);
-          }
-        }
-        // If still pending, continue polling
-      } catch (error) {
-        // Continue polling on error
-      }
-    }, 2000); // Poll every 2 seconds
+    pollingRequestInFlightRef.current = false;
   };
 
   useEffect(() => {
@@ -168,8 +134,12 @@ export function PaymentProcessingPage() {
         if (data.status === "pending") {
           setTransactionId(data.transactionId || idempotencyKey);
           updateStepStatus("pending", "active");
+          setIsPollingTimeout(false);
+          setFailureReason(undefined);
+          console.info("PAYMENT_PENDING_STARTED", {
+            transactionId: data.transactionId || idempotencyKey,
+          });
           setStatus("PENDING");
-          startPolling(data.transactionId || idempotencyKey);
           return;
         }
 
@@ -193,10 +163,12 @@ export function PaymentProcessingPage() {
               : null
           );
           setStatus("SUCCESS");
+          stopPolling();
         } else {
           setStatus("FAILED");
           setErrorMessage(mapBackendErrorMessage(data.error || "Khalad ayaa dhacay"));
           updateStepStatus("confirmed", "failed");
+          stopPolling();
         }
       } catch (error) {
         if (!isCancelled) {
@@ -213,10 +185,89 @@ export function PaymentProcessingPage() {
       isCancelled = true;
       paymentRequestAbortRef.current?.abort();
       if (pollingIntervalRef.current) {
-        clearInterval(pollingIntervalRef.current);
+        stopPolling();
       }
     };
   }, [amount, idempotencyKey, phoneNumber, stationCode]);
+
+  useEffect(() => {
+    if (status !== "PENDING" || !transactionId) {
+      return;
+    }
+
+    pollingStartedAtRef.current = Date.now();
+    setIsPollingTimeout(false);
+
+    const poll = async () => {
+      if (pollingRequestInFlightRef.current) {
+        return;
+      }
+
+      const startedAt = pollingStartedAtRef.current || Date.now();
+      if (Date.now() - startedAt >= 60_000) {
+        stopPolling();
+        setIsPollingTimeout(true);
+        console.info("PAYMENT_TIMEOUT", { transactionId });
+        return;
+      }
+
+      pollingRequestInFlightRef.current = true;
+
+      try {
+        const response = await fetch(`/api/payment/status?transactionId=${transactionId}`, {
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          return;
+        }
+
+        const data: ApiResponse = await response.json();
+
+        if (data.status === "payment_confirmed") {
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "completed");
+          updateStepStatus("verifying", "completed");
+          updateStepStatus("success", "completed");
+          if (data.battery_id && data.slot_id) {
+            setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
+          }
+          setIsPollingTimeout(false);
+          console.info("PAYMENT_CONFIRMED", { transactionId });
+          setStatus("SUCCESS");
+          stopPolling();
+          return;
+        }
+
+        if (data.status === "failed") {
+          setFailureReason(data.reason);
+          if (data.reason === "user_cancelled") {
+            setErrorMessage("Waad joojisay bixinta. Lacag lagama jarin. Payment cancelled. No money charged.");
+            console.info("PAYMENT_USER_CANCELLED", { transactionId });
+          } else {
+            setErrorMessage(mapBackendErrorMessage(data.error || "Khalad ayaa dhacay."));
+            console.info("PAYMENT_FAILED", { transactionId, reason: data.reason || "unknown" });
+          }
+          updateStepStatus("confirmed", "failed");
+          setIsPollingTimeout(false);
+          setStatus("FAILED");
+          stopPolling();
+        }
+      } catch {
+        // Keep polling on transient network failure.
+      } finally {
+        pollingRequestInFlightRef.current = false;
+      }
+    };
+
+    void poll();
+    pollingIntervalRef.current = setInterval(() => {
+      void poll();
+    }, 2000);
+
+    return () => {
+      stopPolling();
+    };
+  }, [status, transactionId]);
 
   const handleConfirm = async (confirmed: boolean) => {
     try {
@@ -339,13 +390,23 @@ export function PaymentProcessingPage() {
                 Fadlan dhammee PIN-ka taleefankaaga
               </h1>
               <p className="text-sm text-slate-600 mb-4">
-                Waxaan sugaynaa xaqiijin.
+                Please complete payment on your phone
               </p>
               <div className="rounded-xl bg-blue-50 p-4 border border-blue-100">
                 <p className="text-sm font-medium text-blue-700">
-                  Please complete the payment on your phone. We are waiting for confirmation.
+                  Waxaan sugaynaa xaqiijinta bixinta.
                 </p>
               </div>
+              {isPollingTimeout && (
+                <div className="mt-4 rounded-xl bg-amber-50 p-4 border border-amber-100">
+                  <p className="text-sm font-medium text-amber-700">
+                    Waxaan wali hubinaynaa lacagta. Fadlan sug.
+                  </p>
+                  <p className="text-xs text-amber-600 mt-1">
+                    We are still verifying your payment.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Step Progress */}
@@ -530,7 +591,9 @@ export function PaymentProcessingPage() {
                 </div>
               </div>
               <h1 className="text-xl font-bold text-slate-900 mb-2">
-                Ma suuragelin in la sii daayo power bank
+                {failureReason === "user_cancelled"
+                  ? "Bixinta waa la joojiyay"
+                  : "Ma suuragelin in la sii daayo power bank"}
               </h1>
               <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
                 <p className="text-sm font-medium text-rose-700">
@@ -568,11 +631,16 @@ export function PaymentProcessingPage() {
               ))}
             </div>
 
-            <div className="rounded-xl bg-emerald-50 p-4 border border-emerald-100">
-              <p className="text-sm font-bold text-emerald-700">
-                Lacag lagama jarin (No payment charged)
-              </p>
-            </div>
+            {failureReason === "user_cancelled" && (
+              <div className="rounded-xl bg-emerald-50 p-4 border border-emerald-100">
+                <p className="text-sm font-bold text-emerald-700">
+                  Waad joojisay bixinta. Lacag lagama jarin.
+                </p>
+                <p className="text-xs text-emerald-600 mt-1">
+                  Payment cancelled. No money charged.
+                </p>
+              </div>
+            )}
 
             <Link
               href="/"

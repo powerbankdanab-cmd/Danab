@@ -241,37 +241,73 @@ export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
   return state === "CANCELLED" || state === "REVERSED" || state === "FAILED";
 }
 
-export async function checkPaymentStatus(transaction: {
-  providerRef?: string | null;
-  providerReferenceId?: string | null;
-}): Promise<{ status: "paid" | "not_paid" | "unknown"; transactionId?: string }> {
+export async function checkPaymentStatus(
+  providerRef?: string | null,
+  providerReferenceId?: string | null,
+): Promise<"pending" | "paid" | "cancelled" | "failed" | "unknown"> {
+  if (!providerRef && !providerReferenceId) {
+    return "unknown";
+  }
+
   try {
     const statusResponse = await queryWaafiTransactionStatus({
-      transactionId: transaction.providerRef,
-      referenceId: transaction.providerReferenceId,
+      transactionId: providerRef,
+      referenceId: providerReferenceId,
     });
 
-    const { transactionId } = extractWaafiIds(statusResponse);
-
     if (isWaafiApproved(statusResponse)) {
-      return { status: "paid", transactionId: transactionId || undefined };
+      return "paid";
     }
 
-    // Check for specific failure states
     const state = getWaafiLifecycleState(statusResponse);
-    if (state === "FAILED" || state === "CANCELLED" || state === "REVERSED") {
-      return { status: "not_paid", transactionId: transactionId || undefined };
+    const responseCode = String(statusResponse.responseCode || "").trim();
+    const responseMsg = String(statusResponse.responseMsg || "").toLowerCase();
+    const errorCode = String(statusResponse.errorCode || "").toLowerCase();
+    const combinedReason = `${responseMsg} ${errorCode}`;
+
+    if (
+      state === "CANCELLED" ||
+      state === "REVERSED" ||
+      state === "ABANDONED" ||
+      state === "EXPIRED" ||
+      combinedReason.includes("cancel") ||
+      combinedReason.includes("dismiss") ||
+      combinedReason.includes("user cancelled")
+    ) {
+      return "cancelled";
     }
 
-    // If response code indicates processing/pending
-    const responseCode = String(statusResponse.responseCode);
-    if (responseCode === "2002" || responseCode === "2003") { // Common pending codes
-      return { status: "unknown", transactionId: transactionId || undefined }; // Still processing
+    if (
+      state === "FAILED" ||
+      state === "DECLINED" ||
+      state === "REJECTED" ||
+      combinedReason.includes("wrong pin") ||
+      combinedReason.includes("invalid pin") ||
+      combinedReason.includes("rejected") ||
+      combinedReason.includes("declined")
+    ) {
+      return "failed";
     }
 
-    return { status: "unknown", transactionId: transactionId || undefined };
+    if (responseCode === "2001") {
+      return "paid";
+    }
+
+    if (
+      responseCode === "2002" ||
+      responseCode === "2003" ||
+      state === "INITIATED" ||
+      state === "PENDING" ||
+      state === "PROCESSING" ||
+      combinedReason.includes("pending") ||
+      combinedReason.includes("processing")
+    ) {
+      return "pending";
+    }
+
+    return "unknown";
   } catch (error) {
     console.error("Failed to check payment status:", error);
-    return { status: "unknown" };
+    return "unknown";
   }
 }

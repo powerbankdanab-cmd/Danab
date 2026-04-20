@@ -276,6 +276,14 @@ export async function processPayment(
       });
     }
 
+    if (txRecord.record.status === "pending_payment") {
+      return {
+        status: "pending",
+        message: "waiting_for_user_payment",
+        transactionId: txRecord.record.id,
+      };
+    }
+
     throw new HttpError(
       409,
       "This payment is already being processed. Please wait.",
@@ -389,33 +397,42 @@ export async function processPayment(
     }
 
     if (!isWaafiApproved(preauthResponse)) {
-      // If it's not approved but NOT a timeout, we might still want to check if it's pending
-      // based on Waafi response codes, but for now we follow the instruction:
-      // "IF Waafi does not immediately confirm success -> move to pending_payment"
-      // or at least handle the "waiting for user payment" UX.
-
-      const responseCode = String(preauthResponse.responseCode);
-      // Some providers use specific codes for "Pending/Processing"
-      // If we are unsure, we move to pending_payment anyway to be safe.
+      const pendingIds = extractWaafiIds(preauthResponse);
+      const pendingAudit = extractWaafiAudit(preauthResponse);
+      const waafiConfirmedPhoneNumber =
+        typeof pendingAudit.waafiConfirmedPhoneNumber === "string" &&
+        pendingAudit.waafiConfirmedPhoneNumber.trim().length > 0
+          ? pendingAudit.waafiConfirmedPhoneNumber.trim()
+          : null;
+      const canonicalPhoneNumber = phoneNumber;
+      const phoneAuthority = waafiConfirmedPhoneNumber
+        ? waafiConfirmedPhoneNumber === phoneNumber
+          ? "waafi_confirmed_full_match"
+          : "requested_phone_waafi_mismatch"
+        : "requested_phone_only";
 
       await transitionPaymentTransactionState({
         id: idempotencyKey,
         from: "initiated",
         to: "pending_payment",
         patch: {
-          providerReferenceId: preauthReferenceId,
+          providerRef: pendingIds.transactionId || null,
+          providerIssuerRef: pendingIds.issuerTransactionId || null,
+          providerReferenceId: pendingIds.referenceId || preauthReferenceId,
           pendingReason: "WAAFI_NOT_IMMEDIATE_SUCCESS",
-          waafiResponse: preauthResponse,
+          waafiAudit: pendingAudit,
           updatedAt: Date.now(),
           delivery: {
             imei,
             stationCode,
             batteryId: reservedBatteryId,
             slotId: battery.slot_id,
-            phoneNumber,
-            // phoneAuthority and other fields can be updated later if needed
-          }
-        }
+            phoneAuthority,
+            unlockAttempts: 0,
+            requestedPhoneNumber: phoneNumber,
+            canonicalPhoneNumber,
+          },
+        },
       });
 
       return {

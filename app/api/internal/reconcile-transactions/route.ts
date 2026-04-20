@@ -75,22 +75,12 @@ async function reconcile(request: NextRequest) {
           });
         }
         else if (tx.status === "pending_payment") {
-          const paymentResult = await checkPaymentStatus(tx);
+          const paymentResult = await checkPaymentStatus(
+            tx.providerRef,
+            tx.providerReferenceId,
+          );
 
-          if (paymentResult.status === "paid") {
-            // Update transaction with providerRef if we got it
-            if (paymentResult.transactionId && !tx.providerRef) {
-              await transitionPaymentTransactionState({
-                id: tx.id,
-                from: "pending_payment",
-                to: "pending_payment",
-                patch: {
-                  providerRef: paymentResult.transactionId,
-                  updatedAt: Date.now()
-                }
-              });
-            }
-
+          if (paymentResult === "paid") {
             // Transition to verified and finalize capture
             await transitionPaymentTransactionState({
               id: tx.id,
@@ -123,7 +113,10 @@ async function reconcile(request: NextRequest) {
               stats.errors++;
             }
           }
-          else if (paymentResult.status === "not_paid" && (Date.now() - tx.createdAt) > 120_000) { // 2 minutes
+          else if (
+            (paymentResult === "cancelled" || paymentResult === "failed") &&
+            (Date.now() - tx.createdAt) > 120_000
+          ) { // 2 minutes
             await cancelHold(tx.id, "PAYMENT_TIMEOUT (Async payment not completed)");
             stats.cancelled++;
 
