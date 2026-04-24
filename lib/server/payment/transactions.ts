@@ -5,6 +5,20 @@ import { HttpError } from "@/lib/server/payment/errors";
 
 export const PAYMENT_TRANSACTIONS_COLLECTION = "transactions";
 
+export type MinimalTransactionRecord = {
+  phone: string;
+  amount: number;
+  status: "pending_payment";
+  providerRef: null;
+  unlockAttempted: false;
+  unlockResult: null;
+  verificationResult: null;
+  rentalCreated: false;
+  failureReason: null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
 export type PaymentTransactionStatus =
   | "initiated"
   | "held"
@@ -59,6 +73,35 @@ export type PaymentTransactionRecord = {
 };
 
 type JsonObject = Record<string, unknown>;
+
+export async function createMinimalTransaction(input: {
+  phone: string;
+  amount: number;
+}) {
+  const now = Timestamp.now();
+  const record: MinimalTransactionRecord = {
+    phone: input.phone,
+    amount: input.amount,
+    status: "pending_payment",
+    providerRef: null,
+    unlockAttempted: false,
+    unlockResult: null,
+    verificationResult: null,
+    rentalCreated: false,
+    failureReason: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const docRef = await getDb()
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .add(record);
+
+  return {
+    id: docRef.id,
+    record,
+  };
+}
 
 export async function createOrGetPaymentTransaction(input: {
   id: string;
