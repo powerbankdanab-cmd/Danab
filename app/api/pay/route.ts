@@ -158,6 +158,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       transactionId: transaction.id,
       status: transaction.record.status,
+      providerRef: providerIds.transactionId,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

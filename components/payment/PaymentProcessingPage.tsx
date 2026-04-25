@@ -26,6 +26,7 @@ type ApiResponse = {
   status?: "pending_payment" | "paid" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
   reason_code?: "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
   failureReason?: string;
+  providerRef?: string | null;
   message?: string;
   transactionId?: string;
   error?: string;
@@ -248,9 +249,10 @@ export function PaymentProcessingPage() {
         updateStepStatus("init", "completed");
         setTransactionId(data.transactionId || idempotencyKey);
         updateStepStatus("pending", "active");
-        setStatus("PENDING_PAYMENT");
+        setStatus(data.providerRef ? "WAITING_PIN" : "PENDING_PAYMENT");
         console.info("PAYMENT_PENDING_STARTED", {
           transactionId: data.transactionId || idempotencyKey,
+          providerEngaged: Boolean(data.providerRef),
         });
       } catch (error) {
         if (!isCancelled) {
@@ -274,7 +276,7 @@ export function PaymentProcessingPage() {
   }, [amount, idempotencyKey, phoneNumber, stationCode]);
 
   useEffect(() => {
-    if (status !== "PENDING_PAYMENT" || !transactionId) {
+    if ((status !== "PENDING_PAYMENT" && status !== "WAITING_PIN") || !transactionId) {
       return;
     }
 
@@ -565,6 +567,87 @@ export function PaymentProcessingPage() {
               </p>
               <p className="mt-1 text-xs text-slate-400">
                 Lacagta lama jarin weli. Waxaan sugaynaa jawaabta bixinta ee provider-ka.
+              </p>
+            </div>
+          </div>
+        );
+
+      case "WAITING_PIN":
+        return (
+          <div className="space-y-6 py-4">
+            <div className="text-center">
+              <p className="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                {method} â€¢ {formatAmount(amount)} â€¢ {formatPhone(phoneNumber)}
+              </p>
+              <div className="flex justify-center mb-4">
+                <div className="relative h-16 w-16">
+                  <div className="absolute inset-0 animate-ping rounded-full bg-blue-400/20" />
+                  <div className="relative flex h-16 w-16 items-center justify-center rounded-full bg-white shadow-xl">
+                    <span className="h-8 w-8 animate-spin rounded-full border-4 border-blue-500 border-t-transparent" />
+                  </div>
+                </div>
+              </div>
+              <h1 className="text-xl font-bold text-slate-900 mb-2">
+                Fadlan dhammee PIN-ka taleefankaaga
+              </h1>
+              <p className="text-sm text-slate-600 mb-4">
+                Please complete payment on your phone
+              </p>
+              <div className="rounded-xl bg-blue-50 p-4 border border-blue-100">
+                <p className="text-sm font-medium text-blue-700">
+                  Fadlan dhammee PIN-ka taleefankaaga
+                </p>
+                <p className="mt-1 text-xs text-blue-600">
+                  Please complete payment on your phone
+                </p>
+              </div>
+              {isSlowPolling && (
+                <div className="mt-4 rounded-xl bg-amber-50 p-4 border border-amber-100">
+                  <p className="text-sm font-medium text-amber-700">
+                    Waxaan wali hubinaynaa lacagta. Fadlan sug.
+                  </p>
+                  <p className="text-xs text-amber-600 mt-1">
+                    We are still verifying your payment.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Step Progress */}
+            <div className="space-y-3">
+              {steps.map((step, index) => (
+                <div key={step.id} className="flex items-center gap-3">
+                  <div className="flex-shrink-0">
+                    {renderStepIcon(step.status)}
+                  </div>
+                  <div className="flex-1 text-left">
+                    <p className={cn(
+                      "text-sm font-medium",
+                      step.status === "active" ? "text-blue-700" :
+                        step.status === "completed" ? "text-emerald-700" :
+                          step.status === "failed" ? "text-red-700" : "text-gray-500"
+                    )}>
+                      {step.label}
+                    </p>
+                    <p className={cn(
+                      "text-xs",
+                      step.status === "active" ? "text-blue-600" :
+                        step.status === "completed" ? "text-emerald-600" :
+                          step.status === "failed" ? "text-red-600" : "text-gray-400"
+                    )}>
+                      {step.somaliLabel}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="rounded-xl bg-slate-50 p-4 border border-slate-100">
+              <p className="text-sm text-slate-500">
+                Money Status: <span className="font-bold text-slate-700">WAITING FOR PIN</span>
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Lacagta lama jarin weli. Waxaan sugaynaa PIN-ka taleefankaaga.
               </p>
             </div>
           </div>

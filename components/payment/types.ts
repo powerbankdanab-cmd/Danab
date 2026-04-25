@@ -3,6 +3,7 @@ export type PaymentMethod = "EVC Plus" | "ZAAD" | "SAHAL";
 export type PaymentStatus =
   | "CONNECTING"
   | "PENDING_PAYMENT"
+  | "WAITING_PIN"
   | "PROCESSING"
   | "CONFIRM_REQUIRED"
   | "SUCCESS"
