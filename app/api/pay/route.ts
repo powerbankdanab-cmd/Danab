@@ -114,6 +114,7 @@ export async function POST(request: NextRequest) {
           ? {
             status: "failed",
             reason_code: "USER_CANCELLED",
+            failureReason: "USER_CANCELLED",
             error: "Payment cancelled by user",
           }
           : { error: "Payment provider did not return a transaction id" },
@@ -147,6 +148,7 @@ export async function POST(request: NextRequest) {
         ? {
           status: "failed",
           reason_code: "USER_CANCELLED",
+          failureReason: "USER_CANCELLED",
           error: "Payment cancelled by user",
         }
         : { error: "Failed to create transaction" },

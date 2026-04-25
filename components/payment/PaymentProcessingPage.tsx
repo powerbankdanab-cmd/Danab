@@ -15,7 +15,6 @@ import {
 import {
   cn,
   formatAmount,
-  mapBackendErrorMessage,
   normalizePhone,
 } from "@/components/payment/helpers";
 import {
@@ -26,6 +25,7 @@ import {
 type ApiResponse = {
   status?: "pending_payment" | "paid" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
   reason_code?: "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
+  failureReason?: string;
   message?: string;
   transactionId?: string;
   error?: string;
@@ -112,100 +112,79 @@ export function PaymentProcessingPage() {
     ));
   };
 
+  const normalizeFailureReason = (
+    data?: Pick<ApiResponse, "reason_code" | "failureReason">,
+  ): ApiResponse["reason_code"] => {
+    const rawReason = String(data?.reason_code || data?.failureReason || "")
+      .trim()
+      .toUpperCase();
+
+    if (rawReason === "USER_CANCELLED") {
+      return "USER_CANCELLED";
+    }
+
+    if (rawReason === "TIMEOUT") {
+      return "TIMEOUT";
+    }
+
+    if (rawReason === "INSUFFICIENT_BALANCE") {
+      return "INSUFFICIENT_BALANCE";
+    }
+
+    if (rawReason === "PROVIDER_ERROR") {
+      return "PROVIDER_ERROR";
+    }
+
+    if (rawReason === "WRONG_PIN") {
+      return "WRONG_PIN";
+    }
+
+    return undefined;
+  };
+
   const getFriendlyFailureMessage = (
     reason?: ApiResponse["reason_code"],
-    backendError?: string,
   ) => {
     if (reason === "USER_CANCELLED") {
-      return "Waad joojisay bixinta. Lacag lagama jarin. Payment cancelled. No money charged.";
+      return "Waad joojisay lacag bixinta. You cancelled the payment.";
     }
 
     if (reason === "TIMEOUT") {
-      return "Waqtigii lacag bixintu wuu dhammaaday. Lacag lagama jarin. Fadlan mar kale isku day. Payment timed out. No money charged.";
+      return "Waqtiga lacag bixintu wuu dhammaaday. Payment request timed out.";
     }
 
-    const normalizedError = String(backendError || "").toLowerCase();
-
-    if (
-      normalizedError.includes("insufficient") ||
-      normalizedError.includes("low balance") ||
-      normalizedError.includes("not enough balance") ||
-      normalizedError.includes("haraaga")
-    ) {
-      return "Lacag kugu filan ma jirto. Fadlan hubi haraagaga ama lambarka aad bixinta ka isticmaaleyso, kadibna mar kale isku day. Insufficient balance.";
+    if (reason === "PROVIDER_ERROR") {
+      return "Waxaa dhacay cilad adeeg bixiyaha. There was an issue with the payment provider.";
     }
 
-    if (
-      normalizedError.includes("payment not approved") ||
-      normalizedError.includes("payment hold not approved") ||
-      normalizedError.includes("not approved") ||
-      normalizedError.includes("declined") ||
-      normalizedError.includes("rejected")
-    ) {
-      return "Bixinta lama oggolaan. Fadlan hubi haraagaga ama lambarka, kadibna mar kale isku day. Payment was not approved.";
+    if (reason === "INSUFFICIENT_BALANCE") {
+      return "Lacag kugu filan ma jirto. You do not have enough balance.";
     }
 
-    if (
-      normalizedError.includes("wrong pin") ||
-      normalizedError.includes("invalid pin") ||
-      normalizedError.includes("pin")
-    ) {
-      return "PIN-ka aad gelisay ma saxna ama lama xaqiijin. Fadlan hubi PIN-ka oo mar kale isku day.";
-    }
-
-    if (
-      normalizedError.includes("number") ||
-      normalizedError.includes("phone") ||
-      normalizedError.includes("accountno") ||
-      normalizedError.includes("account no")
-    ) {
-      return "Lambarka bixinta waa khaldan yahay ama lama aqoonsan. Fadlan hubi lambarka oo mar kale isku day.";
-    }
-
-    if (backendError) {
-      const mapped = mapBackendErrorMessage(backendError);
-      if (mapped && mapped.trim().length > 0 && !mapped.toLowerCase().includes("khalad")) {
-        return mapped;
-      }
-    }
-
-    return "Lacag bixin ma dhicin. Lacag lagama jarin. Fadlan mar kale isku day. Payment did not complete. No money charged. Please try again.";
+    return "Wax khalad ah ayaa dhacay, fadlan mar kale isku day. Something went wrong, please try again.";
   };
 
   const getFailureHeading = (
     reason?: ApiResponse["reason_code"],
-    message?: string,
   ) => {
     if (reason === "USER_CANCELLED") {
       return "Bixinta waa la joojiyay";
     }
 
-    const normalized = String(message || "").toLowerCase();
-
-    if (
-      normalized.includes("insufficient balance") ||
-      normalized.includes("lacag kugu filan ma jirto")
-    ) {
+    if (reason === "INSUFFICIENT_BALANCE") {
       return "Haraaga kuma filna";
     }
 
-    if (
-      normalized.includes("pin") &&
-      (normalized.includes("khaldan") || normalized.includes("invalid") || normalized.includes("wrong"))
-    ) {
+    if (reason === "WRONG_PIN") {
       return "PIN-ka lama xaqiijin";
-    }
-
-    if (
-      normalized.includes("lambarka") ||
-      normalized.includes("phone") ||
-      normalized.includes("account")
-    ) {
-      return "Lambarka bixinta waa khaldan";
     }
 
     if (reason === "TIMEOUT") {
       return "Xaqiijinta lacagta way daahday";
+    }
+
+    if (reason === "PROVIDER_ERROR") {
+      return "Cilad adeeg bixiyaha";
     }
 
     return "Lacag bixinta ma dhicin";
@@ -252,12 +231,13 @@ export function PaymentProcessingPage() {
         if (isCancelled) return;
 
         const data: ApiResponse = await response.json();
+        console.log("PAY RESPONSE:", data);
 
-        if (!response.ok) {
-          const reason = data.reason_code || "PROVIDER_ERROR";
+        if (data.status === "failed" || !response.ok) {
+          const reason = normalizeFailureReason(data);
           setStatus("FAILED");
           setFailureReason(reason);
-          setErrorMessage(getFriendlyFailureMessage(reason, data.error || "Bixinta lama bilaabin."));
+          setErrorMessage(getFriendlyFailureMessage(reason));
           updateStepStatus("init", "failed");
           return;
         }
@@ -273,12 +253,7 @@ export function PaymentProcessingPage() {
         if (!isCancelled) {
           setStatus("FAILED");
           setFailureReason("PROVIDER_ERROR");
-          setErrorMessage(
-            getFriendlyFailureMessage(
-              "PROVIDER_ERROR",
-              error instanceof Error ? error.message : "Cillad farsamo ayaa dhacday.",
-            ),
-          );
+          setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
           updateStepStatus("init", "failed");
         }
       }
@@ -334,6 +309,7 @@ export function PaymentProcessingPage() {
         }
 
         const data: ApiResponse = await response.json();
+        console.log("STATUS RESPONSE:", data);
 
         if (data.status === "paid" || data.status === "payment_confirmed") {
           updateStepStatus("confirmed", "completed");
@@ -351,12 +327,13 @@ export function PaymentProcessingPage() {
         }
 
         if (data.status === "failed") {
-          setFailureReason(data.reason_code);
-          setErrorMessage(getFriendlyFailureMessage(data.reason_code, data.error));
-          if (data.reason_code === "USER_CANCELLED") {
+          const reason = normalizeFailureReason(data);
+          setFailureReason(reason);
+          setErrorMessage(getFriendlyFailureMessage(reason));
+          if (reason === "USER_CANCELLED") {
             console.info("PAYMENT_USER_CANCELLED", { transactionId });
           } else {
-            console.info("PAYMENT_FAILED", { transactionId, reason: data.reason_code || "unknown" });
+            console.info("PAYMENT_FAILED", { transactionId, reason: reason || "unknown" });
           }
           updateStepStatus("confirmed", "failed");
           setIsSlowPolling(false);
@@ -416,7 +393,7 @@ export function PaymentProcessingPage() {
       if (!res.ok) {
         setStatus("FAILED");
         setFailureReason("PROVIDER_ERROR");
-        setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", data.error || "Xaqiijinta waa fashilantay."));
+        setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
         return;
       }
 
@@ -436,14 +413,7 @@ export function PaymentProcessingPage() {
     } catch (error) {
       setStatus("FAILED");
       setFailureReason("PROVIDER_ERROR");
-      setErrorMessage(
-        getFriendlyFailureMessage(
-          "PROVIDER_ERROR",
-          error instanceof Error
-            ? error.message
-            : "Cillad farsamo ayaa dhacday inta lagu guda jiray xaqiijinta.",
-        ),
-      );
+      setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
     }
   };
 
@@ -804,7 +774,7 @@ export function PaymentProcessingPage() {
                 </div>
               </div>
               <h1 className="text-xl font-bold text-slate-900 mb-2">
-                {getFailureHeading(failureReason, errorMessage)}
+                {getFailureHeading(failureReason)}
               </h1>
               <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
                 <p className="text-sm font-medium text-rose-700">

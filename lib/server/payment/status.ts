@@ -10,6 +10,7 @@ const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 export type PaymentStatusResponse = {
   status: "pending_payment" | "paid" | "failed";
   reason_code?: "USER_CANCELLED" | "TIMEOUT" | "PROVIDER_ERROR";
+  failureReason?: "USER_CANCELLED" | "TIMEOUT" | "PROVIDER_ERROR";
 };
 
 function toReasonCode(
@@ -64,6 +65,7 @@ export async function getProviderDrivenPaymentStatus(
     return {
       status: "failed",
       reason_code: toReasonCode(transaction.failureReason),
+      failureReason: toReasonCode(transaction.failureReason),
     };
   }
 
@@ -84,7 +86,7 @@ export async function getProviderDrivenPaymentStatus(
       failureReason: "TIMEOUT",
     });
 
-    return { status, reason_code: "TIMEOUT" };
+    return { status, reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
   }
 
   if (!transaction.providerRef) {
@@ -137,7 +139,11 @@ export async function getProviderDrivenPaymentStatus(
       failureReason: "USER_CANCELLED",
     });
 
-    return { status, reason_code: "USER_CANCELLED" };
+    return {
+      status,
+      reason_code: "USER_CANCELLED",
+      failureReason: "USER_CANCELLED",
+    };
   }
 
   if (providerCheck.status === "failed") {
@@ -152,7 +158,11 @@ export async function getProviderDrivenPaymentStatus(
       failureReason: "PROVIDER_FAILED",
     });
 
-    return { status, reason_code: "PROVIDER_ERROR" };
+    return {
+      status,
+      reason_code: "PROVIDER_ERROR",
+      failureReason: "PROVIDER_ERROR",
+    };
   }
 
   if (providerCheck.status === "paid") {
