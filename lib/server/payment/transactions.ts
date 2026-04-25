@@ -20,6 +20,7 @@ export type PaymentTransactionStatus =
   | "held"
   | "pending_payment"
   | "paid"
+  | "processing"
   | "verified"
   | "captured"
   | "failed"
