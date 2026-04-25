@@ -215,12 +215,23 @@ export function PaymentProcessingPage() {
     }
 
     if (status === "FAILED") {
-      setSteps((currentSteps) =>
-        currentSteps.map((step) => ({
-          ...step,
-          status: step.id === "pending" ? "failed" : "pending",
-        })),
-      );
+      setSteps((currentSteps) => {
+        const activeIndex = currentSteps.findIndex((step) => step.status === "active");
+        const pendingIndex = currentSteps.findIndex((step) => step.status === "pending");
+        const failureIndex = activeIndex !== -1 ? activeIndex : pendingIndex !== -1 ? pendingIndex : 0;
+
+        return currentSteps.map((step, index) => {
+          if (index < failureIndex) {
+            return { ...step, status: "completed" };
+          }
+
+          if (index === failureIndex) {
+            return { ...step, status: "failed" };
+          }
+
+          return { ...step, status: "pending" };
+        });
+      });
     }
   }, [status]);
 
