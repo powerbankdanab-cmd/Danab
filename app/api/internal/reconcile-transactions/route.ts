@@ -132,11 +132,12 @@ async function reconcile(request: NextRequest) {
             await cancelHold(tx.id, "PAYMENT_TIMEOUT (Async payment not completed)");
             stats.cancelled++;
 
+            const createdAtMs = toMillis(tx.createdAt) ?? Date.now();
             await logError({
               type: "ASYNC_PAYMENT_TIMEOUT",
               transactionId: tx.id,
               stationCode: tx.station,
-              message: `[RECON] Auto-cancelled pending payment (${Math.floor((Date.now() - tx.createdAt) / 1000)}s old)`,
+              message: `[RECON] Auto-cancelled pending payment (${Math.floor((Date.now() - createdAtMs) / 1000)}s old)`,
               metadata: { action: "PAYMENT_TIMEOUT", station: tx.station }
             });
           }
