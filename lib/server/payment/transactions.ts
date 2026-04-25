@@ -9,12 +9,8 @@ export type MinimalTransactionRecord = {
   phone: string;
   amount: number;
   status: "pending_payment";
-  providerRef: null;
-  unlockAttempted: false;
-  unlockResult: null;
-  verificationResult: null;
-  rentalCreated: false;
-  failureReason: null;
+  providerRef?: string | null;
+  failureReason?: string | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
@@ -23,6 +19,7 @@ export type PaymentTransactionStatus =
   | "initiated"
   | "held"
   | "pending_payment"
+  | "paid"
   | "verified"
   | "captured"
   | "failed"
@@ -83,12 +80,6 @@ export async function createMinimalTransaction(input: {
     phone: input.phone,
     amount: input.amount,
     status: "pending_payment",
-    providerRef: null,
-    unlockAttempted: false,
-    unlockResult: null,
-    verificationResult: null,
-    rentalCreated: false,
-    failureReason: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -153,7 +144,62 @@ export async function getPaymentTransaction(
   if (!snap.exists) {
     return null;
   }
-  return snap.data() as PaymentTransactionRecord;
+  return { id, ...(snap.data() as Omit<PaymentTransactionRecord, "id">) };
+}
+
+export async function patchPhase2Transaction(input: {
+  id: string;
+  patch: JsonObject;
+}) {
+  await getDb()
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .doc(input.id)
+    .set(
+      {
+        ...input.patch,
+        updatedAt: Timestamp.now(),
+      },
+      { merge: true },
+    );
+}
+
+export async function completePhase2Transaction(input: {
+  id: string;
+  status: "paid" | "failed";
+  failureReason?: string;
+}) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(input.id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) {
+      throw new HttpError(404, "Transaction record not found", {
+        transactionId: input.id,
+      });
+    }
+
+    const current = snap.data() as { status?: string };
+    if (current.status === "paid" || current.status === "failed") {
+      return current.status as "paid" | "failed";
+    }
+
+    if (current.status !== "pending_payment") {
+      throw new HttpError(409, "invalid state", {
+        transactionId: input.id,
+        expectedState: "pending_payment",
+        actualState: current.status,
+      });
+    }
+
+    tx.update(docRef, {
+      status: input.status,
+      updatedAt: Timestamp.now(),
+      ...(input.failureReason ? { failureReason: input.failureReason } : {}),
+    });
+
+    return input.status;
+  });
 }
 
 export async function ensurePaymentTransactionState(

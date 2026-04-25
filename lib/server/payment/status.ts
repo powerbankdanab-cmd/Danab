@@ -1,65 +1,31 @@
-import { logError } from "@/lib/server/alerts/log-error";
 import { HttpError } from "@/lib/server/payment/errors";
-import { resumePendingPayment } from "@/lib/server/payment/process-payment";
 import {
+  completePhase2Transaction,
   getPaymentTransaction,
-  PaymentTransactionRecord,
-  transitionPaymentTransactionState,
 } from "@/lib/server/payment/transactions";
-import { checkPaymentStatus } from "@/lib/server/payment/waafi";
+import { checkPaymentStatusDetailed } from "@/lib/server/payment/waafi";
 
-export type PaymentStatusReason = "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
+const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 
 export type PaymentStatusResponse = {
-  status: "pending_payment" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
-  reason_code?: PaymentStatusReason;
-  message?: string;
-  transactionId: string;
-  battery_id?: string;
-  slot_id?: string;
+  status: "pending_payment" | "paid" | "failed";
 };
 
-function toFinalResponse(transaction: PaymentTransactionRecord): PaymentStatusResponse {
-  if (transaction.status === "failed") {
-    const reason = String(transaction.failureReason || "").toLowerCase().includes("cancel")
-      ? "USER_CANCELLED"
-      : "PROVIDER_ERROR";
-
-    return {
-      status: "failed",
-      reason_code: reason,
-      transactionId: transaction.id,
-    };
+function toMillis(value: unknown): number | null {
+  if (typeof value === "number") {
+    return value;
   }
 
-  if (transaction.status === "captured") {
-    return {
-      status: "payment_confirmed",
-      transactionId: transaction.id,
-      battery_id: transaction.delivery?.batteryId,
-      slot_id: transaction.delivery?.slotId,
-    };
+  if (
+    value &&
+    typeof value === "object" &&
+    "toMillis" in value &&
+    typeof (value as { toMillis?: unknown }).toMillis === "function"
+  ) {
+    return (value as { toMillis: () => number }).toMillis();
   }
 
-  if (transaction.status === "confirm_required") {
-    return {
-      status: "confirm_required",
-      transactionId: transaction.id,
-    };
-  }
-
-  if (transaction.status === "pending_payment") {
-    return {
-      status: "pending_payment",
-      transactionId: transaction.id,
-    };
-  }
-
-  // held, verified, capture_unknown, resolving → processing
-  return {
-    status: "processing",
-    transactionId: transaction.id,
-  };
+  return null;
 }
 
 export async function getProviderDrivenPaymentStatus(
@@ -71,94 +37,112 @@ export async function getProviderDrivenPaymentStatus(
     throw new HttpError(404, "Transaction not found");
   }
 
-  if (transaction.status !== "pending_payment") {
-    return toFinalResponse(transaction);
+  if (transaction.status === "paid") {
+    return { status: "paid" };
   }
 
-  const providerStatus = await checkPaymentStatus(
+  if (transaction.status === "failed") {
+    return { status: "failed" };
+  }
+
+  const createdAtMs = toMillis(transaction.createdAt);
+  if (
+    transaction.status === "pending_payment" &&
+    createdAtMs !== null &&
+    Date.now() - createdAtMs > PAYMENT_PENDING_TIMEOUT_MS
+  ) {
+    const status = await completePhase2Transaction({
+      id: transactionId,
+      status: "failed",
+      failureReason: "TIMEOUT",
+    });
+
+    console.info("payment_failed", {
+      transactionId,
+      failureReason: "TIMEOUT",
+    });
+
+    return { status };
+  }
+
+  if (!transaction.providerRef) {
+    console.info("payment_status_checked", {
+      transactionId,
+      providerRef: null,
+      providerStatus: "missing_provider_ref",
+    });
+
+    return { status: "pending_payment" };
+  }
+
+  const providerCheck = await checkPaymentStatusDetailed(
     transaction.providerRef,
-    transaction.providerReferenceId,
+    null,
   );
 
-  if (providerStatus === "pending") {
-    console.info("PAYMENT_PENDING_STARTED", { transactionId });
-    return {
-      status: "pending_payment",
-      transactionId,
-    };
-  }
-
-  if (providerStatus === "cancelled") {
-    await transitionPaymentTransactionState({
-      id: transactionId,
-      from: "pending_payment",
-      to: "failed",
-      patch: {
-        failedAt: Date.now(),
-        failureReason: "USER_CANCELLED",
-      },
-    }).catch(() => undefined);
-
-    console.info("PAYMENT_USER_CANCELLED", { transactionId });
-
-    return {
-      status: "failed",
-      reason_code: "USER_CANCELLED",
-      transactionId,
-    };
-  }
-
-  if (providerStatus === "failed") {
-    await transitionPaymentTransactionState({
-      id: transactionId,
-      from: "pending_payment",
-      to: "failed",
-      patch: {
-        failedAt: Date.now(),
-        failureReason: "PROVIDER_ERROR",
-      },
-    }).catch(() => undefined);
-
-    console.info("PAYMENT_FAILED", { transactionId });
-
-    return {
-      status: "failed",
-      reason_code: "PROVIDER_ERROR",
-      transactionId,
-    };
-  }
-
-  if (providerStatus === "paid") {
-    try {
-      await resumePendingPayment(transaction);
-      const latest = await getPaymentTransaction(transactionId);
-      console.info("PAYMENT_CONFIRMED", { transactionId });
-      return toFinalResponse(latest || transaction);
-    } catch (error) {
-      await logError({
-        type: "PAYMENT_CONFIRM_AFTER_PENDING_FAILED",
-        transactionId,
-        stationCode: transaction.station,
-        phoneNumber: transaction.phone,
-        message: "Provider returned PAID but pending resume failed",
-        metadata: {
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-
-      return {
-        status: "pending_payment",
-        reason_code: "PROVIDER_ERROR",
-        message: "Provider status reconciliation pending after resume failure",
-        transactionId,
-      };
-    }
-  }
-
-  return {
-    status: "pending_payment",
-    reason_code: "PROVIDER_ERROR",
-    message: "Provider status returned unknown; keeping transaction pending",
+  console.info("payment_status_checked", {
     transactionId,
-  };
+    providerRef: transaction.providerRef,
+    providerStatus: providerCheck.status,
+    providerResponseCode:
+      providerCheck.raw?.responseCode !== undefined
+        ? String(providerCheck.raw.responseCode)
+        : null,
+    providerErrorCode: providerCheck.raw?.errorCode || null,
+    providerState: providerCheck.raw?.params?.state || null,
+    providerMessage: providerCheck.raw?.responseMsg || null,
+  });
+
+  if (providerCheck.error) {
+    console.info("provider_error", {
+      transactionId,
+      providerRef: transaction.providerRef,
+      error: providerCheck.error,
+    });
+
+    return { status: "pending_payment" };
+  }
+
+  if (providerCheck.status === "cancelled") {
+    const status = await completePhase2Transaction({
+      id: transactionId,
+      status: "failed",
+      failureReason: "USER_CANCELLED",
+    });
+
+    console.info("payment_failed", {
+      transactionId,
+      failureReason: "USER_CANCELLED",
+    });
+
+    return { status };
+  }
+
+  if (providerCheck.status === "failed") {
+    const status = await completePhase2Transaction({
+      id: transactionId,
+      status: "failed",
+      failureReason: "PROVIDER_FAILED",
+    });
+
+    console.info("payment_failed", {
+      transactionId,
+      failureReason: "PROVIDER_FAILED",
+    });
+
+    return { status };
+  }
+
+  if (providerCheck.status === "paid") {
+    const status = await completePhase2Transaction({
+      id: transactionId,
+      status: "paid",
+    });
+
+    console.info("payment_paid", { transactionId });
+
+    return { status };
+  }
+
+  return { status: "pending_payment" };
 }

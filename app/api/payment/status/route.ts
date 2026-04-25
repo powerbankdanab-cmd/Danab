@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import { isHttpError } from "@/lib/server/payment/errors";
 import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
-import { isHttpError } from "@/lib/server/payment-service";
 
 export async function GET(request: NextRequest) {
   try {

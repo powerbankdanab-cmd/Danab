@@ -264,27 +264,22 @@ function classifyWaafiPaymentStatus(
     "timeout waiting pin",
   ];
   const failedTerms = [
-    "wrong pin",
-    "invalid pin",
     "rejected",
     "declined",
     "denied",
-    "insufficient",
-    "failed",
+    "explicit decline",
   ];
 
   if (
     state === "CANCELLED" ||
     state === "REVERSED" ||
     state === "ABANDONED" ||
-    state === "EXPIRED" ||
     cancelledTerms.some((term) => combinedReason.includes(term))
   ) {
     return "cancelled";
   }
 
   if (
-    state === "FAILED" ||
     state === "DECLINED" ||
     state === "REJECTED" ||
     failedTerms.some((term) => combinedReason.includes(term))
@@ -292,38 +287,38 @@ function classifyWaafiPaymentStatus(
     return "failed";
   }
 
-  if (responseCode === "2001") {
-    return "paid";
-  }
-
   if (
     responseCode === "2002" ||
     responseCode === "2003" ||
+    responseCode === "2001" ||
     state === "INITIATED" ||
     state === "PENDING" ||
     state === "PROCESSING" ||
+    state === "ACCEPTED" ||
+    state === "PENDING_APPROVAL" ||
     combinedReason.includes("pending") ||
     combinedReason.includes("processing") ||
+    combinedReason.includes("accepted") ||
     combinedReason.includes("waiting")
   ) {
     return "pending";
   }
 
-  // Defensive fallback: if provider returned a concrete terminal-like response
-  // we don't recognize, prefer failed over "pending forever".
-  if (responseCode && responseCode !== "2002" && responseCode !== "2003") {
-    return "failed";
-  }
-
   return "unknown";
 }
 
-export async function checkPaymentStatus(
+export type WaafiPaymentStatusCheck = {
+  status: "pending" | "paid" | "cancelled" | "failed" | "unknown";
+  raw?: WaafiResponse;
+  error?: string;
+};
+
+export async function checkPaymentStatusDetailed(
   providerRef?: string | null,
   providerReferenceId?: string | null,
-): Promise<"pending" | "paid" | "cancelled" | "failed" | "unknown"> {
+): Promise<WaafiPaymentStatusCheck> {
   if (!providerRef && !providerReferenceId) {
-    return "unknown";
+    return { status: "unknown" };
   }
 
   try {
@@ -333,7 +328,7 @@ export async function checkPaymentStatus(
       });
       const transactionStatus = classifyWaafiPaymentStatus(byTransactionId);
       if (transactionStatus !== "unknown") {
-        return transactionStatus;
+        return { status: transactionStatus, raw: byTransactionId };
       }
     }
 
@@ -341,12 +336,24 @@ export async function checkPaymentStatus(
       const byReferenceId = await queryWaafiTransactionStatus({
         referenceId: providerReferenceId,
       });
-      return classifyWaafiPaymentStatus(byReferenceId);
+      return {
+        status: classifyWaafiPaymentStatus(byReferenceId),
+        raw: byReferenceId,
+      };
     }
 
-    return "unknown";
+    return { status: "unknown" };
   } catch (error) {
-    console.error("Failed to check payment status:", error);
-    return "unknown";
+    const message = error instanceof Error ? error.message : String(error);
+    console.info("provider_error", { providerRef, error: message });
+    return { status: "unknown", error: message };
   }
+}
+
+export async function checkPaymentStatus(
+  providerRef?: string | null,
+  providerReferenceId?: string | null,
+): Promise<"pending" | "paid" | "cancelled" | "failed" | "unknown"> {
+  const result = await checkPaymentStatusDetailed(providerRef, providerReferenceId);
+  return result.status;
 }
