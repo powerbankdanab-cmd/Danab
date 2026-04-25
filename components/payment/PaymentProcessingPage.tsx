@@ -24,7 +24,7 @@ import {
 } from "@/components/payment/types";
 
 type ApiResponse = {
-  status?: "pending_payment" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
+  status?: "pending_payment" | "paid" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
   reason_code?: "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
   message?: string;
   transactionId?: string;
@@ -121,7 +121,7 @@ export function PaymentProcessingPage() {
     }
 
     if (reason === "TIMEOUT") {
-      return "Lacag bixin wali ma dhicin. Fadlan sug wax yar ama mar kale isku day. Payment is still being verified.";
+      return "Waqtigii lacag bixintu wuu dhammaaday. Lacag lagama jarin. Fadlan mar kale isku day. Payment timed out. No money charged.";
     }
 
     const normalizedError = String(backendError || "").toLowerCase();
@@ -334,12 +334,12 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
 
-        if (data.status === "payment_confirmed") {
+        if (data.status === "paid" || data.status === "payment_confirmed") {
           updateStepStatus("confirmed", "completed");
-          updateStepStatus("unlocking", "completed");
-          updateStepStatus("verifying", "completed");
-          updateStepStatus("success", "completed");
           if (data.battery_id && data.slot_id) {
+            updateStepStatus("unlocking", "completed");
+            updateStepStatus("verifying", "completed");
+            updateStepStatus("success", "completed");
             setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
           }
           setIsSlowPolling(false);
