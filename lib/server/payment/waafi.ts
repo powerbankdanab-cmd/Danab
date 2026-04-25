@@ -244,62 +244,56 @@ export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
 export function classifyWaafiPaymentStatus(
   statusResponse: WaafiResponse,
 ): "pending" | "paid" | "cancelled" | "failed" | "unknown" {
+  console.log("WAAFI RAW RESPONSE:", statusResponse);
+
   if (isWaafiApproved(statusResponse)) {
     return "paid";
   }
 
-  const state = getWaafiLifecycleState(statusResponse);
+  const state = String(statusResponse.params?.state || "").toLowerCase();
   const responseCode = String(statusResponse.responseCode || "").trim();
-  const responseMsg = String(statusResponse.responseMsg || "").toLowerCase();
-  const errorCode = String(statusResponse.errorCode || "").toLowerCase();
-  const combinedReason = `${responseMsg} ${errorCode}`;
-
-  const cancelledTerms = [
-    "cancel",
-    "dismiss",
-    "abandon",
-    "abort",
-    "user cancelled",
-    "closed by user",
-    "timeout waiting pin",
-  ];
-  const failedTerms = [
-    "rejected",
-    "declined",
-    "denied",
-    "explicit decline",
-  ];
+  const message = String(
+    statusResponse.responseMsg ||
+    (statusResponse as { message?: unknown }).message ||
+    "",
+  ).toLowerCase();
+  const error = String(
+    statusResponse.errorCode ||
+    (statusResponse as { error?: unknown }).error ||
+    "",
+  ).toLowerCase();
 
   if (
-    state === "CANCELLED" ||
-    state === "REVERSED" ||
-    state === "ABANDONED" ||
-    cancelledTerms.some((term) => combinedReason.includes(term))
+    state.includes("cancel") ||
+    state.includes("abort") ||
+    state.includes("fail") ||
+    state.includes("revers") ||
+    state.includes("decline") ||
+    message.includes("cancel") ||
+    message.includes("user") ||
+    message.includes("abort") ||
+    message.includes("dismiss") ||
+    message.includes("closed") ||
+    error.includes("cancel") ||
+    error.includes("user") ||
+    error.includes("abort")
   ) {
     return "cancelled";
-  }
-
-  if (
-    state === "DECLINED" ||
-    state === "REJECTED" ||
-    failedTerms.some((term) => combinedReason.includes(term))
-  ) {
-    return "failed";
   }
 
   if (
     responseCode === "2002" ||
     responseCode === "2003" ||
     responseCode === "2001" ||
-    state === "INITIATED" ||
-    state === "PENDING" ||
-    state === "PROCESSING" ||
-    state === "ACCEPTED" ||
-    state === "PENDING_APPROVAL" ||
-    combinedReason.includes("pending") ||
-    combinedReason.includes("processing") ||
-    combinedReason.includes("accepted") ||
-    combinedReason.includes("waiting")
+    state === "initiated" ||
+    state === "pending" ||
+    state === "processing" ||
+    state === "accepted" ||
+    state === "pending_approval" ||
+    message.includes("pending") ||
+    message.includes("processing") ||
+    message.includes("accepted") ||
+    message.includes("waiting")
   ) {
     return "pending";
   }
