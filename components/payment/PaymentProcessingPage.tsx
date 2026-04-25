@@ -200,6 +200,26 @@ export function PaymentProcessingPage() {
   };
 
   useEffect(() => {
+    if (status === "WAITING_PIN") {
+      updateStepStatus("pending", "active");
+    }
+
+    if (status === "PROCESSING") {
+      updateStepStatus("pending", "completed");
+      updateStepStatus("confirmed", "active");
+    }
+
+    if (status === "SUCCESS") {
+      updateStepStatus("confirmed", "completed");
+      updateStepStatus("success", "completed");
+    }
+
+    if (status === "FAILED") {
+      updateStepStatus("pending", "failed");
+    }
+  }, [status]);
+
+  useEffect(() => {
     if (!phoneNumber || !idempotencyKey) {
       setStatus("FAILED");
       setFailureReason("PROVIDER_ERROR");
@@ -290,11 +310,7 @@ export function PaymentProcessingPage() {
 
       const startedAt = pollingStartedAtRef.current || Date.now();
       const elapsedMs = Date.now() - startedAt;
-      const isSlowPolling = elapsedMs >= 60_000; // After 60s, switch to slow polling
-
-      if (isSlowPolling !== isSlowPolling) {
-        setIsSlowPolling(isSlowPolling);
-      }
+      setIsSlowPolling(elapsedMs >= 60_000);
 
       pollingRequestInFlightRef.current = true;
 

@@ -66,7 +66,11 @@ function looksUserCancelled(value: unknown) {
     text.includes("dismiss") ||
     text.includes("abandon") ||
     text.includes("abort") ||
-    text.includes("closed by user")
+    text.includes("closed by user") ||
+    text.includes("closed") ||
+    text.includes("decline") ||
+    text.includes("revers") ||
+    text.includes("user")
   );
 }
 
@@ -97,6 +101,7 @@ export async function POST(request: NextRequest) {
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
+    console.log("WAAFI RAW RESPONSE:", providerResponse);
     const providerStatus = classifyWaafiPaymentStatus(providerResponse);
 
     console.info("payment_request_sent", {
