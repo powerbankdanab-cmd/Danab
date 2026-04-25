@@ -60,6 +60,22 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type TimestampLike = number | Date | { toMillis?: () => number } | { seconds?: number } | null | undefined;
+
+function toMillis(value: TimestampLike): number | null {
+  if (typeof value === "number") return value;
+  if (value instanceof Date) return value.getTime();
+  if (value && typeof value === "object") {
+    if (typeof value.toMillis === "function") {
+      return value.toMillis();
+    }
+    if (typeof value.seconds === "number") {
+      return value.seconds * 1000;
+    }
+  }
+  return null;
+}
+
 async function getBatterySnapshot(
   imei: string,
   batteryId: string,
@@ -1040,246 +1056,247 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
   }
 }
 
-  /**
-   * Cancels a hold safely.
-   * IDEMPOTENT: returns success if already failed.
-   */
+/**
+ * Cancels a hold safely.
+ * IDEMPOTENT: returns success if already failed.
+ */
 export async function cancelHold(idempotencyKey: string, reason: string): Promise<any> {
-    const tx = await getPaymentTransaction(idempotencyKey);
+  const tx = await getPaymentTransaction(idempotencyKey);
 
-    if (tx?.status === "failed") {
-      return { status: "failed", success: true };
-    }
-
-    if (!tx || (tx.status !== "held" && tx.status !== "confirm_required")) {
-      throw new HttpError(400, "Transaction in invalid state for cancellation");
-    }
-
-    if (tx.providerRef) {
-      await cancelWaafiPreauthorization({
-        transactionId: tx.providerRef,
-        description: reason,
-      });
-    }
-
-    await markTransactionFailed(idempotencyKey, reason);
+  if (tx?.status === "failed") {
     return { status: "failed", success: true };
   }
 
-  /**
-   * Handles user confirmation (YES/NO) from the frontend for MEDIUM confidence cases.
-   */
-export async function handleUserConfirmation(
-    idempotencyKey: string,
-    confirmed: boolean,
-  ): Promise<any> {
-    const tx = await getPaymentTransaction(idempotencyKey);
+  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required")) {
+    throw new HttpError(400, "Transaction in invalid state for cancellation");
+  }
 
-    // 1. Idempotency Check
-    if (tx?.status === "captured" || tx?.status === "failed") {
-      return { status: tx.status };
-    }
-
-    // 2. Timeout Check (60 seconds)
-    if (tx?.status === "confirm_required" && tx.updatedAt) {
-      const elapsedSeconds = (Date.now() - tx.updatedAt) / 1000;
-      if (elapsedSeconds > 60) {
-        await logError({
-          type: CRITICAL_ERROR_TYPES.VERIFICATION_TIMEOUT,
-          transactionId: idempotencyKey,
-          message: "Confirmation timeout - auto-cancelling hold",
-        });
-        return cancelHold(idempotencyKey, "Confirmation timed out (60s)");
-      }
-    }
-
-    // 3. State Check
-    if (!tx || tx.status !== "confirm_required") {
-      throw new HttpError(400, `Confirmation not allowed for status: ${tx?.status || "unknown"}`);
-    }
-
-    await logError({
-      type: "USER_CONFIRMATION",
-      transactionId: idempotencyKey,
-      stationCode: tx.station,
-      message: `User confirmed delivery: ${confirmed}`,
-      metadata: { confirmed }
+  if (tx.providerRef) {
+    await cancelWaafiPreauthorization({
+      transactionId: tx.providerRef,
+      description: reason,
     });
+  }
 
-    // 4. Set state to resolving (transactional)
+  await markTransactionFailed(idempotencyKey, reason);
+  return { status: "failed", success: true };
+}
+
+/**
+ * Handles user confirmation (YES/NO) from the frontend for MEDIUM confidence cases.
+ */
+export async function handleUserConfirmation(
+  idempotencyKey: string,
+  confirmed: boolean,
+): Promise<any> {
+  const tx = await getPaymentTransaction(idempotencyKey);
+
+  // 1. Idempotency Check
+  if (tx?.status === "captured" || tx?.status === "failed") {
+    return { status: tx.status };
+  }
+
+  // 2. Timeout Check (60 seconds)
+  if (tx?.status === "confirm_required" && tx.updatedAt) {
+    const updatedAtMs = toMillis(tx.updatedAt) ?? Date.now();
+    const elapsedSeconds = (Date.now() - updatedAtMs) / 1000;
+    if (elapsedSeconds > 60) {
+      await logError({
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_TIMEOUT,
+        transactionId: idempotencyKey,
+        message: "Confirmation timeout - auto-cancelling hold",
+      });
+      return cancelHold(idempotencyKey, "Confirmation timed out (60s)");
+    }
+  }
+
+  // 3. State Check
+  if (!tx || tx.status !== "confirm_required") {
+    throw new HttpError(400, `Confirmation not allowed for status: ${tx?.status || "unknown"}`);
+  }
+
+  await logError({
+    type: "USER_CONFIRMATION",
+    transactionId: idempotencyKey,
+    stationCode: tx.station,
+    message: `User confirmed delivery: ${confirmed}`,
+    metadata: { confirmed }
+  });
+
+  // 4. Set state to resolving (transactional)
+  await transitionPaymentTransactionState({
+    id: idempotencyKey,
+    from: "confirm_required",
+    to: "resolving",
+  });
+
+  try {
+    if (confirmed) {
+      return await finalizeCapture(idempotencyKey);
+    } else {
+      return await cancelHold(idempotencyKey, "User reported battery did not come out");
+    }
+  } catch (error) {
+    // If provider call fails, transition back to confirm_required to allow retry
     await transitionPaymentTransactionState({
       id: idempotencyKey,
-      from: "confirm_required",
-      to: "resolving",
+      from: "resolving",
+      to: "confirm_required",
+    }).catch(() => undefined); // Don't throw on cleanup
+    throw error;
+  }
+}
+
+/**
+ * Shared hardware ejection and verification logic.
+ */
+async function performEjectionAndVerification(input: {
+  idempotencyKey: string;
+  transactionId: string;
+  stationCode: string;
+  phoneNumber: string;
+  imei: string;
+  battery: { battery_id: string; slot_id: string };
+  preauthAudit: Record<string, unknown>;
+  phoneAuthority: string;
+  canonicalPhoneNumber: string;
+}) {
+  const {
+    idempotencyKey,
+    transactionId,
+    stationCode,
+    phoneNumber,
+    imei,
+    battery,
+    preauthAudit,
+    phoneAuthority,
+    canonicalPhoneNumber
+  } = input;
+
+  await ensurePaymentTransactionState(idempotencyKey, "held");
+
+  let unlockAttempts = 0;
+  let lastUnlockError: unknown = null;
+  const currentBattery = battery;
+  let confidence: DeliveryConfidence = "LOW";
+  let verification: VerificationResult | null = null;
+
+  const preUnlockSnapshot = await getBatterySnapshot(imei, currentBattery.battery_id, currentBattery.slot_id);
+
+  if (preUnlockSnapshot.presence !== "present") {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+      transactionId: idempotencyKey,
+      providerRef: transactionId,
+      stationCode,
+      message: "Battery not present in slot before unlock — hold will be cancelled",
     });
 
     try {
-      if (confirmed) {
-        return await finalizeCapture(idempotencyKey);
-      } else {
-        return await cancelHold(idempotencyKey, "User reported battery did not come out");
-      }
-    } catch (error) {
-      // If provider call fails, transition back to confirm_required to allow retry
-      await transitionPaymentTransactionState({
-        id: idempotencyKey,
-        from: "resolving",
-        to: "confirm_required",
-      }).catch(() => undefined); // Don't throw on cleanup
-      throw error;
+      await cancelWaafiPreauthorization({ transactionId, description: "Battery not in slot before unlock" });
+    } catch (cancelErr) {
+      console.error("Critical: Failed to cancel hold in failed verify", cancelErr);
     }
+
+    await markTransactionFailed(idempotencyKey, "Battery missing before unlock");
+    throw new HttpError(409, "Battery is no longer in slot. Please retry.");
   }
 
-  /**
-   * Shared hardware ejection and verification logic.
-   */
-async function performEjectionAndVerification(input: {
-    idempotencyKey: string;
-    transactionId: string;
-    stationCode: string;
-    phoneNumber: string;
-    imei: string;
-    battery: { battery_id: string; slot_id: string };
-    preauthAudit: Record<string, unknown>;
-    phoneAuthority: string;
-    canonicalPhoneNumber: string;
-  }) {
-    const {
-      idempotencyKey,
-      transactionId,
-      stationCode,
-      phoneNumber,
-      imei,
-      battery,
-      preauthAudit,
-      phoneAuthority,
-      canonicalPhoneNumber
-    } = input;
-
-    await ensurePaymentTransactionState(idempotencyKey, "held");
-
-    let unlockAttempts = 0;
-    let lastUnlockError: unknown = null;
-    const currentBattery = battery;
-    let confidence: DeliveryConfidence = "LOW";
-    let verification: VerificationResult | null = null;
-
-    const preUnlockSnapshot = await getBatterySnapshot(imei, currentBattery.battery_id, currentBattery.slot_id);
-
-    if (preUnlockSnapshot.presence !== "present") {
-      await logError({
-        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
-        transactionId: idempotencyKey,
-        providerRef: transactionId,
+  const processStartTime = Date.now();
+  for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
+    unlockAttempts = attempt;
+    try {
+      await releaseBattery({ imei, batteryId: currentBattery.battery_id, slotId: currentBattery.slot_id });
+      verification = await verifyDeliveryWithConfidence(imei, currentBattery.battery_id, currentBattery.slot_id, {
         stationCode,
-        message: "Battery not present in slot before unlock — hold will be cancelled",
+        phoneNumber,
+        transactionId: idempotencyKey
       });
 
-      try {
-        await cancelWaafiPreauthorization({ transactionId, description: "Battery not in slot before unlock" });
-      } catch (cancelErr) {
-        console.error("Critical: Failed to cancel hold in failed verify", cancelErr);
-      }
+      confidence = verification.confidence;
+      if (confidence === "HIGH" || confidence === "MEDIUM") break;
 
-      await markTransactionFailed(idempotencyKey, "Battery missing before unlock");
-      throw new HttpError(409, "Battery is no longer in slot. Please retry.");
-    }
-
-    const processStartTime = Date.now();
-    for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
-      unlockAttempts = attempt;
-      try {
-        await releaseBattery({ imei, batteryId: currentBattery.battery_id, slotId: currentBattery.slot_id });
-        verification = await verifyDeliveryWithConfidence(imei, currentBattery.battery_id, currentBattery.slot_id, {
-          stationCode,
-          phoneNumber,
-          transactionId: idempotencyKey
-        });
-
-        confidence = verification.confidence;
-        if (confidence === "HIGH" || confidence === "MEDIUM") break;
-
-        await logError({
-          type: "RETRYING_UNLOCK",
-          transactionId: idempotencyKey,
-          message: `Unlock attempt ${attempt} failed (Confidence: ${confidence}).`,
-          metadata: { verification }
-        });
-      } catch (err) {
-        lastUnlockError = err;
-      }
-
-      if (Date.now() - processStartTime > 12000) break;
-    }
-
-    // Final Decision
-    if (confidence === "MEDIUM") {
-      await transitionPaymentTransactionState({
-        id: idempotencyKey,
-        from: "held",
-        to: "confirm_required",
-        patch: {
-          confirmRequiredAt: Date.now(),
-          delivery: {
-            imei,
-            stationCode,
-            batteryId: currentBattery.battery_id,
-            slotId: currentBattery.slot_id,
-            phoneAuthority,
-            unlockAttempts,
-            requestedPhoneNumber: phoneNumber,
-            canonicalPhoneNumber,
-          },
-          waafiAudit: preauthAudit,
-        },
+      await logError({
+        type: "RETRYING_UNLOCK",
+        transactionId: idempotencyKey,
+        message: `Unlock attempt ${attempt} failed (Confidence: ${confidence}).`,
+        metadata: { verification }
       });
-
-      return { status: "confirm_required", message: "Did the power bank come out?", transactionId: idempotencyKey };
+    } catch (err) {
+      lastUnlockError = err;
     }
 
-    if (confidence !== "HIGH") {
-      const failureNote = (lastUnlockError instanceof Error ? lastUnlockError.message : String(lastUnlockError || "")) || `Low confidence: ${confidence}`;
-      await cancelHold(transactionId, "Battery ejection not verified");
-      await markTransactionFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
-
-      throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
-    }
-
-    return finalizeCapture(idempotencyKey);
+    if (Date.now() - processStartTime > 12000) break;
   }
 
-  /**
-   * Resumes hardware ejection for a transaction that was in 'pending_payment'
-   * once it is verified as PAID.
-   */
-export async function resumePendingPayment(transaction: PaymentTransactionRecord) {
-    const { id: idempotencyKey, phone: phoneNumber, station: stationCode, delivery, waafiAudit } = transaction;
-
-    if (!delivery || !waafiAudit) {
-      throw new Error("Cannot resume pending payment: missing delivery/audit metadata");
-    }
-
-    const { imei, batteryId, slotId } = delivery;
-
-    // Transition from pending_payment -> held to start hardware flow
+  // Final Decision
+  if (confidence === "MEDIUM") {
     await transitionPaymentTransactionState({
       id: idempotencyKey,
-      from: "pending_payment",
-      to: "held",
+      from: "held",
+      to: "confirm_required",
       patch: {
-        verifiedPaidAt: Date.now(),
-      }
+        confirmRequiredAt: Date.now(),
+        delivery: {
+          imei,
+          stationCode,
+          batteryId: currentBattery.battery_id,
+          slotId: currentBattery.slot_id,
+          phoneAuthority,
+          unlockAttempts,
+          requestedPhoneNumber: phoneNumber,
+          canonicalPhoneNumber,
+        },
+        waafiAudit: preauthAudit,
+      },
     });
 
-    return performEjectionAndVerification({
-      idempotencyKey,
-      transactionId: transaction.providerRef!,
-      stationCode,
-      phoneNumber,
-      imei,
-      battery: { battery_id: batteryId, slot_id: slotId },
-      preauthAudit: waafiAudit as Record<string, unknown>,
-      phoneAuthority: delivery.phoneAuthority || "async_confirmed",
-      canonicalPhoneNumber: phoneNumber,
-    });
+    return { status: "confirm_required", message: "Did the power bank come out?", transactionId: idempotencyKey };
   }
+
+  if (confidence !== "HIGH") {
+    const failureNote = (lastUnlockError instanceof Error ? lastUnlockError.message : String(lastUnlockError || "")) || `Low confidence: ${confidence}`;
+    await cancelHold(transactionId, "Battery ejection not verified");
+    await markTransactionFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
+
+    throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
+  }
+
+  return finalizeCapture(idempotencyKey);
+}
+
+/**
+ * Resumes hardware ejection for a transaction that was in 'pending_payment'
+ * once it is verified as PAID.
+ */
+export async function resumePendingPayment(transaction: PaymentTransactionRecord) {
+  const { id: idempotencyKey, phone: phoneNumber, station: stationCode, delivery, waafiAudit } = transaction;
+
+  if (!delivery || !waafiAudit) {
+    throw new Error("Cannot resume pending payment: missing delivery/audit metadata");
+  }
+
+  const { imei, batteryId, slotId } = delivery;
+
+  // Transition from pending_payment -> held to start hardware flow
+  await transitionPaymentTransactionState({
+    id: idempotencyKey,
+    from: "pending_payment",
+    to: "held",
+    patch: {
+      verifiedPaidAt: Date.now(),
+    }
+  });
+
+  return performEjectionAndVerification({
+    idempotencyKey,
+    transactionId: transaction.providerRef!,
+    stationCode,
+    phoneNumber,
+    imei,
+    battery: { battery_id: batteryId, slot_id: slotId },
+    preauthAudit: waafiAudit as Record<string, unknown>,
+    phoneAuthority: delivery.phoneAuthority || "async_confirmed",
+    canonicalPhoneNumber: phoneNumber,
+  });
+}
