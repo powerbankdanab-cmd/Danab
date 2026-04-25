@@ -11,8 +11,9 @@ export type MinimalTransactionRecord = {
   status: "pending_payment";
   providerRef?: string | null;
   failureReason?: string | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
+  unlockStarted?: boolean;
+  createdAt: Date | Timestamp | number;
+  updatedAt: Date | Timestamp | number;
 };
 
 export type PaymentTransactionStatus =
@@ -21,6 +22,7 @@ export type PaymentTransactionStatus =
   | "pending_payment"
   | "paid"
   | "processing"
+  | "verifying"
   | "verified"
   | "captured"
   | "failed"
@@ -46,8 +48,10 @@ export type PaymentTransactionRecord = {
   station: string;
   amount: number;
   providerRef: string | null;
-  createdAt: number;
-  updatedAt: number;
+  unlockStarted?: boolean;
+  processingStartedAt?: Date | Timestamp | number;
+  createdAt: Date | Timestamp | number;
+  updatedAt: Date | Timestamp | number;
   heldAt?: number;
   verifiedAt?: number;
   capturedAt?: number;
@@ -76,11 +80,12 @@ export async function createMinimalTransaction(input: {
   phone: string;
   amount: number;
 }) {
-  const now = Timestamp.now();
+  const now = new Date();
   const record: MinimalTransactionRecord = {
     phone: input.phone,
     amount: input.amount,
     status: "pending_payment",
+    unlockStarted: false,
     createdAt: now,
     updatedAt: now,
   };
@@ -120,6 +125,7 @@ export async function createOrGetPaymentTransaction(input: {
       station: input.station,
       amount: input.amount,
       providerRef: null,
+      unlockStarted: false,
       rentalCreated: false,
       createdAt: now,
       updatedAt: now,

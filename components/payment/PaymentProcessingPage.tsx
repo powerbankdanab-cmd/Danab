@@ -23,8 +23,21 @@ import {
 } from "@/components/payment/types";
 
 type ApiResponse = {
-  status?: "pending_payment" | "paid" | "processing" | "confirm_required" | "payment_confirmed" | "failed";
-  reason_code?: "USER_CANCELLED" | "INSUFFICIENT_BALANCE" | "WRONG_PIN" | "TIMEOUT" | "PROVIDER_ERROR";
+  status?:
+  | "pending_payment"
+  | "paid"
+  | "processing"
+  | "verifying"
+  | "verified"
+  | "confirm_required"
+  | "failed";
+  reason_code?:
+  | "USER_CANCELLED"
+  | "INSUFFICIENT_BALANCE"
+  | "WRONG_PIN"
+  | "TIMEOUT"
+  | "PROVIDER_ERROR"
+  | "UNLOCK_TIMEOUT";
   failureReason?: string;
   providerRef?: string | null;
   message?: string;
@@ -33,6 +46,7 @@ type ApiResponse = {
   battery_id?: string;
   slot_id?: string;
   waafiMessage?: string;
+  unlockStarted?: boolean;
 };
 
 type PaymentStep = {
@@ -154,6 +168,10 @@ export function PaymentProcessingPage() {
       return "Waqtiga lacag bixintu wuu dhammaaday. Payment request timed out.";
     }
 
+    if (reason === "UNLOCK_TIMEOUT") {
+      return "Soo deynta qalabka ayaa qaadatay wakhti ka badan inta la oggolaaday. Unlock timed out.";
+    }
+
     if (reason === "PROVIDER_ERROR") {
       return "Waxaa dhacay cilad adeeg bixiyaha. There was an issue with the payment provider.";
     }
@@ -184,6 +202,10 @@ export function PaymentProcessingPage() {
       return "Xaqiijinta lacagta way daahday";
     }
 
+    if (reason === "UNLOCK_TIMEOUT") {
+      return "Soo deynta qalabka ayaa qaadatay wakhti xad dhaaf ah";
+    }
+
     if (reason === "PROVIDER_ERROR") {
       return "Cilad adeeg bixiyaha";
     }
@@ -197,6 +219,106 @@ export function PaymentProcessingPage() {
       pollingIntervalRef.current = null;
     }
     pollingRequestInFlightRef.current = false;
+  };
+
+  const transactionStorageKey = useMemo(
+    () => (idempotencyKey ? `paymentTransactionId:${idempotencyKey}` : null),
+    [idempotencyKey],
+  );
+
+  const [hasLoadedStoredTransactionId, setHasLoadedStoredTransactionId] = useState(false);
+
+  useEffect(() => {
+    if (!transactionStorageKey || transactionId) {
+      setHasLoadedStoredTransactionId(true);
+      return;
+    }
+
+    try {
+      const savedId = window.localStorage.getItem(transactionStorageKey);
+      if (savedId) {
+        setTransactionId(savedId);
+      }
+    } catch {
+      // Ignore storage failures
+    } finally {
+      setHasLoadedStoredTransactionId(true);
+    }
+  }, [transactionStorageKey, transactionId]);
+
+  useEffect(() => {
+    if (!transactionStorageKey) {
+      return;
+    }
+
+    try {
+      if (transactionId) {
+        window.localStorage.setItem(transactionStorageKey, transactionId);
+      } else {
+        window.localStorage.removeItem(transactionStorageKey);
+      }
+    } catch {
+      // Ignore storage failures
+    }
+  }, [transactionStorageKey, transactionId]);
+
+  const executeUnlock = async () => {
+    if (!transactionId) {
+      return false;
+    }
+
+    try {
+      const response = await fetch("/api/payment/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transactionId }),
+      });
+
+      const data: ApiResponse = await response.json();
+      console.info("PAYMENT_EXECUTE_RESPONSE", { transactionId, status: data.status, unlockStarted: data.unlockStarted });
+
+      if (!response.ok || data.status === "failed") {
+        if (data.status === "failed") {
+          const reason = normalizeFailureReason(data);
+          setFailureReason(reason);
+          setErrorMessage(getFriendlyFailureMessage(reason));
+          setStatus("FAILED");
+          updateStepStatus("confirmed", "failed");
+        }
+        return false;
+      }
+
+      if (data.status === "processing") {
+        updateStepStatus("pending", "completed");
+        updateStepStatus("confirmed", "completed");
+        updateStepStatus("unlocking", "active");
+        setStatus("PROCESSING");
+        return true;
+      }
+
+      if (data.status === "verifying") {
+        updateStepStatus("pending", "completed");
+        updateStepStatus("confirmed", "completed");
+        updateStepStatus("unlocking", "completed");
+        updateStepStatus("verifying", "active");
+        setStatus("PROCESSING");
+        return true;
+      }
+
+      if (data.status === "verified") {
+        updateStepStatus("confirmed", "completed");
+        updateStepStatus("unlocking", "completed");
+        updateStepStatus("verifying", "completed");
+        updateStepStatus("success", "completed");
+        setStatus("SUCCESS");
+        return true;
+      }
+
+      return true;
+    } catch (error) {
+      console.warn("PAYMENT_EXECUTE_REQUEST_FAILED", { transactionId, error });
+      return false;
+    }
   };
 
   useEffect(() => {
@@ -240,6 +362,10 @@ export function PaymentProcessingPage() {
       setStatus("FAILED");
       setFailureReason("PROVIDER_ERROR");
       setErrorMessage("Macluumaad sax ah lama helin. Fadlan mar kale isku day.");
+      return;
+    }
+
+    if (transactionId || !hasLoadedStoredTransactionId) {
       return;
     }
 
@@ -309,10 +435,10 @@ export function PaymentProcessingPage() {
         stopPolling();
       }
     };
-  }, [amount, idempotencyKey, phoneNumber, stationCode]);
+  }, [amount, idempotencyKey, phoneNumber, stationCode, transactionId, hasLoadedStoredTransactionId]);
 
   useEffect(() => {
-    if ((status !== "PENDING_PAYMENT" && status !== "WAITING_PIN") || !transactionId) {
+    if (!transactionId || status === "SUCCESS" || status === "FAILED") {
       return;
     }
 
@@ -351,16 +477,44 @@ export function PaymentProcessingPage() {
         console.log("REASON CODE:", data.reason_code);
         console.log("FAILURE REASON:", data.failureReason);
 
-        if (data.status === "paid" || data.status === "payment_confirmed") {
+        if (data.status === "paid") {
+          updateStepStatus("pending", "completed");
           updateStepStatus("confirmed", "completed");
-          if (data.battery_id && data.slot_id) {
-            updateStepStatus("unlocking", "completed");
-            updateStepStatus("verifying", "completed");
-            updateStepStatus("success", "completed");
-            setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
+          updateStepStatus("unlocking", "active");
+          setStatus("PROCESSING");
+          const executed = await executeUnlock();
+          if (!executed) {
+            console.info("PAYMENT_EXECUTE_RETRY_SCHEDULED", { transactionId });
           }
+          return;
+        }
+
+        if (data.status === "processing") {
+          updateStepStatus("pending", "completed");
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "active");
+          setStatus("PROCESSING");
+          return;
+        }
+
+        if (data.status === "verifying") {
+          updateStepStatus("pending", "completed");
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "completed");
+          updateStepStatus("verifying", "active");
+          setStatus("PROCESSING");
+          return;
+        }
+
+        if (data.status === "verified") {
+          updateStepStatus("pending", "completed");
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "completed");
+          updateStepStatus("verifying", "completed");
+          updateStepStatus("success", "completed");
+          setBatteryInfo({ batteryId: data.battery_id || "", slotId: data.slot_id || "" });
           setIsSlowPolling(false);
-          console.info("PAYMENT_CONFIRMED", { transactionId });
+          console.info("PAYMENT_VERIFIED", { transactionId });
           setStatus("SUCCESS");
           stopPolling();
           return;
@@ -380,12 +534,6 @@ export function PaymentProcessingPage() {
           setStatus("FAILED");
           stopPolling();
           return;
-        }
-
-        if (data.status === "processing") {
-          updateStepStatus("pending", "completed");
-          updateStepStatus("confirmed", "active");
-          setStatus("PROCESSING");
         }
 
         // Continue polling for other states (pending_payment, etc.)

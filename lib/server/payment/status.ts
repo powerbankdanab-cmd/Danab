@@ -2,19 +2,38 @@ import { HttpError } from "@/lib/server/payment/errors";
 import {
   completePhase2Transaction,
   getPaymentTransaction,
-  PaymentTransactionRecord,
+  patchPaymentTransaction,
   transitionPaymentTransactionState,
+  PAYMENT_TRANSACTIONS_COLLECTION,
+  PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed } from "@/lib/server/payment/waafi";
+import { getDb } from "@/lib/server/firebase-admin";
+import { Timestamp } from "firebase-admin/firestore";
 import { releaseBattery } from "@/lib/server/payment/heycharge";
-import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
 
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
+const PROCESSING_TIMEOUT_MS = 30_000;
 
 export type PaymentStatusResponse = {
-  status: "pending_payment" | "paid" | "processing" | "verified" | "failed";
-  reason_code?: "USER_CANCELLED" | "TIMEOUT" | "PROVIDER_ERROR";
-  failureReason?: "USER_CANCELLED" | "TIMEOUT" | "PROVIDER_ERROR";
+  status:
+  | "pending_payment"
+  | "paid"
+  | "processing"
+  | "verifying"
+  | "verified"
+  | "failed";
+  reason_code?:
+  | "USER_CANCELLED"
+  | "TIMEOUT"
+  | "PROVIDER_ERROR"
+  | "UNLOCK_TIMEOUT";
+  failureReason?:
+  | "USER_CANCELLED"
+  | "TIMEOUT"
+  | "PROVIDER_ERROR"
+  | "UNLOCK_TIMEOUT";
+  unlockStarted?: boolean;
 };
 
 function toReasonCode(
@@ -28,6 +47,10 @@ function toReasonCode(
     return "TIMEOUT";
   }
 
+  if (failureReason === "UNLOCK_TIMEOUT") {
+    return "UNLOCK_TIMEOUT";
+  }
+
   if (failureReason) {
     return "PROVIDER_ERROR";
   }
@@ -36,17 +59,26 @@ function toReasonCode(
 }
 
 function toMillis(value: unknown): number | null {
-  if (typeof value === "number") {
-    return value;
-  }
+  if (!value) return null;
+
+  if (typeof value === "number") return value;
+
+  if (value instanceof Date) return value.getTime();
 
   if (
-    value &&
     typeof value === "object" &&
-    "toMillis" in value &&
+    value !== null &&
     typeof (value as { toMillis?: unknown }).toMillis === "function"
   ) {
     return (value as { toMillis: () => number }).toMillis();
+  }
+
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { seconds?: unknown }).seconds === "number"
+  ) {
+    return (value as { seconds: number }).seconds * 1000;
   }
 
   return null;
@@ -67,6 +99,10 @@ function buildStatusResponse(
     return { status: "processing" };
   }
 
+  if (transaction.status === "verifying") {
+    return { status: "verifying" };
+  }
+
   if (transaction.status === "verified") {
     return { status: "verified" };
   }
@@ -78,11 +114,11 @@ function buildStatusResponse(
   return { status: "pending_payment" };
 }
 
-async function handlePaidTransaction(
+export async function runUnlockIfNeeded(
   transaction: PaymentTransactionRecord,
-): Promise<PaymentStatusResponse> {
-  if (transaction.status !== "paid") {
-    return buildStatusResponse(transaction);
+): Promise<void> {
+  if (transaction.status !== "paid" || transaction.unlockStarted) {
+    return;
   }
 
   if (!transaction.delivery) {
@@ -90,34 +126,43 @@ async function handlePaidTransaction(
       transactionId: transaction.id,
       reason: "missing_delivery_payload",
     });
-
-    return { status: "paid" };
+    return;
   }
 
-  const currentTransaction = await getPaymentTransaction(transaction.id);
-  if (!currentTransaction) {
-    throw new HttpError(404, "Transaction not found");
-  }
+  const db = getDb();
+  const docRef = db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .doc(transaction.id);
 
-  if (currentTransaction.status !== "paid") {
-    return buildStatusResponse(currentTransaction);
-  }
+  let shouldUnlock = false;
 
-  try {
-    await transitionPaymentTransactionState({
-      id: transaction.id,
-      from: "paid",
-      to: "processing",
-    });
-  } catch {
-    const reloaded = await getPaymentTransaction(transaction.id);
-    if (!reloaded) {
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) {
       throw new HttpError(404, "Transaction not found");
     }
-    return buildStatusResponse(reloaded);
+
+    const fresh = snap.data() as PaymentTransactionRecord;
+    if (fresh.status !== "paid" || fresh.unlockStarted) {
+      return;
+    }
+
+    tx.update(docRef, {
+      unlockStarted: true,
+      status: "processing",
+      processingStartedAt: new Date(),
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+
+    shouldUnlock = true;
+  });
+
+  if (!shouldUnlock) {
+    return;
   }
 
-  console.info("payment_processing", { transactionId: transaction.id });
+  console.info("unlock_started", { transactionId: transaction.id });
 
   try {
     await releaseBattery({
@@ -126,70 +171,29 @@ async function handlePaidTransaction(
       slotId: transaction.delivery.slotId,
     });
 
-    const verification = await verifyDeliveryWithConfidence(
-      transaction.delivery.imei,
-      transaction.delivery.batteryId,
-      transaction.delivery.slotId,
-      {
-        stationCode: transaction.delivery.stationCode,
-        phoneNumber:
-          transaction.delivery.canonicalPhoneNumber || transaction.phone,
-        transactionId: transaction.id,
+    await patchPaymentTransaction({
+      id: transaction.id,
+      patch: {
+        status: "verifying",
+        updatedAt: Date.now(),
+        updatedAtTs: Timestamp.now(),
       },
-    );
-
-    if (verification.confidence === "HIGH") {
-      await transitionPaymentTransactionState({
-        id: transaction.id,
-        from: "processing",
-        to: "verified",
-        patch: { verifiedAt: Date.now() },
-      });
-
-      console.info("payment_verified", {
-        transactionId: transaction.id,
-        confidence: verification.confidence,
-      });
-
-      return { status: "verified" };
-    }
-
-    await transitionPaymentTransactionState({
-      id: transaction.id,
-      from: "processing",
-      to: "failed",
-      patch: { failureReason: "PROVIDER_ERROR" },
     });
-
-    console.info("payment_failed", {
-      transactionId: transaction.id,
-      failureReason: "PROVIDER_ERROR",
-      confidence: verification.confidence,
-    });
-
-    return {
-      status: "failed",
-      reason_code: "PROVIDER_ERROR",
-      failureReason: "PROVIDER_ERROR",
-    };
   } catch (error) {
-    await transitionPaymentTransactionState({
-      id: transaction.id,
-      from: "processing",
-      to: "failed",
-      patch: { failureReason: "PROVIDER_ERROR" },
-    });
-
     console.error("payment_unlock_error", {
       transactionId: transaction.id,
       error: error instanceof Error ? error.message : String(error),
     });
 
-    return {
-      status: "failed",
-      reason_code: "PROVIDER_ERROR",
-      failureReason: "PROVIDER_ERROR",
-    };
+    await patchPaymentTransaction({
+      id: transaction.id,
+      patch: {
+        status: "failed",
+        failureReason: "PROVIDER_ERROR",
+        updatedAt: Date.now(),
+        updatedAtTs: Timestamp.now(),
+      },
+    });
   }
 }
 
@@ -203,10 +207,54 @@ export async function getProviderDrivenPaymentStatus(
   }
 
   if (transaction.status === "paid") {
-    return handlePaidTransaction(transaction);
+    if (!transaction.unlockStarted) {
+      console.info("unlock_fallback_triggered", {
+        transactionId,
+      });
+
+      runUnlockIfNeeded(transaction).catch((err) => {
+        console.error("unlock_fallback_failed", {
+          transactionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
+    return buildStatusResponse(transaction);
   }
 
   if (transaction.status === "processing") {
+    const processingStartedAtMs = toMillis(transaction.processingStartedAt);
+    if (
+      processingStartedAtMs !== null &&
+      Date.now() - processingStartedAtMs > PROCESSING_TIMEOUT_MS
+    ) {
+      await transitionPaymentTransactionState({
+        id: transactionId,
+        from: "processing",
+        to: "failed",
+        patch: {
+          failureReason: "UNLOCK_TIMEOUT",
+        },
+      });
+
+      console.info("unlock_timeout", { transactionId });
+      console.info("payment_failed", {
+        transactionId,
+        failureReason: "UNLOCK_TIMEOUT",
+      });
+
+      return {
+        status: "failed",
+        reason_code: "UNLOCK_TIMEOUT",
+        failureReason: "UNLOCK_TIMEOUT",
+      };
+    }
+
+    return buildStatusResponse(transaction);
+  }
+
+  if (transaction.status === "verifying") {
     return buildStatusResponse(transaction);
   }
 
@@ -219,23 +267,37 @@ export async function getProviderDrivenPaymentStatus(
   }
 
   const createdAtMs = toMillis(transaction.createdAt);
-  if (
-    transaction.status === "pending_payment" &&
-    createdAtMs !== null &&
-    Date.now() - createdAtMs > PAYMENT_PENDING_TIMEOUT_MS
-  ) {
-    const status = await completePhase2Transaction({
-      id: transactionId,
-      status: "failed",
-      failureReason: "TIMEOUT",
-    });
-
-    console.info("payment_failed", {
+  if (!createdAtMs) {
+    console.error("MISSING createdAt - cannot evaluate timeout", {
       transactionId,
-      failureReason: "TIMEOUT",
+      createdAt: transaction.createdAt,
+    });
+  } else {
+    const elapsedMs = Date.now() - createdAtMs;
+    console.log("TIME CHECK:", {
+      transactionId,
+      createdAtMs,
+      now: Date.now(),
+      elapsedMs,
     });
 
-    return { status, reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+    if (
+      transaction.status === "pending_payment" &&
+      elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS
+    ) {
+      const status = await completePhase2Transaction({
+        id: transactionId,
+        status: "failed",
+        failureReason: "TIMEOUT",
+      });
+
+      console.info("payment_failed", {
+        transactionId,
+        failureReason: "TIMEOUT",
+      });
+
+      return { status, reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+    }
   }
 
   if (!transaction.providerRef) {
@@ -327,7 +389,7 @@ export async function getProviderDrivenPaymentStatus(
       throw new HttpError(404, "Transaction not found");
     }
 
-    return handlePaidTransaction(updatedTransaction);
+    return buildStatusResponse(updatedTransaction);
   }
 
   return { status: "pending_payment" };
