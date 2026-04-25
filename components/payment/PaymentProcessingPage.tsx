@@ -232,6 +232,9 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
         console.log("PAY RESPONSE:", data);
+        console.log("FULL RESPONSE OBJECT:", data);
+        console.log("REASON CODE:", data.reason_code);
+        console.log("FAILURE REASON:", data.failureReason);
 
         if (data.status === "failed" || !response.ok) {
           const reason = normalizeFailureReason(data);
@@ -310,6 +313,9 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
         console.log("STATUS RESPONSE:", data);
+        console.log("FULL RESPONSE OBJECT:", data);
+        console.log("REASON CODE:", data.reason_code);
+        console.log("FAILURE REASON:", data.failureReason);
 
         if (data.status === "paid" || data.status === "payment_confirmed") {
           updateStepStatus("confirmed", "completed");

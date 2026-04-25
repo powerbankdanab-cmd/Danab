@@ -16,6 +16,22 @@ type PaymentRequestBody = {
   amount?: number;
 };
 
+function failedPaymentResponse(
+  reason: "USER_CANCELLED" | "PROVIDER_ERROR",
+  error: string,
+  status: number,
+) {
+  return NextResponse.json(
+    {
+      status: "failed",
+      reason_code: reason,
+      failureReason: reason,
+      error,
+    },
+    { status },
+  );
+}
+
 function parseAndValidateBody(body: PaymentRequestBody) {
   const rawPhone =
     typeof body.phone === "string"
@@ -60,13 +76,17 @@ export async function POST(request: NextRequest) {
   try {
     body = (await request.json()) as PaymentRequestBody;
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return failedPaymentResponse("PROVIDER_ERROR", "Invalid JSON body", 400);
   }
 
   const parsed = parseAndValidateBody(body);
 
   if ("error" in parsed) {
-    return NextResponse.json({ error: parsed.error }, { status: 400 });
+    return failedPaymentResponse(
+      "PROVIDER_ERROR",
+      parsed.error || "Missing valid phone and amount",
+      400,
+    );
   }
 
   try {
@@ -117,7 +137,12 @@ export async function POST(request: NextRequest) {
             failureReason: "USER_CANCELLED",
             error: "Payment cancelled by user",
           }
-          : { error: "Payment provider did not return a transaction id" },
+          : {
+            status: "failed",
+            reason_code: "PROVIDER_ERROR",
+            failureReason: "PROVIDER_ERROR",
+            error: "Payment provider did not return a transaction id",
+          },
         { status: failureReason === "USER_CANCELLED" ? 409 : 502 },
       );
     }
@@ -151,7 +176,12 @@ export async function POST(request: NextRequest) {
           failureReason: "USER_CANCELLED",
           error: "Payment cancelled by user",
         }
-        : { error: "Failed to create transaction" },
+        : {
+          status: "failed",
+          reason_code: "PROVIDER_ERROR",
+          failureReason: "PROVIDER_ERROR",
+          error: "Failed to create transaction",
+        },
       { status: userCancelled ? 409 : 500 },
     );
   }
