@@ -150,14 +150,17 @@ export async function POST(request: NextRequest) {
       const responseCode = String(providerResponse.responseCode || "").trim();
       const responseState = String(providerResponse.params?.state || "").toUpperCase();
       const isApproved = responseCode === "2001" && responseState === "APPROVED";
-      const looksCancelled =
-        providerStatus === "cancelled" || looksLikeWaafiUserCancelled(providerResponse);
+      let failureReason: "USER_CANCELLED" | "PROVIDER_ERROR";
 
-      const failureReason: "USER_CANCELLED" | "PROVIDER_ERROR" =
-        !isApproved ? "USER_CANCELLED" : looksCancelled ? "USER_CANCELLED" : "PROVIDER_ERROR";
+      if (!isApproved) {
+        failureReason = "USER_CANCELLED";
+      } else {
+        failureReason = "PROVIDER_ERROR";
+      }
 
       console.log("NO PROVIDER REF CASE:", {
         response: providerResponse,
+        isApproved,
         classifiedAs: failureReason,
       });
 
@@ -186,7 +189,7 @@ export async function POST(request: NextRequest) {
             status: "failed",
             reason_code: "PROVIDER_ERROR",
             failureReason: "PROVIDER_ERROR",
-            error: "Payment provider did not return a transaction id",
+            error: "Payment provider error",
           },
         { status: failureReason === "USER_CANCELLED" ? 409 : 502 },
       );
