@@ -175,14 +175,30 @@ function getUnknownReconcileBackoffMs(retryCount: number) {
   return exp + jitter;
 }
 
+type TimestampLike = number | Date | { toMillis?: () => number } | { seconds?: number } | null | undefined;
+
+function toMillis(value: TimestampLike): number | null {
+  if (typeof value === "number") return value;
+  if (value instanceof Date) return value.getTime();
+  if (value && typeof value === "object") {
+    if (typeof (value as { toMillis?: unknown }).toMillis === "function") {
+      return (value as { toMillis: () => number }).toMillis();
+    }
+    if (typeof (value as { seconds?: unknown }).seconds === "number") {
+      return (value as { seconds: number }).seconds * 1000;
+    }
+  }
+  return null;
+}
+
 async function scheduleUnknownRetry(
   transaction: PaymentTransactionRecord,
   fence: RecoveryFence,
   reason: string,
 ) {
   const retryCount = (transaction.unknownRetryCount || 0) + 1;
-  const createdAt = transaction.createdAt || Date.now();
-  const ageMs = Date.now() - createdAt;
+  const createdAtMs = toMillis(transaction.createdAt) ?? Date.now();
+  const ageMs = Date.now() - createdAtMs;
   const needsManualReview =
     retryCount >= UNKNOWN_RECONCILE_MAX_ATTEMPTS ||
     ageMs >= UNKNOWN_RECONCILE_MANUAL_REVIEW_AGE_MS;
