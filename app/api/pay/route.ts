@@ -147,10 +147,19 @@ export async function POST(request: NextRequest) {
     });
 
     if (!providerIds.transactionId) {
-      const failureReason =
-        providerStatus === "cancelled" || looksLikeWaafiUserCancelled(providerResponse)
-          ? "USER_CANCELLED"
-          : "PROVIDER_REF_MISSING";
+      const responseCode = String(providerResponse.responseCode || "").trim();
+      const responseState = String(providerResponse.params?.state || "").toUpperCase();
+      const isApproved = responseCode === "2001" && responseState === "APPROVED";
+      const looksCancelled =
+        providerStatus === "cancelled" || looksLikeWaafiUserCancelled(providerResponse);
+
+      const failureReason: "USER_CANCELLED" | "PROVIDER_ERROR" =
+        !isApproved ? "USER_CANCELLED" : looksCancelled ? "USER_CANCELLED" : "PROVIDER_ERROR";
+
+      console.log("NO PROVIDER REF CASE:", {
+        response: providerResponse,
+        classifiedAs: failureReason,
+      });
 
       await patchPhase2Transaction({
         id: transaction.id,
