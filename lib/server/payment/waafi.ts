@@ -241,7 +241,7 @@ export function isWaafiCancelled(waafiResponse: WaafiResponse): boolean {
   return state === "CANCELLED" || state === "REVERSED" || state === "FAILED";
 }
 
-function classifyWaafiPaymentStatus(
+export function classifyWaafiPaymentStatus(
   statusResponse: WaafiResponse,
 ): "pending" | "paid" | "cancelled" | "failed" | "unknown" {
   if (isWaafiApproved(statusResponse)) {

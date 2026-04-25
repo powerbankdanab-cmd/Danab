@@ -5,6 +5,7 @@ import {
   patchPhase2Transaction,
 } from "@/lib/server/payment/transactions";
 import {
+  classifyWaafiPaymentStatus,
   extractWaafiIds,
   requestWaafiPreauthorization,
 } from "@/lib/server/payment/waafi";
@@ -42,6 +43,17 @@ function parseAndValidateBody(body: PaymentRequestBody) {
   } as const;
 }
 
+function looksUserCancelled(value: unknown) {
+  const text = String(value || "").toLowerCase();
+  return (
+    text.includes("cancel") ||
+    text.includes("dismiss") ||
+    text.includes("abandon") ||
+    text.includes("abort") ||
+    text.includes("closed by user")
+  );
+}
+
 export async function POST(request: NextRequest) {
   let body: PaymentRequestBody;
 
@@ -65,11 +77,13 @@ export async function POST(request: NextRequest) {
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
+    const providerStatus = classifyWaafiPaymentStatus(providerResponse);
 
     console.info("payment_request_sent", {
       phone: parsed.phone,
       transactionId: transaction.id,
       providerRef: providerIds.transactionId || null,
+      providerStatus,
       providerResponseCode:
         providerResponse.responseCode !== undefined
           ? String(providerResponse.responseCode)
@@ -79,22 +93,31 @@ export async function POST(request: NextRequest) {
     });
 
     if (!providerIds.transactionId) {
+      const failureReason =
+        providerStatus === "cancelled" ? "USER_CANCELLED" : "PROVIDER_REF_MISSING";
+
       await patchPhase2Transaction({
         id: transaction.id,
         patch: {
           status: "failed",
-          failureReason: "PROVIDER_REF_MISSING",
+          failureReason,
         },
       });
 
       console.info("payment_failed", {
         transactionId: transaction.id,
-        failureReason: "PROVIDER_REF_MISSING",
+        failureReason,
       });
 
       return NextResponse.json(
-        { error: "Payment provider did not return a transaction id" },
-        { status: 502 },
+        failureReason === "USER_CANCELLED"
+          ? {
+            status: "failed",
+            reason_code: "USER_CANCELLED",
+            error: "Payment cancelled by user",
+          }
+          : { error: "Payment provider did not return a transaction id" },
+        { status: failureReason === "USER_CANCELLED" ? 409 : 502 },
       );
     }
 
@@ -111,14 +134,23 @@ export async function POST(request: NextRequest) {
       status: transaction.record.status,
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const userCancelled = looksUserCancelled(message);
+
     console.info("provider_error", {
       stage: "payment_request_sent",
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
 
     return NextResponse.json(
-      { error: "Failed to create transaction" },
-      { status: 500 },
+      userCancelled
+        ? {
+          status: "failed",
+          reason_code: "USER_CANCELLED",
+          error: "Payment cancelled by user",
+        }
+        : { error: "Failed to create transaction" },
+      { status: userCancelled ? 409 : 500 },
     );
   }
 }

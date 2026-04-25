@@ -254,9 +254,10 @@ export function PaymentProcessingPage() {
         const data: ApiResponse = await response.json();
 
         if (!response.ok) {
+          const reason = data.reason_code || "PROVIDER_ERROR";
           setStatus("FAILED");
-          setFailureReason("PROVIDER_ERROR");
-          setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", data.error || "Bixinta lama bilaabin."));
+          setFailureReason(reason);
+          setErrorMessage(getFriendlyFailureMessage(reason, data.error || "Bixinta lama bilaabin."));
           updateStepStatus("init", "failed");
           return;
         }
