@@ -215,11 +215,12 @@ export function PaymentProcessingPage() {
     }
 
     if (status === "FAILED") {
-      updateStepStatus("pending", "failed");
-      updateStepStatus("confirmed", "pending");
-      updateStepStatus("unlocking", "pending");
-      updateStepStatus("verifying", "pending");
-      updateStepStatus("success", "pending");
+      setSteps((currentSteps) =>
+        currentSteps.map((step) => ({
+          ...step,
+          status: step.id === "pending" ? "failed" : "pending",
+        })),
+      );
     }
   }, [status]);
 
@@ -920,17 +921,6 @@ export function PaymentProcessingPage() {
                 </div>
               ))}
             </div>
-
-            {failureReason === "USER_CANCELLED" && (
-              <div className="rounded-xl bg-emerald-50 p-4 border border-emerald-100">
-                <p className="text-sm font-bold text-emerald-700">
-                  Waad joojisay bixinta. Lacag lagama jarin.
-                </p>
-                <p className="text-xs text-emerald-600 mt-1">
-                  Payment cancelled. No money charged.
-                </p>
-              </div>
-            )}
 
             <Link
               href="/"
