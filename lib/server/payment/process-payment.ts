@@ -60,7 +60,15 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type TimestampLike = number | Date | { toMillis?: () => number } | { seconds?: number } | null | undefined;
+type TimestampLike =
+  | number
+  | Date
+  | {
+    toMillis?: () => number;
+    seconds?: number;
+  }
+  | null
+  | undefined;
 
 function toMillis(value: TimestampLike): number | null {
   if (typeof value === "number") return value;
