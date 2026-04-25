@@ -216,6 +216,10 @@ export function PaymentProcessingPage() {
 
     if (status === "FAILED") {
       updateStepStatus("pending", "failed");
+      updateStepStatus("confirmed", "pending");
+      updateStepStatus("unlocking", "pending");
+      updateStepStatus("verifying", "pending");
+      updateStepStatus("success", "pending");
     }
   }, [status]);
 
