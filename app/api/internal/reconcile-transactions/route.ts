@@ -10,6 +10,17 @@ import {
 import { checkPaymentStatus } from "@/lib/server/payment/waafi";
 import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 
+type TimestampLike = number | Date | { seconds?: number } | null | undefined;
+
+function toMillis(value: TimestampLike): number | null {
+  if (typeof value === "number") return value;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "object" && value !== null && typeof value.seconds === "number") {
+    return value.seconds * 1000;
+  }
+  return null;
+}
+
 async function reconcile(request: NextRequest) {
   try {
     // 1. Security Check
@@ -54,11 +65,12 @@ async function reconcile(request: NextRequest) {
           await cancelHold(tx.id, "AUTO_CANCEL_TIMEOUT (Distributed reconciliation)");
           stats.cancelled++;
 
+          const updatedAtMs = toMillis(tx.updatedAt) ?? Date.now();
           await logError({
             type: "CONFIRM_TIMEOUT_AUTO_CANCEL",
             transactionId: tx.id,
             stationCode: tx.station,
-            message: `[RECON] Auto-cancelled stale confirmation (${Math.floor((Date.now() - tx.updatedAt) / 1000)}s old)`,
+            message: `[RECON] Auto-cancelled stale confirmation (${Math.floor((Date.now() - updatedAtMs) / 1000)}s old)`,
             metadata: { action: "AUTO_CANCEL_TIMEOUT", station: tx.station, slotId: tx.delivery?.slotId }
           });
         }
@@ -115,7 +127,7 @@ async function reconcile(request: NextRequest) {
           }
           else if (
             (paymentResult === "cancelled" || paymentResult === "failed") &&
-            (Date.now() - tx.createdAt) > 120_000
+            (Date.now() - (toMillis(tx.createdAt) ?? Date.now())) > 120_000
           ) { // 2 minutes
             await cancelHold(tx.id, "PAYMENT_TIMEOUT (Async payment not completed)");
             stats.cancelled++;
