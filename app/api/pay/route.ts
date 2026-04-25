@@ -74,6 +74,35 @@ function looksUserCancelled(value: unknown) {
   );
 }
 
+function looksLikeWaafiUserCancelled(response: unknown) {
+  const payload = response as {
+    params?: Record<string, unknown>;
+    responseMsg?: unknown;
+    message?: unknown;
+    errorCode?: unknown;
+    error?: unknown;
+  };
+
+  const state = String(payload.params?.state || "").toLowerCase();
+  const message = String(payload.responseMsg || payload.message || "").toLowerCase();
+  const error = String(payload.errorCode || payload.error || "").toLowerCase();
+
+  return (
+    state.includes("cancel") ||
+    state.includes("abort") ||
+    state.includes("decline") ||
+    message.includes("cancel") ||
+    message.includes("user") ||
+    message.includes("abort") ||
+    message.includes("dismiss") ||
+    message.includes("closed") ||
+    message.includes("decline") ||
+    error.includes("cancel") ||
+    error.includes("user") ||
+    error.includes("abort")
+  );
+}
+
 export async function POST(request: NextRequest) {
   let body: PaymentRequestBody;
 
@@ -101,7 +130,7 @@ export async function POST(request: NextRequest) {
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
-    console.log("WAAFI RAW RESPONSE:", providerResponse);
+    console.log("WAAFI PREAUTH RAW:", providerResponse);
     const providerStatus = classifyWaafiPaymentStatus(providerResponse);
 
     console.info("payment_request_sent", {
@@ -119,7 +148,9 @@ export async function POST(request: NextRequest) {
 
     if (!providerIds.transactionId) {
       const failureReason =
-        providerStatus === "cancelled" ? "USER_CANCELLED" : "PROVIDER_REF_MISSING";
+        providerStatus === "cancelled" || looksLikeWaafiUserCancelled(providerResponse)
+          ? "USER_CANCELLED"
+          : "PROVIDER_REF_MISSING";
 
       await patchPhase2Transaction({
         id: transaction.id,
@@ -166,12 +197,20 @@ export async function POST(request: NextRequest) {
       providerRef: providerIds.transactionId,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const userCancelled = looksUserCancelled(message);
+    const msg = String((error as { message?: unknown })?.message || "").toLowerCase();
+    const userCancelled =
+      msg.includes("cancel") ||
+      msg.includes("user") ||
+      msg.includes("abort") ||
+      msg.includes("dismiss") ||
+      msg.includes("closed") ||
+      msg.includes("decline");
+
+    console.log("WAAFI PREAUTH ERROR:", error);
 
     console.info("provider_error", {
       stage: "payment_request_sent",
-      error: message,
+      error: msg,
     });
 
     return NextResponse.json(
@@ -186,7 +225,7 @@ export async function POST(request: NextRequest) {
           status: "failed",
           reason_code: "PROVIDER_ERROR",
           failureReason: "PROVIDER_ERROR",
-          error: "Failed to create transaction",
+          error: "Payment provider error",
         },
       { status: userCancelled ? 409 : 500 },
     );
