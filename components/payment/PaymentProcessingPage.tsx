@@ -37,6 +37,7 @@ type ApiResponse = {
   | "WRONG_PIN"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
+  | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT";
   failureReason?: string;
   providerRef?: string | null;
@@ -150,6 +151,10 @@ export function PaymentProcessingPage() {
       return "PROVIDER_ERROR";
     }
 
+    if (rawReason === "UNLOCK_FAILED") {
+      return "UNLOCK_FAILED";
+    }
+
     if (rawReason === "WRONG_PIN") {
       return "WRONG_PIN";
     }
@@ -170,6 +175,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "UNLOCK_TIMEOUT") {
       return "Soo deynta qalabka ayaa qaadatay wakhti ka badan inta la oggolaaday. Unlock timed out.";
+    }
+
+    if (reason === "UNLOCK_FAILED") {
+      return "Lacagta waa la xaqiijiyay laakiin qalad ayaa ka dhacay bixinta power bank-ka. Payment was successful, but there was an issue releasing the power bank.";
     }
 
     if (reason === "PROVIDER_ERROR") {
@@ -204,6 +213,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "UNLOCK_TIMEOUT") {
       return "Soo deynta qalabka ayaa qaadatay wakhti xad dhaaf ah";
+    }
+
+    if (reason === "UNLOCK_FAILED") {
+      return "Lacagtii waa la xaqiijiyay, laakiin power bank-ga lama sii deyn karin";
     }
 
     if (reason === "PROVIDER_ERROR") {

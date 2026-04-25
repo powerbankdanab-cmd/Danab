@@ -27,11 +27,13 @@ export type PaymentStatusResponse = {
   | "USER_CANCELLED"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
+  | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT";
   failureReason?:
   | "USER_CANCELLED"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
+  | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT";
   unlockStarted?: boolean;
 };
@@ -49,6 +51,10 @@ function toReasonCode(
 
   if (failureReason === "UNLOCK_TIMEOUT") {
     return "UNLOCK_TIMEOUT";
+  }
+
+  if (failureReason === "UNLOCK_FAILED") {
+    return "UNLOCK_FAILED";
   }
 
   if (failureReason) {
@@ -180,7 +186,7 @@ export async function runUnlockIfNeeded(
       },
     });
   } catch (error) {
-    console.error("payment_unlock_error", {
+    console.error("unlock_failed", {
       transactionId: transaction.id,
       error: error instanceof Error ? error.message : String(error),
     });
@@ -189,7 +195,7 @@ export async function runUnlockIfNeeded(
       id: transaction.id,
       patch: {
         status: "failed",
-        failureReason: "PROVIDER_ERROR",
+        failureReason: "UNLOCK_FAILED",
         updatedAt: Date.now(),
         updatedAtTs: Timestamp.now(),
       },
@@ -238,7 +244,7 @@ export async function getProviderDrivenPaymentStatus(
         },
       });
 
-      console.info("unlock_timeout", { transactionId });
+      console.error("unlock_timeout", { transactionId });
       console.info("payment_failed", {
         transactionId,
         failureReason: "UNLOCK_TIMEOUT",
