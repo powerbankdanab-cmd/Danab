@@ -35,11 +35,14 @@ type ApiResponse = {
   | "USER_CANCELLED"
   | "INSUFFICIENT_FUNDS"
   | "INSUFFICIENT_BALANCE"
+  | "PROVIDER_DECLINED"
+  | "PROVIDER_ERROR"
   | "WRONG_PIN"
   | "TIMEOUT"
-  | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT"
+  | "VERIFICATION_FAILED"
+  | "SLA_BREACH"
   | "INVALID_INITIAL_STATE";
   failureReason?: string;
   providerRef?: string | null;
@@ -137,32 +140,12 @@ export function PaymentProcessingPage() {
       .trim()
       .toUpperCase();
 
-    if (rawReason === "USER_CANCELLED") {
-      return "USER_CANCELLED";
+    if (rawReason === "USER_CANCELLED" || rawReason === "INSUFFICIENT_FUNDS" || rawReason === "PROVIDER_DECLINED" || rawReason === "PROVIDER_ERROR" || rawReason === "TIMEOUT" || rawReason === "UNLOCK_FAILED" || rawReason === "UNLOCK_TIMEOUT" || rawReason === "VERIFICATION_FAILED" || rawReason === "SLA_BREACH" || rawReason === "INVALID_INITIAL_STATE" || rawReason === "WRONG_PIN") {
+      return rawReason as ApiResponse["reason_code"];
     }
 
-    if (rawReason === "TIMEOUT") {
-      return "TIMEOUT";
-    }
-
-    if (rawReason === "INSUFFICIENT_FUNDS" || rawReason === "INSUFFICIENT_BALANCE") {
+    if (rawReason === "INSUFFICIENT_BALANCE") {
       return "INSUFFICIENT_FUNDS";
-    }
-
-    if (rawReason === "PROVIDER_ERROR") {
-      return "PROVIDER_ERROR";
-    }
-
-    if (rawReason === "UNLOCK_FAILED") {
-      return "UNLOCK_FAILED";
-    }
-
-    if (rawReason === "INVALID_INITIAL_STATE") {
-      return "INVALID_INITIAL_STATE";
-    }
-
-    if (rawReason === "WRONG_PIN") {
-      return "WRONG_PIN";
     }
 
     return undefined;
@@ -179,6 +162,10 @@ export function PaymentProcessingPage() {
       return "Haraagaagu kuma filna. Fadlan lacag ku dar oo isku day mar kale.";
     }
 
+    if (reason === "PROVIDER_DECLINED" || reason === "WRONG_PIN") {
+      return "Lacag bixinta waa la diiday. Fadlan hubi PIN-kaaga ama in akoonkaagu xanniban yahay.";
+    }
+
     if (reason === "TIMEOUT") {
       return "Waqtiga lacag bixintu wuu dhammaaday. Payment request timed out.";
     }
@@ -189,6 +176,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "UNLOCK_FAILED") {
       return "Lacagta waa la xaqiijiyay laakiin qalad ayaa ka dhacay bixinta power bank-ka. Payment was successful, but there was an issue releasing the power bank.";
+    }
+    
+    if (reason === "VERIFICATION_FAILED") {
+      return "Waxaan xaqiijin kari waynay in qalabku soo baxay. Lacagta waa laguu soo celin doonaa.";
     }
 
     if (reason === "INVALID_INITIAL_STATE") {
@@ -201,6 +192,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "INSUFFICIENT_BALANCE") {
       return "Lacag kugu filan ma jirto. You do not have enough balance.";
+    }
+
+    if (reason === "SLA_BREACH") {
+      return "Lacag bixinta waxay qaadatay waqti dheer. Fadlan la xiriir taageerada macaamiisha.";
     }
 
     return "Wax khalad ah ayaa dhacay, fadlan mar kale isku day. Something went wrong, please try again.";
@@ -217,8 +212,8 @@ export function PaymentProcessingPage() {
       return "Haraaga kuma filna";
     }
 
-    if (reason === "WRONG_PIN") {
-      return "PIN-ka lama xaqiijin";
+    if (reason === "PROVIDER_DECLINED" || reason === "WRONG_PIN") {
+      return "Lacag bixinta waa la diiday";
     }
 
     if (reason === "TIMEOUT") {
@@ -233,12 +228,20 @@ export function PaymentProcessingPage() {
       return "Lacagtii waa la xaqiijiyay, laakiin power bank-ga lama sii deyn karin";
     }
 
+    if (reason === "VERIFICATION_FAILED") {
+      return "Xaqiijinta qalabka ayaa fashilantay";
+    }
+
     if (reason === "INVALID_INITIAL_STATE") {
       return "Slot state invalid before unlock";
     }
 
     if (reason === "PROVIDER_ERROR") {
       return "Cilad adeeg bixiyaha";
+    }
+
+    if (reason === "SLA_BREACH") {
+      return "Waqti dheer ayay qaadatay";
     }
 
     return "Lacag bixinta ma dhicin";

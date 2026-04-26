@@ -34,18 +34,24 @@ export type PaymentStatusResponse = {
   reason_code?:
   | "USER_CANCELLED"
   | "INSUFFICIENT_FUNDS"
-  | "TIMEOUT"
+  | "PROVIDER_DECLINED"
   | "PROVIDER_ERROR"
+  | "TIMEOUT"
   | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT"
+  | "VERIFICATION_FAILED"
+  | "SLA_BREACH"
   | "INVALID_INITIAL_STATE";
   failureReason?:
   | "USER_CANCELLED"
   | "INSUFFICIENT_FUNDS"
-  | "TIMEOUT"
+  | "PROVIDER_DECLINED"
   | "PROVIDER_ERROR"
+  | "TIMEOUT"
   | "UNLOCK_FAILED"
   | "UNLOCK_TIMEOUT"
+  | "VERIFICATION_FAILED"
+  | "SLA_BREACH"
   | "INVALID_INITIAL_STATE";
   unlockStarted?: boolean;
 };
@@ -53,35 +59,23 @@ export type PaymentStatusResponse = {
 function toReasonCode(
   failureReason: unknown,
 ): PaymentStatusResponse["reason_code"] {
-  if (failureReason === "USER_CANCELLED") {
-    return "USER_CANCELLED";
-  }
+  const code = String(failureReason).trim().toUpperCase();
 
-  if (failureReason === "INSUFFICIENT_FUNDS") {
-    return "INSUFFICIENT_FUNDS";
+  switch (code) {
+    case "USER_CANCELLED":
+    case "INSUFFICIENT_FUNDS":
+    case "PROVIDER_DECLINED":
+    case "PROVIDER_ERROR":
+    case "TIMEOUT":
+    case "UNLOCK_FAILED":
+    case "UNLOCK_TIMEOUT":
+    case "VERIFICATION_FAILED":
+    case "SLA_BREACH":
+    case "INVALID_INITIAL_STATE":
+      return code as PaymentStatusResponse["reason_code"];
+    default:
+      return undefined;
   }
-
-  if (failureReason === "TIMEOUT") {
-    return "TIMEOUT";
-  }
-
-  if (failureReason === "UNLOCK_TIMEOUT") {
-    return "UNLOCK_TIMEOUT";
-  }
-
-  if (failureReason === "UNLOCK_FAILED") {
-    return "UNLOCK_FAILED";
-  }
-
-  if (failureReason === "INVALID_INITIAL_STATE") {
-    return "INVALID_INITIAL_STATE";
-  }
-
-  if (failureReason) {
-    return "PROVIDER_ERROR";
-  }
-
-  return undefined;
 }
 
 async function getBatteryPresence(

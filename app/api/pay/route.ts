@@ -8,6 +8,7 @@ import {
   classifyWaafiPaymentStatus,
   extractWaafiIds,
   requestWaafiPreauthorization,
+  detectFailureReason,
 } from "@/lib/server/payment/waafi";
 
 type PaymentRequestBody = {
@@ -17,7 +18,11 @@ type PaymentRequestBody = {
 };
 
 function failedPaymentResponse(
-  reason: "USER_CANCELLED" | "PROVIDER_ERROR",
+  reason:
+    | "USER_CANCELLED"
+    | "INSUFFICIENT_FUNDS"
+    | "PROVIDER_DECLINED"
+    | "PROVIDER_ERROR",
   error: string,
   status: number,
 ) {
@@ -147,20 +152,10 @@ export async function POST(request: NextRequest) {
     });
 
     if (!providerIds.transactionId) {
-      const responseCode = String(providerResponse.responseCode || "").trim();
-      const responseState = String(providerResponse.params?.state || "").toUpperCase();
-      const isApproved = responseCode === "2001" && responseState === "APPROVED";
-      let failureReason: "USER_CANCELLED" | "PROVIDER_ERROR";
-
-      if (!isApproved) {
-        failureReason = "USER_CANCELLED";
-      } else {
-        failureReason = "PROVIDER_ERROR";
-      }
+      const failureReason = detectFailureReason(providerResponse);
 
       console.log("NO PROVIDER REF CASE:", {
         response: providerResponse,
-        isApproved,
         classifiedAs: failureReason,
       });
 
@@ -178,20 +173,27 @@ export async function POST(request: NextRequest) {
       });
 
       return NextResponse.json(
-        failureReason === "USER_CANCELLED"
-          ? {
-            status: "failed",
-            reason_code: "USER_CANCELLED",
-            failureReason: "USER_CANCELLED",
-            error: "Payment cancelled by user",
-          }
-          : {
-            status: "failed",
-            reason_code: "PROVIDER_ERROR",
-            failureReason: "PROVIDER_ERROR",
-            error: "Payment provider error",
-          },
-        { status: failureReason === "USER_CANCELLED" ? 409 : 502 },
+        {
+          status: "failed",
+          reason_code: failureReason,
+          failureReason,
+          error:
+            failureReason === "INSUFFICIENT_FUNDS"
+              ? "Insufficient balance"
+              : failureReason === "PROVIDER_DECLINED"
+              ? "Payment declined"
+              : failureReason === "USER_CANCELLED"
+              ? "Payment cancelled by user"
+              : "Payment provider error",
+        },
+        {
+          status:
+            failureReason === "INSUFFICIENT_FUNDS" ||
+            failureReason === "PROVIDER_DECLINED" ||
+            failureReason === "USER_CANCELLED"
+              ? 409
+              : 502,
+        }
       );
     }
 
@@ -209,37 +211,38 @@ export async function POST(request: NextRequest) {
       providerRef: providerIds.transactionId,
     });
   } catch (error) {
-    const msg = String((error as { message?: unknown })?.message || "").toLowerCase();
-    const userCancelled =
-      msg.includes("cancel") ||
-      msg.includes("user") ||
-      msg.includes("abort") ||
-      msg.includes("dismiss") ||
-      msg.includes("closed") ||
-      msg.includes("decline");
-
     console.log("WAAFI PREAUTH ERROR:", error);
+    
+    const failureReason = detectFailureReason(error);
 
     console.info("provider_error", {
       stage: "payment_request_sent",
-      error: msg,
+      error: String((error as { message?: unknown })?.message || error).toLowerCase(),
+      failureReason,
     });
 
     return NextResponse.json(
-      userCancelled
-        ? {
-          status: "failed",
-          reason_code: "USER_CANCELLED",
-          failureReason: "USER_CANCELLED",
-          error: "Payment cancelled by user",
-        }
-        : {
-          status: "failed",
-          reason_code: "PROVIDER_ERROR",
-          failureReason: "PROVIDER_ERROR",
-          error: "Payment provider error",
-        },
-      { status: userCancelled ? 409 : 500 },
+      {
+        status: "failed",
+        reason_code: failureReason,
+        failureReason,
+        error:
+          failureReason === "INSUFFICIENT_FUNDS"
+            ? "Insufficient balance"
+            : failureReason === "PROVIDER_DECLINED"
+            ? "Payment declined"
+            : failureReason === "USER_CANCELLED"
+            ? "Payment cancelled by user"
+            : "Payment provider error",
+      },
+      {
+        status:
+          failureReason === "INSUFFICIENT_FUNDS" ||
+          failureReason === "PROVIDER_DECLINED" ||
+          failureReason === "USER_CANCELLED"
+            ? 409
+            : 500,
+      }
     );
   }
 }

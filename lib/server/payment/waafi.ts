@@ -301,16 +301,21 @@ export function classifyWaafiPaymentStatus(
   return "unknown";
 }
 
-export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_ERROR" {
+export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_DECLINED" | "PROVIDER_ERROR" {
   const text =
     (raw?.responseMsg || "") +
     " " +
     (raw?.params?.state || "") +
     " " +
-    (raw?.errorCode || "");
+    (raw?.errorCode || "") +
+    " " +
+    (raw?.message || "") +
+    " " +
+    (typeof raw === "string" ? raw : "");
 
   const normalized = text.toLowerCase();
 
+  // 1. Financial constraints take precedence over generic cancel flags
   if (
     normalized.includes("insufficient") ||
     normalized.includes("balance") ||
@@ -321,6 +326,7 @@ export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_
     return "INSUFFICIENT_FUNDS";
   }
 
+  // 2. User intent
   if (
     normalized.includes("cancel") ||
     normalized.includes("dismiss") ||
@@ -331,6 +337,20 @@ export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_
     return "USER_CANCELLED";
   }
 
+  // 3. Provider active decline (invalid PIN, blocked, limits)
+  if (
+    normalized.includes("limit") ||
+    normalized.includes("exceed") ||
+    normalized.includes("blocked") ||
+    normalized.includes("invalid pin") ||
+    normalized.includes("wrong pin") ||
+    normalized.includes("incorrect pin") ||
+    normalized.includes("decline")
+  ) {
+    return "PROVIDER_DECLINED";
+  }
+
+  // 4. Default to generic provider error
   return "PROVIDER_ERROR";
 }
 
@@ -338,7 +358,7 @@ export type WaafiPaymentStatusCheck = {
   status: "pending" | "paid" | "cancelled" | "failed" | "unknown";
   raw?: WaafiResponse;
   error?: string;
-  reason?: "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_ERROR";
+  reason?: "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_DECLINED" | "PROVIDER_ERROR";
 };
 
 export async function checkPaymentStatusDetailed(
