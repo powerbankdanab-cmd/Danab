@@ -1,10 +1,25 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/server/firebase-admin";
 import { sendWhatsAppAlertWithResult } from "@/lib/server/alerts/whatsapp";
+import { getOptionalEnv } from "@/lib/server/env";
 
 export const maxDuration = 300;
 
-export async function POST() {
+function isAuthorized(request: NextRequest) {
+  const secret = getOptionalEnv("INTERNAL_CRON_TOKEN") || getOptionalEnv("RECONCILE_CRON_SECRET");
+  if (!secret) {
+    return true; // For local dev without secret
+  }
+
+  const authHeader = request.headers.get("authorization") || request.headers.get("Authorization") || "";
+  return authHeader === `Bearer ${secret}`;
+}
+
+export async function POST(request: NextRequest) {
+  if (!isAuthorized(request)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const db = getDb();
   const now = Date.now();
   
@@ -69,6 +84,6 @@ export async function POST() {
   }
 }
 
-export async function GET() {
-  return POST();
+export async function GET(request: NextRequest) {
+  return POST(request);
 }

@@ -12,6 +12,12 @@ export const CRITICAL_ERROR_TYPES = {
   DELIVERY_VERIFICATION: "DELIVERY_VERIFICATION",
   FALSE_EJECTION_PATTERN: "FALSE_EJECTION_PATTERN",
   VERIFICATION_TIMEOUT: "VERIFICATION_TIMEOUT",
+  // Phase 4: Financial safety alerts (Tier 1 — WhatsApp immediate)
+  CAPTURE_INCONSISTENCY: "CAPTURE_INCONSISTENCY_DETECTED",
+  CAPTURE_RETRY_EXHAUSTED: "CAPTURE_RETRY_EXHAUSTED",
+  RENTAL_CREATION_FAILED: "RENTAL_CREATION_FAILED",
+  CAPTURE_FAIL_BLOCKED: "CAPTURE_FAIL_BLOCKED",
+  SLA_BREACH_DETECTED: "SLA_BREACH_DETECTED",
 } as const;
 
 export type CriticalErrorType =
@@ -198,8 +204,20 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
     return { logged, alertStatus: null };
   }
 
-  if (isDuplicateAlert(input.transactionId, input.type)) {
-    console.warn(`[ALERT_DEDUPLICATED] Skipping duplicate alert for Tx: ${input.transactionId}, Type: ${input.type}`);
+  // Persistent deduplication to prevent alert fatigue
+  if (input.transactionId) {
+    try {
+      const lockRef = getDb().collection("alert_locks").doc(`${input.transactionId}_${input.type}`);
+      await lockRef.create({ createdAt: Date.now() });
+    } catch (e: any) {
+      if (e.code === 6) { // ALREADY_EXISTS
+        console.warn(`[ALERT_DEDUPLICATED] Skipping duplicate alert for Tx: ${input.transactionId}, Type: ${input.type}`);
+        return { logged, alertStatus: null };
+      }
+    }
+  } else if (isDuplicateAlert(input.transactionId, input.type)) {
+    // Fallback to in-memory deduplication if no transactionId
+    console.warn(`[ALERT_DEDUPLICATED] Skipping duplicate alert for Tx: unknown, Type: ${input.type}`);
     return { logged, alertStatus: null };
   }
 

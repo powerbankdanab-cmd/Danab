@@ -24,7 +24,7 @@ import {
 } from "@/lib/server/payment/rentals";
 import { getActiveStationCode, getStationImei } from "@/lib/server/payment/station";
 import { getStationConfigByCode } from "@/lib/server/station-config";
-import { notifyPaidButNotEjected } from "@/lib/server/payment/telegram";
+
 import { PaymentInput, PaymentPayload } from "@/lib/server/payment/types";
 import { CRITICAL_ERROR_TYPES, logError } from "@/lib/server/alerts/log-error";
 import {
@@ -42,7 +42,9 @@ import {
   extractWaafiAudit,
   extractWaafiIds,
   isWaafiApproved,
+  isWaafiCaptured,
   mergeWaafiAuditRecords,
+  queryWaafiTransactionStatus,
   requestWaafiPreauthorization,
 } from "@/lib/server/payment/waafi";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
@@ -56,6 +58,10 @@ import {
 const MAX_UNLOCK_ATTEMPTS = 5;
 const UNLOCK_RETRY_DELAY_MS = 2_000;
 const CONFIRMATION_TIMEOUT_MS = 120_000;
+
+// Phase 4 hardening: capture retry backoff
+const CAPTURE_MAX_RETRIES = 5;
+const CAPTURE_MIN_RETRY_INTERVAL_MS = 10_000; // 10s minimum between capture attempts
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -151,6 +157,21 @@ async function markTransactionFailed(
     tx.status === "capture_unknown" ||
     tx.status === "failed"
   ) {
+    return;
+  }
+
+  // Phase 4: Do NOT mark as failed if provider capture already completed
+  // This prevents money/state divergence
+  if (tx.status === "capture_in_progress" && tx.captureCompleted) {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.CAPTURE_FAIL_BLOCKED,
+      transactionId,
+      message: "Attempted to mark capture_in_progress as failed but provider capture already completed — blocking to prevent money divergence",
+      metadata: {
+        reason,
+        providerCaptureRef: tx.providerCaptureRef,
+      },
+    });
     return;
   }
 
@@ -707,7 +728,7 @@ export async function processPayment(
             phoneNumber,
             transactionId: idempotencyKey
           },
-          unlockStartedAt,
+          lastUnlockStartedAt,
         );
 
         confidence = verification.confidence;
@@ -844,18 +865,22 @@ export async function processPayment(
         }
       }
 
-      await notifyPaidButNotEjected({
-        phoneNumber,
-        amount,
-        imei,
+      await logError({
+        type: CRITICAL_ERROR_TYPES.VERIFICATION_FAILED,
+        transactionId: idempotencyKey,
+        providerRef: transactionId,
         stationCode,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
-        transactionId,
-        issuerTransactionId,
-        referenceId,
-        unlockAttempts,
-        reason: failureNote,
+        phoneNumber,
+        message: `Paid but not ejected: ${failureNote}`,
+        metadata: {
+          batteryId: currentBattery.battery_id,
+          slotId: currentBattery.slot_id,
+          imei,
+          amount,
+          unlockAttempts,
+          issuerTransactionId,
+          referenceId,
+        },
       });
 
       let cancelError: unknown = null;
@@ -955,23 +980,116 @@ export async function processPayment(
 }
 
 /**
+ * Helper: Create rental record after capture is confirmed.
+ * Shared by finalizeCapture's normal path and provider pre-check early-return.
+ */
+async function finalizeCaptureRentalStep(
+  idempotencyKey: string,
+  tx: { rentalCreated?: boolean },
+  imei: string,
+  stationCode: string,
+  batteryId: string,
+  slotId: string,
+  canonicalPhoneNumber: string,
+  phoneNumber: string,
+  amount: number,
+  transactionId: string,
+  issuerTransactionId: string | null | undefined,
+  referenceId: string | null | undefined,
+  phoneAuthority: string,
+  preauthAudit: Record<string, unknown> | undefined,
+): Promise<any> {
+  if (!tx.rentalCreated) {
+    try {
+      const rentalRef = await createRentalLog({
+        imei,
+        stationCode,
+        batteryId,
+        slotId,
+        phoneNumber: canonicalPhoneNumber,
+        requestedPhoneNumber: phoneNumber,
+        amount,
+        transactionId,
+        issuerTransactionId: issuerTransactionId || null,
+        referenceId: referenceId || "manual",
+        phoneAuthority,
+        waafiAudit: preauthAudit || {},
+      });
+
+      await patchPaymentTransaction({
+        id: idempotencyKey,
+        patch: { rentalCreated: true, rentalId: rentalRef.id },
+      });
+
+      await releaseReservation(imei, batteryId);
+      await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+
+      await logError({
+        type: "RENTAL_CREATED",
+        transactionId: idempotencyKey,
+        message: "Rental record created successfully after capture",
+        metadata: { rentalId: rentalRef.id, batteryId, slotId },
+      });
+    } catch (rentalError) {
+      await logError({
+        type: CRITICAL_ERROR_TYPES.RENTAL_CREATION_FAILED,
+        transactionId: idempotencyKey,
+        message: "CRITICAL: Payment captured but rental creation failed — will be recovered by reconciliation",
+        metadata: {
+          error: rentalError instanceof Error ? rentalError.message : String(rentalError),
+          batteryId,
+          slotId,
+          stationCode,
+        },
+      });
+
+      return {
+        status: "captured",
+        success: true,
+        rentalPending: true,
+        battery_id: batteryId,
+        slot_id: slotId,
+      };
+    }
+  }
+
+  return { status: "captured", success: true, battery_id: batteryId, slot_id: slotId };
+}
+
+/**
  * Finalizes capture and rental creation for a verified delivery.
- * IDEMPOTENT: returns success if already captured.
+ *
+ * Phase 4: IDEMPOTENT + CRASH-SAFE capture flow.
+ *
+ * State machine:
+ *   held/confirm_required/resolving → verified → capture_in_progress → captured
+ *
+ * Safety guarantees:
+ *   - captureAttempted is written BEFORE the provider call (crash breadcrumb)
+ *   - captureCompleted + providerCaptureRef stored BEFORE state → captured
+ *   - If already captured, skips provider call entirely (no double capture)
+ *   - Rental creation failure after capture is caught and logged (recoverable)
+ *   - Every code path returns or throws — no silent fallthrough
  */
 export async function finalizeCapture(idempotencyKey: string): Promise<any> {
   const tx = await getPaymentTransaction(idempotencyKey);
 
-  if (!tx || (tx.status !== "held" && tx.status !== "confirm_required" && tx.status !== "captured" && tx.status !== "verified" && tx.status !== "resolving")) {
+  const CAPTURABLE_STATES = new Set([
+    "held", "confirm_required", "verified",
+    "capture_in_progress", "captured", "resolving",
+  ]);
+
+  if (!tx || !CAPTURABLE_STATES.has(tx.status)) {
     throw new HttpError(400, `Transaction in invalid state for capture: ${tx?.status}`);
   }
 
-  // Idempotency: If already captured and rental created, return success
+  // ── Idempotency: already fully complete ──────────────────────────
   if (tx.status === "captured" && tx.rentalCreated) {
     return {
       status: "captured",
       success: true,
       battery_id: tx.delivery?.batteryId,
-      slot_id: tx.delivery?.slotId
+      slot_id: tx.delivery?.slotId,
     };
   }
 
@@ -999,8 +1117,8 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
     canonicalPhoneNumber,
   } = delivery;
 
-  // 1. Move to 'verified' state if not already past it
-  if (tx.status !== "verified" && tx.status !== "captured") {
+  // ── Step 1: Transition to verified (if not already past it) ──────
+  if (tx.status !== "verified" && tx.status !== "capture_in_progress" && tx.status !== "captured") {
     await transitionPaymentTransactionState({
       id: idempotencyKey,
       from: tx.status,
@@ -1009,64 +1127,210 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
     });
   }
 
-  // 2. Commit Waafi (Only if not already captured)
-  let commitResponse;
+  // ── Step 2: Provider capture (only if not already completed) ─────
   if (tx.status !== "captured") {
-    try {
-      commitResponse = await commitWaafiPreauthorization({
-        transactionId: transactionId!,
-        description: "Powerbank rental committed after delivery verification",
-      });
-    } catch (error) {
+    // Phase 4 idempotency guard: skip provider call if already completed locally
+    if (tx.captureCompleted) {
       await logError({
-        type: CRITICAL_ERROR_TYPES.SYSTEM_INCONSISTENCY,
+        type: "CAPTURE_SKIPPED_ALREADY_CAPTURED",
         transactionId: idempotencyKey,
-        message: "Waafi capture retry or failure",
-        metadata: { error: String(error) }
+        message: "Capture already completed by provider — skipping commit call",
+        metadata: {
+          providerCaptureRef: tx.providerCaptureRef,
+          currentStatus: tx.status,
+        },
       });
-      throw error;
+    } else {
+      // ── Retry backoff guard ──────────────────────────────────────
+      const retryCount = tx.captureRetryCount || 0;
+      if (retryCount >= CAPTURE_MAX_RETRIES) {
+        await logError({
+          type: CRITICAL_ERROR_TYPES.CAPTURE_RETRY_EXHAUSTED,
+          transactionId: idempotencyKey,
+          message: `Capture retry limit reached (${retryCount}/${CAPTURE_MAX_RETRIES}) — deferring to reconciliation`,
+          metadata: { retryCount, lastAttemptAt: tx.captureAttemptedAt },
+        });
+        throw new Error(`Capture retry limit reached (${retryCount}/${CAPTURE_MAX_RETRIES})`);
+      }
+
+      if (
+        tx.captureAttemptedAt &&
+        (Date.now() - tx.captureAttemptedAt) < CAPTURE_MIN_RETRY_INTERVAL_MS
+      ) {
+        await logError({
+          type: "CAPTURE_RETRY_SCHEDULED",
+          transactionId: idempotencyKey,
+          message: "Capture retry too soon — deferring to avoid provider spam",
+          metadata: {
+            msSinceLastAttempt: Date.now() - tx.captureAttemptedAt,
+            minInterval: CAPTURE_MIN_RETRY_INTERVAL_MS,
+          },
+        });
+        throw new Error("Capture retry cooldown not elapsed");
+      }
+
+      // ── Provider-level idempotency pre-check ─────────────────────
+      // Before calling commit, check if the provider already captured.
+      // This prevents double-capture even if local captureCompleted was
+      // never written (crash between provider response and DB write).
+      if (transactionId) {
+        try {
+          const providerStatus = await queryWaafiTransactionStatus({
+            transactionId,
+            referenceId: referenceId || null,
+          });
+
+          if (isWaafiCaptured(providerStatus)) {
+            // Provider already captured — do NOT call commit again
+            const captureRef = providerStatus.params?.transactionId || transactionId;
+            await patchPaymentTransaction({
+              id: idempotencyKey,
+              patch: {
+                captureCompleted: true,
+                providerCaptureRef: captureRef,
+                captureRetryCount: retryCount,
+              },
+            });
+
+            await logError({
+              type: "CAPTURE_SKIPPED_ALREADY_CAPTURED",
+              transactionId: idempotencyKey,
+              message: "Provider pre-check confirms capture already completed — skipping commit call",
+              metadata: { providerCaptureRef: captureRef, detectedVia: "provider_pre_check" },
+            });
+
+            // Skip directly to state transition below
+            const fromState = tx.status === "capture_in_progress" ? "capture_in_progress" : "verified";
+            await transitionPaymentTransactionState({
+              id: idempotencyKey,
+              from: fromState as any,
+              to: "captured",
+              patch: { capturedAt: Date.now(), rentalCreated: false },
+            });
+
+            // Jump to rental creation (step 3)
+            // Will be handled below since we exit this if-block
+            return await finalizeCaptureRentalStep(
+              idempotencyKey, tx, imei, stationCode, batteryId, slotId,
+              canonicalPhoneNumber, phoneNumber, amount, transactionId!,
+              issuerTransactionId, referenceId, phoneAuthority, preauthAudit,
+            );
+          }
+        } catch (preCheckError) {
+          // Provider pre-check failed — log but continue with commit attempt.
+          // This is non-fatal: we'll try the commit and let it fail/succeed normally.
+          await logError({
+            type: "CAPTURE_PRECHECK_FAILED",
+            transactionId: idempotencyKey,
+            message: "Provider status pre-check failed — proceeding with commit attempt",
+            metadata: {
+              error: preCheckError instanceof Error ? preCheckError.message : String(preCheckError),
+            },
+          });
+        }
+      }
+
+      // ── Transition to capture_in_progress ─────────────────────────
+      if (tx.status !== "capture_in_progress") {
+        await transitionPaymentTransactionState({
+          id: idempotencyKey,
+          from: "verified",
+          to: "capture_in_progress",
+          patch: {
+            captureAttempted: true,
+            captureAttemptedAt: Date.now(),
+            captureRetryCount: retryCount + 1,
+          },
+        });
+
+        await logError({
+          type: "CAPTURE_STARTED",
+          transactionId: idempotencyKey,
+          message: "Capture initiated — calling provider",
+          metadata: { providerRef: transactionId, attempt: retryCount + 1 },
+        });
+      } else {
+        // Already in capture_in_progress (retry path) — update attempt tracking
+        await patchPaymentTransaction({
+          id: idempotencyKey,
+          patch: {
+            captureAttemptedAt: Date.now(),
+            captureRetryCount: retryCount + 1,
+          },
+        });
+      }
+
+      // ── Call provider ─────────────────────────────────────────────
+      let commitResponse;
+      try {
+        commitResponse = await commitWaafiPreauthorization({
+          transactionId: transactionId!,
+          description: "Powerbank rental committed after delivery verification",
+        });
+      } catch (error) {
+        await logError({
+          type: "CAPTURE_FAILED",
+          transactionId: idempotencyKey,
+          message: "Waafi capture API call failed",
+          metadata: {
+            error: error instanceof Error ? error.message : String(error),
+            providerRef: transactionId,
+            attempt: retryCount + 1,
+          },
+        });
+        // Leave in capture_in_progress for reconciliation to pick up
+        throw error;
+      }
+
+      if (!isWaafiApproved(commitResponse)) {
+        await logError({
+          type: "CAPTURE_FAILED",
+          transactionId: idempotencyKey,
+          message: "Waafi capture not approved by provider",
+          metadata: {
+            providerRef: transactionId,
+            responseCode: commitResponse.responseCode,
+            responseMsg: commitResponse.responseMsg,
+          },
+        });
+        throw new Error("Waafi capture not approved");
+      }
+
+      // Store provider capture reference BEFORE marking captured
+      const captureRef = commitResponse.params?.transactionId || transactionId;
+      await patchPaymentTransaction({
+        id: idempotencyKey,
+        patch: {
+          captureCompleted: true,
+          providerCaptureRef: captureRef,
+        },
+      });
+
+      await logError({
+        type: "CAPTURE_SUCCESS",
+        transactionId: idempotencyKey,
+        message: "Provider capture confirmed — transitioning to captured",
+        metadata: { providerCaptureRef: captureRef, attempt: retryCount + 1 },
+      });
     }
 
-    if (!isWaafiApproved(commitResponse)) {
-      throw new Error("Waafi capture not approved");
-    }
-
-    // Move to 'captured' state
+    // Transition: capture_in_progress → captured
+    // (safe even after crash: captureCompleted is already true)
+    const fromState = tx.captureCompleted ? tx.status : "capture_in_progress";
     await transitionPaymentTransactionState({
       id: idempotencyKey,
-      from: "verified",
+      from: fromState as any,
       to: "captured",
       patch: { capturedAt: Date.now(), rentalCreated: false },
     });
-
-    // 3. Create Rental Log (Only if not already created)
-    if (!tx.rentalCreated) {
-      const rentalRef = await createRentalLog({
-        imei,
-        stationCode,
-        batteryId,
-        slotId,
-        phoneNumber: canonicalPhoneNumber,
-        requestedPhoneNumber: phoneNumber,
-        amount,
-        transactionId: transactionId!,
-        issuerTransactionId: issuerTransactionId || null,
-        referenceId: referenceId || "manual",
-        phoneAuthority,
-        waafiAudit: preauthAudit || {},
-      });
-
-      await patchPaymentTransaction({
-        id: idempotencyKey,
-        patch: { rentalCreated: true, rentalId: rentalRef.id },
-      });
-
-      await releaseReservation(imei, batteryId);
-      await updateRentalUnlockStatus(rentalRef.id, "unlocked");
-    }
-
-    return { status: "captured", success: true, battery_id: batteryId, slot_id: slotId };
   }
+
+  // ── Step 3: Create rental (via shared helper) ─────────────────────
+  return await finalizeCaptureRentalStep(
+    idempotencyKey, tx, imei, stationCode, batteryId, slotId,
+    canonicalPhoneNumber, phoneNumber, amount, transactionId!,
+    issuerTransactionId, referenceId, phoneAuthority, preauthAudit,
+  );
 }
 
 /**

@@ -99,6 +99,41 @@ async function reconcile(request: NextRequest) {
             metadata: { action: "REPAIR_MISSING_RENTAL", station: tx.station, slotId: tx.delivery?.slotId }
           });
         }
+        // Phase 4: capture_in_progress crash recovery
+        else if (tx.status === "capture_in_progress") {
+          await finalizeCapture(tx.id);
+          stats.repaired++;
+
+          await logError({
+            type: "CAPTURE_IN_PROGRESS_RECOVERED",
+            transactionId: tx.id,
+            stationCode: tx.station,
+            message: "[RECON] Recovered stale capture_in_progress transaction",
+            metadata: {
+              action: "CAPTURE_CRASH_RECOVERY",
+              station: tx.station,
+              captureCompleted: tx.captureCompleted,
+              captureAttemptedAt: tx.captureAttemptedAt,
+            }
+          });
+        }
+        // Phase 4: verified + captureAttempted crash recovery
+        else if (tx.status === "verified" && tx.captureAttempted) {
+          await finalizeCapture(tx.id);
+          stats.repaired++;
+
+          await logError({
+            type: "VERIFIED_CRASH_RECOVERED",
+            transactionId: tx.id,
+            stationCode: tx.station,
+            message: "[RECON] Recovered verified+captureAttempted crash case",
+            metadata: {
+              action: "VERIFIED_CRASH_RECOVERY",
+              station: tx.station,
+              captureAttemptedAt: tx.captureAttemptedAt,
+            }
+          });
+        }
         else if (tx.status === "pending_payment") {
           const paymentResult = await checkPaymentStatus(
             tx.providerRef,

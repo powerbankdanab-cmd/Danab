@@ -24,6 +24,7 @@ export type PaymentTransactionStatus =
   | "processing"
   | "verifying"
   | "verified"
+  | "capture_in_progress"
   | "captured"
   | "failed"
   | "confirm_required"
@@ -75,6 +76,12 @@ export type PaymentTransactionRecord = {
   nextReconcileAt?: number | null;
   manualReviewRequired?: boolean;
   manualReviewReason?: string | null;
+  // Phase 4: Capture tracking for idempotent, crash-safe finalization
+  captureAttempted?: boolean;
+  captureCompleted?: boolean;
+  captureAttemptedAt?: number;
+  providerCaptureRef?: string | null;
+  captureRetryCount?: number;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -301,7 +308,7 @@ export type RecoveryFence = {
 
 export async function listTransactionsForReconciliation(limit = 50) {
   const db = getDb();
-  const [capturedSnap, unknownSnap] = await Promise.all([
+  const [capturedSnap, unknownSnap, inProgressSnap, verifiedSnap] = await Promise.all([
     db
       .collection(PAYMENT_TRANSACTIONS_COLLECTION)
       .where("status", "==", "captured")
@@ -310,6 +317,16 @@ export async function listTransactionsForReconciliation(limit = 50) {
     db
       .collection(PAYMENT_TRANSACTIONS_COLLECTION)
       .where("status", "==", "capture_unknown")
+      .limit(limit)
+      .get(),
+    db
+      .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+      .where("status", "==", "capture_in_progress")
+      .limit(limit)
+      .get(),
+    db
+      .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+      .where("status", "==", "verified")
       .limit(limit)
       .get(),
   ]);
@@ -327,6 +344,17 @@ export async function listTransactionsForReconciliation(limit = 50) {
     byId.set(doc.id, doc.data() as PaymentTransactionRecord);
   }
 
+  for (const doc of inProgressSnap.docs) {
+    byId.set(doc.id, doc.data() as PaymentTransactionRecord);
+  }
+
+  for (const doc of verifiedSnap.docs) {
+    const tx = doc.data() as PaymentTransactionRecord;
+    if (tx.captureAttempted) {
+      byId.set(doc.id, tx);
+    }
+  }
+
   return Array.from(byId.values());
 }
 
@@ -334,6 +362,8 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
   const db = getDb();
   const now = Date.now();
   const confirmationCutoff = now - 120_000;
+  // Phase 4: capture_in_progress older than 60s is likely a crash-after-commit
+  const captureInProgressCutoff = now - 60_000;
 
   // Query 1: confirm_required transactions older than 2 minutes
   const confirmSnap = await db
@@ -360,6 +390,23 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .limit(limit)
     .get();
 
+  // Query 4 (Phase 4): capture_in_progress stuck for >60s (crash recovery)
+  const captureInProgressSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "capture_in_progress")
+    .where("captureAttemptedAt", "<", captureInProgressCutoff)
+    .orderBy("captureAttemptedAt")
+    .limit(limit)
+    .get();
+
+  // Query 5 (Phase 4): verified with captureAttempted=true (crash between commit and state write)
+  const verifiedCrashSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "verified")
+    .where("captureAttempted", "==", true)
+    .limit(limit)
+    .get();
+
   const results: PaymentTransactionRecord[] = [];
 
   // Add confirm_required
@@ -380,6 +427,18 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     if (!tx.rentalCreated) {
       results.push(tx);
     }
+  }
+
+  // Phase 4: Add stale capture_in_progress
+  for (const doc of captureInProgressSnap.docs) {
+    if (results.length >= limit) break;
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
+  // Phase 4: Add verified + captureAttempted crash cases
+  for (const doc of verifiedCrashSnap.docs) {
+    if (results.length >= limit) break;
+    results.push(doc.data() as PaymentTransactionRecord);
   }
 
   return results;

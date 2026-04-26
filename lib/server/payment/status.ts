@@ -28,6 +28,8 @@ export type PaymentStatusResponse = {
   | "verifying"
   | "confirm_required"
   | "verified"
+  | "capture_in_progress"
+  | "captured"
   | "failed";
   reason_code?:
   | "USER_CANCELLED"
@@ -154,7 +156,11 @@ function buildStatusResponse(
     return { status: "confirm_required" };
   }
 
-  if (transaction.status === "verified" || transaction.status === "captured") {
+  if (
+    transaction.status === "verified" ||
+    transaction.status === "capture_in_progress" ||
+    transaction.status === "captured"
+  ) {
     return { status: "verified" };
   }
 
