@@ -1,8 +1,8 @@
-import { 
-  BatteryPresence, 
-  BatterySnapshot, 
-  DeliveryConfidence, 
-  VerificationResult 
+import {
+  BatteryPresence,
+  BatterySnapshot,
+  DeliveryConfidence,
+  VerificationResult
 } from "./types";
 import { queryStationBatteries } from "./heycharge";
 import { normalizeBatteryId } from "./battery-id";
@@ -26,7 +26,8 @@ export async function verifyDeliveryWithConfidence(
     stationCode: string;
     phoneNumber: string;
     transactionId: string;
-  }
+  },
+  unlockStartedAt: number,
 ): Promise<VerificationResult> {
   const snapshots: BatterySnapshot[] = [];
   const startTime = Date.now();
@@ -40,21 +41,29 @@ export async function verifyDeliveryWithConfidence(
           battery.slot_id === slotId,
       );
 
+      const slotOccupiedByOtherBattery = stationBatteries.some(
+        (battery) =>
+          battery.slot_id === slotId &&
+          normalizeBatteryId(battery.battery_id) !== normalizeBatteryId(batteryId),
+      );
+
       const snapshot: BatterySnapshot = found
         ? {
-            presence: "present",
-            lockStatus: found.lock_status || null,
-            slotStatus: found.slot_status || null,
-            batteryStatus: found.battery_status || null,
-            observedAt: Date.now(),
-          }
+          presence: "present",
+          lockStatus: found.lock_status || null,
+          slotStatus: found.slot_status || null,
+          batteryStatus: found.battery_status || null,
+          observedAt: Date.now(),
+          slotOccupiedByOtherBattery: false,
+        }
         : {
-            presence: "missing",
-            lockStatus: null,
-            slotStatus: null,
-            batteryStatus: null,
-            observedAt: Date.now(),
-          };
+          presence: "missing",
+          lockStatus: null,
+          slotStatus: null,
+          batteryStatus: null,
+          observedAt: Date.now(),
+          slotOccupiedByOtherBattery,
+        };
       snapshots.push(snapshot);
       return snapshot;
     } catch (error) {
@@ -88,10 +97,10 @@ export async function verifyDeliveryWithConfidence(
   }
 
   // --- Phase 2 ---
-  await delay(2500); // Wait 2.5s
+  await delay(3000); // Longer window for hardware / sensor latency
   let phase2Result: BatteryPresence = "missing";
-  let phase2Snapshots: BatteryPresence[] = [];
-  
+  const phase2Snapshots: BatteryPresence[] = [];
+
   for (let i = 0; i < 2; i++) {
     const snapshot = await getSnapshot();
     phase2Snapshots.push(snapshot.presence);
@@ -101,23 +110,54 @@ export async function verifyDeliveryWithConfidence(
     if (i === 0) await delay(500);
   }
 
+  // --- Extended window ---
+  const extendedSnapshots: BatteryPresence[] = [];
+  let extendedConsecutiveMissing = 0;
+  for (let i = 0; i < 3; i++) {
+    const snapshot = await getSnapshot();
+    extendedSnapshots.push(snapshot.presence);
+    if (snapshot.presence === "missing") {
+      extendedConsecutiveMissing++;
+    } else {
+      extendedConsecutiveMissing = 0;
+    }
+    if (extendedConsecutiveMissing >= 2) {
+      break;
+    }
+    await delay(1000);
+  }
+
   // --- Confidence Model ---
+  const phase2Stable = phase2Snapshots.every((p) => p === "missing");
+  const extendedStableMissing = extendedConsecutiveMissing >= 2;
+  const missingDetectedAt = snapshots.find((snapshot) => snapshot.presence === "missing")?.observedAt ?? null;
+  const causalityInvalid =
+    missingDetectedAt !== null && missingDetectedAt <= unlockStartedAt;
+  const presenceSequence = snapshots.map((s) => s.presence);
+  const firstMissingIndex = presenceSequence.indexOf("missing");
+  const presentAfterMissing =
+    firstMissingIndex !== -1 &&
+    presenceSequence.slice(firstMissingIndex + 1).some((presence) => presence === "present");
+  const missingOnlyOnce = presenceSequence.filter((p) => p === "missing").length === 1;
+
   let confidence: DeliveryConfidence = "LOW";
-  const phase2Stable = phase2Snapshots.every(p => p === "missing");
-  
-  if (phase1Result === "missing" && phase2Stable) {
+  if (presentAfterMissing) {
+    confidence = "LOW";
+  } else if (
+    !causalityInvalid &&
+    ((phase1Result === "missing" && phase2Stable) || extendedStableMissing)
+  ) {
     confidence = "HIGH";
-  } else if (phase1Result === "missing" && !phase2Stable) {
+  } else if (!causalityInvalid && snapshots.some((snapshot) => snapshot.presence === "missing")) {
     confidence = "MEDIUM";
   } else {
     confidence = "LOW";
   }
 
   // --- Logic for False Positive detection ---
-  const presenceSequence = snapshots.map(s => s.presence);
-  const detectedFalseEjection = 
-    (presenceSequence.includes("missing") && presenceSequence[presenceSequence.length - 1] === "present") ||
-    (presenceSequence.filter(p => p === "missing").length === 1);
+  const detectedFalseEjection =
+    presentAfterMissing ||
+    missingOnlyOnce;
 
   if (detectedFalseEjection) {
     await logError({
@@ -145,12 +185,41 @@ export async function verifyDeliveryWithConfidence(
       batteryId,
       slotId,
       snapshots,
+      presenceSequence,
       phase1Result,
       phase2Result,
       confidence,
-      durationMs: Date.now() - startTime
+      missingDetectedAt,
+      unlockStartedAt,
+      durationMs: Date.now() - startTime,
+      causalityInvalid,
+      presentAfterMissing,
+      missingOnlyOnce,
+      phase2Stable,
+      extendedStableMissing,
+      counts: {
+        present: presenceSequence.filter((p) => p === "present").length,
+        missing: presenceSequence.filter((p) => p === "missing").length,
+        unknown: presenceSequence.filter((p) => p === "unknown").length,
+      },
     }
   });
 
-  return { confidence, snapshots, phase1Result, phase2Result };
+  if (causalityInvalid) {
+    await logError({
+      type: "FALSE_EJECTION_PATTERN",
+      stationCode: metadata.stationCode,
+      phoneNumber: metadata.phoneNumber,
+      transactionId: metadata.transactionId,
+      message: "Missing signal was detected before unlock completed; ignoring early missing signal",
+      metadata: {
+        unlockStartedAt,
+        missingDetectedAt,
+        sequence: presenceSequence,
+        snapshots,
+      },
+    });
+  }
+
+  return { confidence, snapshots, phase1Result, phase2Result, missingDetectedAt };
 }

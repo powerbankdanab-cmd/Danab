@@ -39,6 +39,7 @@ export type PaymentDeliveryContext = {
   unlockAttempts: number;
   requestedPhoneNumber: string;
   canonicalPhoneNumber: string;
+  unlockStartedAt?: number;
 };
 
 export type PaymentTransactionRecord = {
@@ -58,6 +59,8 @@ export type PaymentTransactionRecord = {
   failedAt?: number;
   failureReason?: string;
   captureUnknownAt?: number;
+  confirmRequiredAt?: number;
+  lastConfirmVerificationAt?: number;
   providerIssuerRef?: string | null;
   providerReferenceId?: string | null;
   rentalCreated?: boolean;
@@ -330,14 +333,14 @@ export async function listTransactionsForReconciliation(limit = 50) {
 export async function listStaleTransactionsForReconciliation(limit = 20) {
   const db = getDb();
   const now = Date.now();
-  const sixtySecondsAgo = now - 60000;
+  const confirmationCutoff = now - 120_000;
 
-  // Query 1: confirm_required that are older than 60s
+  // Query 1: confirm_required transactions older than 2 minutes
   const confirmSnap = await db
     .collection(PAYMENT_TRANSACTIONS_COLLECTION)
     .where("status", "==", "confirm_required")
-    .where("updatedAt", "<", sixtySecondsAgo)
-    .orderBy("updatedAt")
+    .where("confirmRequiredAt", "<", confirmationCutoff)
+    .orderBy("confirmRequiredAt")
     .limit(limit)
     .get();
 

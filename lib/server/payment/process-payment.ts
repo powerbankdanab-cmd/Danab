@@ -55,6 +55,7 @@ import {
 
 const MAX_UNLOCK_ATTEMPTS = 5;
 const UNLOCK_RETRY_DELAY_MS = 2_000;
+const CONFIRMATION_TIMEOUT_MS = 120_000;
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -682,12 +683,14 @@ export async function processPayment(
 
     let confidence: DeliveryConfidence = "LOW";
     let verification: VerificationResult | null = null;
+    let lastUnlockStartedAt: number | null = null;
 
     for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
       unlockAttempts = attempt;
       unlockCommandAccepted = false;
 
       try {
+        lastUnlockStartedAt = Date.now();
         unlock = await releaseBattery({
           imei,
           batteryId: currentBattery.battery_id,
@@ -703,7 +706,8 @@ export async function processPayment(
             stationCode,
             phoneNumber,
             transactionId: idempotencyKey
-          }
+          },
+          unlockStartedAt,
         );
 
         confidence = verification.confidence;
@@ -775,6 +779,7 @@ export async function processPayment(
             unlockAttempts,
             requestedPhoneNumber: phoneNumber,
             canonicalPhoneNumber,
+            unlockStartedAt: lastUnlockStartedAt ?? Date.now(),
           },
           waafiAudit: preauthAudit,
         },
@@ -1104,17 +1109,18 @@ export async function handleUserConfirmation(
     return { status: tx.status };
   }
 
-  // 2. Timeout Check (60 seconds)
-  if (tx?.status === "confirm_required" && tx.updatedAt) {
-    const updatedAtMs = toMillis(tx.updatedAt) ?? Date.now();
-    const elapsedSeconds = (Date.now() - updatedAtMs) / 1000;
-    if (elapsedSeconds > 60) {
+  // 2. Timeout Check (120 seconds)
+  if (tx?.status === "confirm_required") {
+    const confirmRequiredAtMs = toMillis(tx.confirmRequiredAt ?? tx.updatedAt) ?? Date.now();
+    const elapsedMs = Date.now() - confirmRequiredAtMs;
+    if (elapsedMs > CONFIRMATION_TIMEOUT_MS) {
       await logError({
         type: CRITICAL_ERROR_TYPES.VERIFICATION_TIMEOUT,
         transactionId: idempotencyKey,
         message: "Confirmation timeout - auto-cancelling hold",
+        metadata: { elapsedMs },
       });
-      return cancelHold(idempotencyKey, "Confirmation timed out (60s)");
+      return cancelHold(idempotencyKey, "Confirmation timed out (120s)");
     }
   }
 
@@ -1211,15 +1217,17 @@ async function performEjectionAndVerification(input: {
   }
 
   const processStartTime = Date.now();
+  let lastUnlockStartedAt: number | null = null;
   for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
     unlockAttempts = attempt;
     try {
+      lastUnlockStartedAt = Date.now();
       await releaseBattery({ imei, batteryId: currentBattery.battery_id, slotId: currentBattery.slot_id });
       verification = await verifyDeliveryWithConfidence(imei, currentBattery.battery_id, currentBattery.slot_id, {
         stationCode,
         phoneNumber,
         transactionId: idempotencyKey
-      });
+      }, lastUnlockStartedAt);
 
       confidence = verification.confidence;
       if (confidence === "HIGH" || confidence === "MEDIUM") break;

@@ -79,6 +79,7 @@ export type BatterySnapshot = {
   slotStatus: string | null;
   batteryStatus: string | null;
   observedAt: number;
+  slotOccupiedByOtherBattery?: boolean;
 };
 
 export type DeliveryConfidence = "HIGH" | "MEDIUM" | "LOW";
@@ -88,4 +89,5 @@ export type VerificationResult = {
   snapshots: BatterySnapshot[];
   phase1Result: BatteryPresence;
   phase2Result: BatteryPresence;
+  missingDetectedAt?: number | null;
 };

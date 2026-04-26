@@ -4,7 +4,7 @@ ensureServerEnvLoaded();
 
 export { isPhoneBlacklisted } from "@/lib/server/payment/blacklist";
 export { HttpError, isHttpError } from "@/lib/server/payment/errors";
-export { 
+export {
   createOrGetPaymentTransaction,
   getPaymentTransaction,
   patchPaymentTransaction,
@@ -13,11 +13,12 @@ export {
   claimTransactionRecovery,
   releaseTransactionRecovery
 } from "@/lib/server/payment/transactions";
-export { 
-  processPayment, 
+export {
+  processPayment,
   handleUserConfirmation,
   finalizeCapture,
-  cancelHold
+  cancelHold,
+  resumePendingPayment
 } from "@/lib/server/payment/process-payment";
 export {
   getActiveStationCode,

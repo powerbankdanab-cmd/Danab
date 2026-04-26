@@ -5,8 +5,10 @@ import {
   releaseTransactionRecovery,
   finalizeCapture,
   cancelHold,
-  transitionPaymentTransactionState
+  transitionPaymentTransactionState,
+  resumePendingPayment,
 } from "@/lib/server/payment-service";
+import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 import { checkPaymentStatus } from "@/lib/server/payment/waafi";
 import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 
@@ -62,16 +64,27 @@ async function reconcile(request: NextRequest) {
 
       try {
         if (tx.status === "confirm_required") {
-          await cancelHold(tx.id, "AUTO_CANCEL_TIMEOUT (Distributed reconciliation)");
-          stats.cancelled++;
+          const statusResult = await getProviderDrivenPaymentStatus(tx.id);
+          if (statusResult.status === "verified") {
+            stats.repaired++;
+          } else if (statusResult.status === "failed") {
+            stats.cancelled++;
+          } else {
+            stats.locked++;
+          }
 
-          const updatedAtMs = toMillis(tx.updatedAt) ?? Date.now();
+          const confirmAtMs = toMillis(tx.confirmRequiredAt ?? tx.updatedAt) ?? Date.now();
           await logError({
             type: "CONFIRM_TIMEOUT_AUTO_CANCEL",
             transactionId: tx.id,
             stationCode: tx.station,
-            message: `[RECON] Auto-cancelled stale confirmation (${Math.floor((Date.now() - updatedAtMs) / 1000)}s old)`,
-            metadata: { action: "AUTO_CANCEL_TIMEOUT", station: tx.station, slotId: tx.delivery?.slotId }
+            message: `[RECON] Processed stale confirm_required transaction (${Math.floor((Date.now() - confirmAtMs) / 1000)}s old)`,
+            metadata: {
+              action: "AUTO_CANCEL_TIMEOUT",
+              station: tx.station,
+              slotId: tx.delivery?.slotId,
+              status: statusResult.status,
+            },
           });
         }
         else if (tx.status === "captured" && !tx.rentalCreated) {
@@ -93,39 +106,30 @@ async function reconcile(request: NextRequest) {
           );
 
           if (paymentResult === "paid") {
-            // Transition to verified and finalize capture
-            await transitionPaymentTransactionState({
-              id: tx.id,
-              from: "pending_payment",
-              to: "verified",
-              patch: { verifiedAt: Date.now() }
-            });
-
+            // Transition to held and resume hardware verification before capture
             try {
-              await finalizeCapture(tx.id);
+              await resumePendingPayment(tx);
               stats.repaired++;
 
               await logError({
                 type: "ASYNC_PAYMENT_CONFIRMED",
                 transactionId: tx.id,
-                message: "[RECON] Payment confirmed and finalized for pending transaction",
+                message: "[RECON] Payment confirmed and ejection verification resumed for pending transaction",
                 metadata: { action: "PAYMENT_CONFIRMED", station: tx.station }
               });
-            } catch (finalizeError) {
-              // If finalize fails, mark for manual review
+            } catch (paymentResumeError) {
               await logError({
                 type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
                 transactionId: tx.id,
-                message: "[RECON] Failed to finalize confirmed payment",
+                message: "[RECON] Failed to resume pending payment after async confirmation",
                 metadata: {
-                  error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
-                  station: tx.station
+                  error: paymentResumeError instanceof Error ? paymentResumeError.message : String(paymentResumeError),
+                  station: tx.station,
                 }
               });
               stats.errors++;
             }
-          }
-          else if (
+          } else if (
             (paymentResult === "cancelled" || paymentResult === "failed") &&
             (Date.now() - (toMillis(tx.createdAt) ?? Date.now())) > 120_000
           ) { // 2 minutes

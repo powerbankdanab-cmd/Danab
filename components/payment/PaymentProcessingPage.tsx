@@ -38,7 +38,8 @@ type ApiResponse = {
   | "TIMEOUT"
   | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
-  | "UNLOCK_TIMEOUT";
+  | "UNLOCK_TIMEOUT"
+  | "INVALID_INITIAL_STATE";
   failureReason?: string;
   providerRef?: string | null;
   message?: string;
@@ -155,6 +156,10 @@ export function PaymentProcessingPage() {
       return "UNLOCK_FAILED";
     }
 
+    if (rawReason === "INVALID_INITIAL_STATE") {
+      return "INVALID_INITIAL_STATE";
+    }
+
     if (rawReason === "WRONG_PIN") {
       return "WRONG_PIN";
     }
@@ -179,6 +184,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "UNLOCK_FAILED") {
       return "Lacagta waa la xaqiijiyay laakiin qalad ayaa ka dhacay bixinta power bank-ka. Payment was successful, but there was an issue releasing the power bank.";
+    }
+
+    if (reason === "INVALID_INITIAL_STATE") {
+      return "Power bank state was invalid before release. Please retry the rental or contact support.";
     }
 
     if (reason === "PROVIDER_ERROR") {
@@ -217,6 +226,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "UNLOCK_FAILED") {
       return "Lacagtii waa la xaqiijiyay, laakiin power bank-ga lama sii deyn karin";
+    }
+
+    if (reason === "INVALID_INITIAL_STATE") {
+      return "Slot state invalid before unlock";
     }
 
     if (reason === "PROVIDER_ERROR") {

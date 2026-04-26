@@ -8,12 +8,17 @@ import {
   PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed } from "@/lib/server/payment/waafi";
+import { finalizeCapture, cancelHold } from "@/lib/server/payment/process-payment";
 import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
-import { releaseBattery } from "@/lib/server/payment/heycharge";
+import { releaseBattery, queryStationBatteries } from "@/lib/server/payment/heycharge";
+import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
+import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
+import { logError } from "@/lib/server/alerts/log-error";
 
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 const PROCESSING_TIMEOUT_MS = 30_000;
+const CONFIRM_REQUIRED_TIMEOUT_MS = 120_000;
 
 export type PaymentStatusResponse = {
   status:
@@ -21,6 +26,7 @@ export type PaymentStatusResponse = {
   | "paid"
   | "processing"
   | "verifying"
+  | "confirm_required"
   | "verified"
   | "failed";
   reason_code?:
@@ -28,13 +34,15 @@ export type PaymentStatusResponse = {
   | "TIMEOUT"
   | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
-  | "UNLOCK_TIMEOUT";
+  | "UNLOCK_TIMEOUT"
+  | "INVALID_INITIAL_STATE";
   failureReason?:
   | "USER_CANCELLED"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
-  | "UNLOCK_TIMEOUT";
+  | "UNLOCK_TIMEOUT"
+  | "INVALID_INITIAL_STATE";
   unlockStarted?: boolean;
 };
 
@@ -57,11 +65,44 @@ function toReasonCode(
     return "UNLOCK_FAILED";
   }
 
+  if (failureReason === "INVALID_INITIAL_STATE") {
+    return "INVALID_INITIAL_STATE";
+  }
+
   if (failureReason) {
     return "PROVIDER_ERROR";
   }
 
   return undefined;
+}
+
+async function getBatteryPresence(
+  imei: string,
+  batteryId: string,
+  slotId: string,
+): Promise<"present" | "missing" | "unknown"> {
+  try {
+    const stationBatteries = await queryStationBatteries(imei);
+    const found = stationBatteries.find(
+      (battery) =>
+        normalizeBatteryId(battery.battery_id) === normalizeBatteryId(batteryId) &&
+        battery.slot_id === slotId,
+    );
+
+    return found ? "present" : "missing";
+  } catch (error) {
+    await logError({
+      type: "STATION_QUERY_FAILED",
+      message: "Failed to query initial battery presence before unlock",
+      metadata: {
+        imei,
+        batteryId,
+        slotId,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    return "unknown";
+  }
 }
 
 function toMillis(value: unknown): number | null {
@@ -109,7 +150,11 @@ function buildStatusResponse(
     return { status: "verifying" };
   }
 
-  if (transaction.status === "verified") {
+  if (transaction.status === "confirm_required") {
+    return { status: "confirm_required" };
+  }
+
+  if (transaction.status === "verified" || transaction.status === "captured") {
     return { status: "verified" };
   }
 
@@ -118,6 +163,117 @@ function buildStatusResponse(
   }
 
   return { status: "pending_payment" };
+}
+
+async function handleConfirmRequiredStatus(
+  transaction: PaymentTransactionRecord,
+): Promise<PaymentStatusResponse> {
+  if (!transaction.delivery) {
+    return { status: "confirm_required" };
+  }
+
+  const CONFIRM_REQUIRED_REVERIFY_INTERVAL_MS = 3000;
+  const confirmRequiredAtMs = toMillis(
+    transaction.confirmRequiredAt ?? transaction.updatedAt,
+  ) ?? Date.now();
+  const lastReverifyAtMs = toMillis(transaction.lastConfirmVerificationAt) ?? 0;
+
+  if (Date.now() - lastReverifyAtMs < CONFIRM_REQUIRED_REVERIFY_INTERVAL_MS) {
+    return { status: "confirm_required" };
+  }
+
+  const unlockStartedAt =
+    transaction.delivery.unlockStartedAt ??
+    toMillis(transaction.processingStartedAt) ??
+    Date.now();
+
+  await patchPaymentTransaction({
+    id: transaction.id,
+    patch: {
+      lastConfirmVerificationAt: Date.now(),
+    },
+  });
+
+  let verification;
+  try {
+    verification = await verifyDeliveryWithConfidence(
+      transaction.delivery.imei,
+      transaction.delivery.batteryId,
+      transaction.delivery.slotId,
+      {
+        stationCode: transaction.delivery.stationCode,
+        phoneNumber: transaction.delivery.requestedPhoneNumber,
+        transactionId: transaction.id,
+      },
+      unlockStartedAt,
+    );
+  } catch (error) {
+    await logError({
+      type: "VERIFICATION_TIMEOUT",
+      transactionId: transaction.id,
+      stationCode: transaction.delivery.stationCode,
+      phoneNumber: transaction.delivery.requestedPhoneNumber,
+      message: "Background verification failed while resolving confirm_required",
+      metadata: {
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+
+    const elapsedMs = Date.now() - confirmRequiredAtMs;
+    if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
+      await logError({
+        type: "verification_final_check_failed",
+        transactionId: transaction.id,
+        stationCode: transaction.delivery.stationCode,
+        message: "Final confirm_required verification attempt failed due to system error",
+        metadata: { elapsedMs },
+      });
+      await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
+      return { status: "failed", reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+    }
+
+    return { status: "confirm_required" };
+  }
+
+  if (verification.confidence === "HIGH") {
+    await logError({
+      type: "verification_recovered",
+      transactionId: transaction.id,
+      stationCode: transaction.delivery.stationCode,
+      message: "Confirm_required transaction recovered with HIGH verification",
+      metadata: {
+        unlockStartedAt,
+        missingDetectedAt: verification.missingDetectedAt,
+      },
+    });
+
+    await finalizeCapture(transaction.id);
+    const refreshed = await getPaymentTransaction(transaction.id);
+    if (!refreshed) {
+      throw new HttpError(404, "Transaction not found");
+    }
+
+    return buildStatusResponse(refreshed);
+  }
+
+  const elapsedMs = Date.now() - confirmRequiredAtMs;
+  if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
+    await logError({
+      type: "verification_final_check_failed",
+      transactionId: transaction.id,
+      stationCode: transaction.delivery.stationCode,
+      message: "Confirm_required final verification attempt did not reach HIGH confidence",
+      metadata: {
+        elapsedMs,
+        confidence: verification.confidence,
+      },
+    });
+
+    await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
+    return { status: "failed", reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+  }
+
+  return { status: "confirm_required" };
 }
 
 export async function runUnlockIfNeeded(
@@ -132,6 +288,32 @@ export async function runUnlockIfNeeded(
       transactionId: transaction.id,
       reason: "missing_delivery_payload",
     });
+    return;
+  }
+
+  const initialPresence = await getBatteryPresence(
+    transaction.delivery.imei,
+    transaction.delivery.batteryId,
+    transaction.delivery.slotId,
+  );
+
+  if (initialPresence !== "present") {
+    console.error("unlock_invalid_initial_state", {
+      transactionId: transaction.id,
+      initialPresence,
+      delivery: transaction.delivery,
+    });
+
+    await patchPaymentTransaction({
+      id: transaction.id,
+      patch: {
+        status: "failed",
+        failureReason: "INVALID_INITIAL_STATE",
+        updatedAt: Date.now(),
+        updatedAtTs: Timestamp.now(),
+      },
+    });
+
     return;
   }
 
@@ -258,6 +440,10 @@ export async function getProviderDrivenPaymentStatus(
     }
 
     return buildStatusResponse(transaction);
+  }
+
+  if (transaction.status === "confirm_required") {
+    return await handleConfirmRequiredStatus(transaction);
   }
 
   if (transaction.status === "verifying") {
