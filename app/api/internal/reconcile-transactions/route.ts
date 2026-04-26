@@ -11,6 +11,17 @@ import {
 import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 import { checkPaymentStatus } from "@/lib/server/payment/waafi";
 import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
+import { getOptionalEnv } from "@/lib/server/env";
+
+function isAuthorized(request: NextRequest) {
+  const secret = getOptionalEnv("INTERNAL_CRON_TOKEN") || getOptionalEnv("CRON_SECRET") || getOptionalEnv("RECONCILE_CRON_SECRET");
+  if (!secret) {
+    return true; // For local dev without secret
+  }
+
+  const authHeader = request.headers.get("authorization") || request.headers.get("Authorization") || "";
+  return authHeader === `Bearer ${secret}`;
+}
 
 type TimestampLike = number | Date | { seconds?: number } | null | undefined;
 
@@ -26,10 +37,7 @@ function toMillis(value: TimestampLike): number | null {
 async function reconcile(request: NextRequest) {
   try {
     // 1. Security Check
-    const authHeader = request.headers.get("Authorization");
-    const cronToken = process.env.INTERNAL_CRON_TOKEN;
-
-    if (cronToken && authHeader !== `Bearer ${cronToken}`) {
+    if (!isAuthorized(request)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 

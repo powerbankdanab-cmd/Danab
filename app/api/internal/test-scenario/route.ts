@@ -8,7 +8,7 @@ import { getOptionalEnv } from "@/lib/server/env";
 export const maxDuration = 60;
 
 function isAuthorized(request: NextRequest) {
-  const secret = getOptionalEnv("INTERNAL_CRON_TOKEN") || getOptionalEnv("RECONCILE_CRON_SECRET");
+  const secret = getOptionalEnv("INTERNAL_CRON_TOKEN") || getOptionalEnv("CRON_SECRET") || getOptionalEnv("RECONCILE_CRON_SECRET");
   if (!secret) {
     return true; // For local dev without secret
   }
