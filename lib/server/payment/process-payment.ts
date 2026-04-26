@@ -16,7 +16,7 @@ import {
 } from "@/lib/server/payment/heycharge";
 import { isPhoneBlacklisted } from "@/lib/server/payment/blacklist";
 import {
-  createRentalLog,
+  createRental,
   getRentalByTransactionId,
   hasActiveRentalForPhone,
   isDuplicateTransaction,
@@ -1002,34 +1002,27 @@ async function finalizeCaptureRentalStep(
 ): Promise<any> {
   if (!tx.rentalCreated) {
     try {
-      const rentalRef = await createRentalLog({
-        imei,
-        stationCode,
-        batteryId,
+      const rentalId = await createRental({
+        transactionId: idempotencyKey,
+        phone: canonicalPhoneNumber,
+        stationId: stationCode,
         slotId,
-        phoneNumber: canonicalPhoneNumber,
-        requestedPhoneNumber: phoneNumber,
-        amount,
-        transactionId,
-        issuerTransactionId: issuerTransactionId || null,
-        referenceId: referenceId || "manual",
-        phoneAuthority,
-        waafiAudit: preauthAudit || {},
+        batteryId,
       });
 
       await patchPaymentTransaction({
         id: idempotencyKey,
-        patch: { rentalCreated: true, rentalId: rentalRef.id },
+        patch: { rentalCreated: true, rentalId },
       });
 
       await releaseReservation(imei, batteryId);
-      await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+      await updateRentalUnlockStatus(rentalId, "unlocked");
 
       await logError({
         type: "RENTAL_CREATED",
         transactionId: idempotencyKey,
         message: "Rental record created successfully after capture",
-        metadata: { rentalId: rentalRef.id, batteryId, slotId },
+        metadata: { rentalId, batteryId, slotId },
       });
     } catch (rentalError) {
       await logError({
@@ -1236,7 +1229,7 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
         await logTransactionEvent(idempotencyKey, "CAPTURE_INITIATED", {
           providerRef: transactionId,
           attempt: retryCount + 1,
-        });
+        }, "IMPORTANT");
 
         await transitionPaymentTransactionState({
           id: idempotencyKey,
@@ -1315,7 +1308,7 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
       await logTransactionEvent(idempotencyKey, "PROVIDER_CAPTURE_SUCCESS", {
         providerCaptureRef: captureRef,
         attempt: retryCount + 1,
-      });
+      }, "IMPORTANT");
 
       await logError({
         type: "CAPTURE_SUCCESS",
@@ -1363,7 +1356,7 @@ export async function cancelHold(idempotencyKey: string, reason: string): Promis
     await logTransactionEvent(idempotencyKey, "CANCELLING_PROVIDER_HOLD", {
       providerRef: tx.providerRef,
       reason,
-    });
+    }, "IMPORTANT");
 
     await cancelWaafiPreauthorization({
       transactionId: tx.providerRef,
@@ -1411,7 +1404,7 @@ export async function handleUserConfirmation(
 
   await logTransactionEvent(idempotencyKey, "USER_CONFIRMATION_RECEIVED", {
     confirmed,
-  });
+  }, "IMPORTANT");
 
   await logError({
     type: "USER_CONFIRMATION",

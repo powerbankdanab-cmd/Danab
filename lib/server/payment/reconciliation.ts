@@ -5,7 +5,7 @@ import {
   ensureBatteryReturnedForTransaction,
 } from "@/lib/server/payment/battery-state";
 import {
-  createRentalLog,
+  createRental,
   getRentalByTransactionId,
   updateRentalUnlockStatus,
 } from "@/lib/server/payment/rentals";
@@ -87,37 +87,21 @@ async function ensureRentalForCapturedTransaction(
     return "already_exists";
   }
 
-  const delivery = transaction.delivery;
-  if (!delivery) {
-    throw new Error("Captured transaction is missing delivery context");
-  }
-
   try {
-    const rentalRef = await createRentalLog({
-      imei: delivery.imei,
-      stationCode: delivery.stationCode,
-      batteryId: delivery.batteryId,
-      slotId: delivery.slotId,
-      phoneNumber: delivery.canonicalPhoneNumber,
-      requestedPhoneNumber: delivery.requestedPhoneNumber,
-      amount: transaction.amount,
-      transactionId: providerRef,
-      issuerTransactionId: transaction.providerIssuerRef || null,
-      referenceId: transaction.providerReferenceId || null,
-      phoneAuthority: delivery.phoneAuthority,
-      waafiAudit: transaction.waafiAudit,
-    });
+    const delivery = transaction.delivery;
+    if (!delivery) {
+      throw new Error("Captured transaction is missing delivery context");
+    }
 
-    await ensureBatteryRentedForTransaction({
+    const rentalId = await createRental({
+      transactionId: providerRef,
+      phone: delivery.canonicalPhoneNumber,
+      stationId: delivery.stationCode,
+      slotId: delivery.slotId,
       batteryId: delivery.batteryId,
       imei: delivery.imei,
-      stationCode: delivery.stationCode,
-      slotId: delivery.slotId,
-      rentalId: rentalRef.id,
-      transactionId: providerRef,
-      phoneNumber: delivery.canonicalPhoneNumber,
-      requestedPhoneNumber: delivery.requestedPhoneNumber,
       phoneAuthority: delivery.phoneAuthority,
+      requestedPhoneNumber: delivery.requestedPhoneNumber,
       amount: transaction.amount,
       issuerTransactionId: transaction.providerIssuerRef || null,
       referenceId: transaction.providerReferenceId || null,
@@ -128,30 +112,18 @@ async function ensureRentalForCapturedTransaction(
         fence,
         patch: {
           rentalCreated: true,
-          rentalId: rentalRef.id,
+          rentalId,
         },
       });
     }
-    await updateRentalUnlockStatus(rentalRef.id, "unlocked");
+
+    await updateRentalUnlockStatus(rentalId, "unlocked");
     return "created";
-  } catch (error) {
-    if (error instanceof BatteryStateConflictError) {
-      const byTx = await getRentalByTransactionId(providerRef);
-      if (byTx) {
-        if (fence) {
-          await guardedPatchPaymentTransaction({
-            fence,
-            patch: {
-              rentalCreated: true,
-              rentalId: byTx.id,
-            },
-          });
-        }
-        await updateRentalUnlockStatus(byTx.id, "unlocked");
-        return "already_exists";
-      }
+  } catch (err) {
+    if (err instanceof BatteryStateConflictError) {
+      return "already_exists";
     }
-    throw error;
+    throw err;
   }
 }
 

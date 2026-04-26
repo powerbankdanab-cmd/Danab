@@ -5,11 +5,30 @@ import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 import {
   BATTERY_STATE_COLLECTION,
   BatteryStateConflictError,
-  clearBatteryStateForRental,
-  getClaimedBatteryIds,
 } from "@/lib/server/payment/battery-state";
 
-export const RENTALS_COLLECTION = "rentalsTrans";
+export type RentalStatus = "active" | "returned" | "overdue" | "lost";
+
+export interface RentalRecord {
+  id: string;
+  transactionId: string;
+  phone: string;
+  stationId: string;
+  slotId: string;
+  batteryId: string;
+  status: RentalStatus;
+  startedAt: number;
+  dueAt: number;
+  returnedAt?: number | null;
+  returnStationId?: string | null;
+  verificationConfidence: "HIGH";
+  penaltyApplied: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export const RENTALS_COLLECTION = "rentals";
+const RENTAL_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 export async function isDuplicateTransaction(transactionId: string) {
   const snapshot = await getDb()
@@ -33,145 +52,222 @@ export async function getRentalByTransactionId(transactionId: string) {
   }
 
   const doc = snapshot.docs[0];
-  return { id: doc.id, data: doc.data() };
+  return { id: doc.id, ...(doc.data() as Omit<RentalRecord, "id">) };
 }
 
-export async function createRentalLog({
-  imei,
-  stationCode,
-  batteryId,
-  slotId,
-  phoneNumber,
-  requestedPhoneNumber,
-  amount,
-  transactionId,
-  issuerTransactionId,
-  referenceId,
-  phoneAuthority,
-  waafiAudit,
-}: {
-  imei: string;
-  stationCode: string;
-  batteryId: string;
+/**
+ * Creates a new rental record.
+ * Only called after HIGH confidence delivery verification.
+ */
+export async function createRental(params: {
+  transactionId: string;
+  phone: string;
+  stationId: string;
   slotId: string;
-  phoneNumber: string;
-  requestedPhoneNumber?: string;
-  amount: number;
-  transactionId: string | null;
-  issuerTransactionId: string | null;
-  referenceId: string | null;
+  batteryId: string;
+  // Metadata for battery_state sync
+  imei?: string;
   phoneAuthority?: string;
-  waafiAudit?: Record<string, unknown>;
-}) {
+  requestedPhoneNumber?: string;
+  amount?: number;
+  issuerTransactionId?: string | null;
+  referenceId?: string | null;
+}): Promise<string> {
   const db = getDb();
-  const now = Timestamp.now();
-  const normalizedBatteryId = normalizeBatteryId(batteryId) || batteryId;
-  const resolvedRequestedPhoneNumber = requestedPhoneNumber || phoneNumber;
+  const now = Date.now();
+  const normalizedBatteryId = normalizeBatteryId(params.batteryId) || params.batteryId;
+  
   const rentalRef = db.collection(RENTALS_COLLECTION).doc();
   const batteryStateRef = db
     .collection(BATTERY_STATE_COLLECTION)
     .doc(normalizedBatteryId);
 
   await db.runTransaction(async (tx) => {
+    // 1. Check for existing active rental for this battery (Asset safety)
     const batteryStateSnap = await tx.get(batteryStateRef);
     const batteryState = batteryStateSnap.data() || {};
 
     if (
-      String(batteryState.status || "").toLowerCase() === "rented" &&
-      String(batteryState.activeRentalId || "").trim().length > 0
+      batteryState.status === "rented" || 
+      batteryState.status === "active"
     ) {
-      throw new BatteryStateConflictError(
-        normalizedBatteryId,
-        String(batteryState.activeRentalId || ""),
-      );
+      if (batteryState.activeRentalId) {
+         throw new BatteryStateConflictError(
+          normalizedBatteryId,
+          batteryState.activeRentalId
+        );
+      }
     }
 
-    tx.set(rentalRef, {
-      imei,
-      stationCode,
-      battery_id: normalizedBatteryId,
-      slot_id: slotId,
-      // Write-once customer phone captured from the approved payment request.
-      requestedPhoneNumber: resolvedRequestedPhoneNumber,
-      phoneNumber,
-      phoneAuthority: phoneAuthority || "requested_phone_only",
-      amount,
-      status: "rented",
-      unlockStatus: "pending",
-      transactionId,
-      issuerTransactionId,
-      referenceId,
-      ...waafiAudit,
-      timestamp: now,
-    });
+    // 2. Check if transaction already has a rental (Idempotency)
+    const existingRentalSnap = await tx.get(
+      db.collection(RENTALS_COLLECTION)
+        .where("transactionId", "==", params.transactionId)
+        .limit(1)
+    );
+    
+    if (!existingRentalSnap.empty) {
+      const existing = existingRentalSnap.docs[0];
+      return existing.id;
+    }
 
+    const rental: Omit<RentalRecord, "id"> = {
+      transactionId: params.transactionId,
+      phone: params.phone,
+      stationId: params.stationId,
+      slotId: params.slotId,
+      batteryId: normalizedBatteryId,
+      status: "active",
+      startedAt: now,
+      dueAt: now + RENTAL_DURATION_MS,
+      returnedAt: null,
+      returnStationId: null,
+      verificationConfidence: "HIGH",
+      penaltyApplied: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    tx.set(rentalRef, rental);
+
+    // 3. Update battery state for global tracking (Keep existing fields for compatibility)
     tx.set(
       batteryStateRef,
       {
         battery_id: normalizedBatteryId,
-        imei,
-        stationCode,
-        slot_id: slotId,
+        imei: params.imei || null,
+        stationCode: params.stationId,
+        slot_id: params.slotId,
         activeRentalId: rentalRef.id,
-        phoneNumber,
-        requestedPhoneNumber: resolvedRequestedPhoneNumber,
-        phoneAuthority: phoneAuthority || "requested_phone_only",
-        transactionId,
-        issuerTransactionId,
-        referenceId,
-        amount,
-        status: "rented",
-        claimedAt: batteryState.claimedAt || now,
-        updatedAt: now,
-        waafiAccountNo:
-          typeof waafiAudit?.waafiAccountNo === "string"
-            ? waafiAudit.waafiAccountNo
-            : null,
-        waafiConfirmedPhoneNumber:
-          typeof waafiAudit?.waafiConfirmedPhoneNumber === "string"
-            ? waafiAudit.waafiConfirmedPhoneNumber
-            : null,
+        phoneNumber: params.phone,
+        requestedPhoneNumber: params.requestedPhoneNumber || params.phone,
+        phoneAuthority: params.phoneAuthority || "requested_phone_only",
+        transactionId: params.transactionId,
+        issuerTransactionId: params.issuerTransactionId || null,
+        referenceId: params.referenceId || null,
+        amount: params.amount || 0,
+        status: "active", // New status
+        claimedAt: batteryState.claimedAt || Timestamp.now(),
+        updatedAt: Timestamp.now(),
       },
       { merge: true },
     );
   });
 
-  return rentalRef;
+  return rentalRef.id;
 }
 
+/**
+ * Marks a rental as returned when a battery is detected in a slot.
+ */
+export async function markRentalReturned(params: {
+  batteryId: string;
+  returnStationId: string;
+}) {
+  const db = getDb();
+  const normalizedBatteryId = normalizeBatteryId(params.batteryId) || params.batteryId;
+  const now = Date.now();
+
+  // Find the active rental for this battery
+  const snapshot = await db
+    .collection(RENTALS_COLLECTION)
+    .where("batteryId", "==", normalizedBatteryId)
+    .where("status", "in", ["active", "overdue"])
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    console.warn(`[RETURN_IGNORED] No active rental found for battery: ${normalizedBatteryId}`);
+    return;
+  }
+
+  const rentalDoc = snapshot.docs[0];
+  const rentalId = rentalDoc.id;
+
+  await db.runTransaction(async (tx) => {
+    tx.update(rentalDoc.ref, {
+      status: "returned",
+      returnedAt: now,
+      returnStationId: params.returnStationId,
+      updatedAt: now,
+    });
+
+    // Clear battery state
+    tx.update(db.collection(BATTERY_STATE_COLLECTION).doc(normalizedBatteryId), {
+      status: "available",
+      activeRentalId: null,
+      updatedAt: Timestamp.now(),
+    });
+  });
+
+  console.info(`[RENTAL_RETURNED] Rental: ${rentalId}, Battery: ${normalizedBatteryId}`);
+}
+
+/**
+ * Periodic task to flag overdue rentals.
+ */
+export async function markOverdueRentals() {
+  const db = getDb();
+  const now = Date.now();
+
+  const snapshot = await db
+    .collection(RENTALS_COLLECTION)
+    .where("status", "==", "active")
+    .where("dueAt", "<", now)
+    .get();
+
+  if (snapshot.empty) return;
+
+  const batch = db.batch();
+  for (const doc of snapshot.docs) {
+    batch.update(doc.ref, {
+      status: "overdue",
+      updatedAt: now,
+    });
+    
+    // Also update battery state to overdue
+    const data = doc.data();
+    if (data.batteryId) {
+      batch.update(db.collection(BATTERY_STATE_COLLECTION).doc(data.batteryId), {
+        status: "overdue",
+        updatedAt: Timestamp.now(),
+      });
+    }
+  }
+
+  await batch.commit();
+  console.info(`[OVERDUE_CRON] Marked ${snapshot.size} rentals as overdue`);
+}
+
+// Legacy helpers (updated to use new collection)
 export async function updateRentalUnlockStatus(
   rentalId: string,
   unlockStatus: "unlocked" | "unlock_failed",
 ) {
   return getDb().collection(RENTALS_COLLECTION).doc(rentalId).update({
     unlockStatus,
-    unlockUpdatedAt: Timestamp.now(),
+    unlockUpdatedAt: Date.now(),
+    updatedAt: Date.now(),
   });
 }
 
-export async function markRentalReturnedAfterFailedUnlock(
-  rentalId: string,
-  batteryId: string,
-  note: string,
-) {
-  await getDb().collection(RENTALS_COLLECTION).doc(rentalId).update({
-    status: "returned",
-    returnedAt: Timestamp.now(),
-    note,
-  });
+export async function hasActiveRentalForPhone(
+  phoneNumber: string,
+): Promise<boolean> {
+  const normalizedPhone = String(phoneNumber || "").replace(/\D/g, "");
+  const snapshot = await getDb()
+    .collection(RENTALS_COLLECTION)
+    .where("phone", "==", `+${normalizedPhone}`) // Assuming stored with +
+    .where("status", "in", ["active", "overdue"])
+    .limit(1)
+    .get();
 
-  await clearBatteryStateForRental({
-    batteryId,
-    rentalId,
-    note,
-  });
+  return !snapshot.empty;
 }
 
 /**
  * Get battery IDs from the provided candidate list that currently have any
- * active rental (status="rented"), regardless of which station created it.
- * This prevents cross-station duplicate assignment if a battery was returned
- * to a different station before the old rental got closed.
+ * active rental (status="active" or "overdue").
  */
 export async function getActiveRentedBatteryIds(
   batteryIds: string[],
@@ -184,58 +280,21 @@ export async function getActiveRentedBatteryIds(
     return new Set<string>();
   }
 
-  const activeIds = await getClaimedBatteryIds(uniqueBatteryIds);
-  const candidateIds = new Set(uniqueBatteryIds);
+  const activeIds = new Set<string>();
   const snapshot = await getDb()
     .collection(RENTALS_COLLECTION)
-    .where("status", "==", "rented")
+    .where("status", "in", ["active", "overdue"])
     .get();
 
+  const candidateIds = new Set(uniqueBatteryIds);
   for (const doc of snapshot.docs) {
-    const data = doc.data();
-    const normalizedBatteryId = normalizeBatteryId(data.battery_id);
-    if (
-      normalizedBatteryId &&
-      candidateIds.has(normalizedBatteryId) &&
-      !activeIds.has(normalizedBatteryId)
-    ) {
-      activeIds.add(normalizedBatteryId);
+    const data = doc.data() as RentalRecord;
+    const normalizedId = normalizeBatteryId(data.batteryId);
+    if (normalizedId && candidateIds.has(normalizedId)) {
+      activeIds.add(normalizedId);
     }
   }
 
   return activeIds;
 }
 
-/**
- * Check whether this phone number already has any active rental.
- * Uses a single-field query so no extra composite index is required.
- */
-export async function hasActiveRentalForPhone(
-  phoneNumber: string,
-): Promise<boolean> {
-  const snapshot = await getDb()
-    .collection(RENTALS_COLLECTION)
-    .where("status", "==", "rented")
-    .get();
-
-  const normalizedPhone = String(phoneNumber || "").replace(/\D/g, "");
-
-  return snapshot.docs.some((doc) => {
-    const data = doc.data();
-    const requestedPhone = String(data.requestedPhoneNumber || "").replace(
-      /\D/g,
-      "",
-    );
-    const waafiPhone = String(data.waafiConfirmedPhoneNumber || "").replace(
-      /\D/g,
-      "",
-    );
-    const storedPhone = String(data.phoneNumber || "").replace(/\D/g, "");
-
-    return (
-      requestedPhone === normalizedPhone ||
-      waafiPhone === normalizedPhone ||
-      storedPhone === normalizedPhone
-    );
-  });
-}

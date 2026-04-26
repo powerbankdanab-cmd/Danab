@@ -43,9 +43,12 @@ export async function getClaimedBatteryIds(
     if (!doc.exists) continue;
 
     const data = doc.data() || {};
+    const status = String(data.status || "").toLowerCase();
+    const hasActiveRental = String(data.activeRentalId || "").trim().length > 0;
+    
     if (
-      String(data.status || "").toLowerCase() === "rented" &&
-      String(data.activeRentalId || "").trim().length > 0
+      (status === "rented" || status === "active" || status === "overdue") &&
+      hasActiveRental
     ) {
       claimedIds.add(batteryStateDocId(String(data.battery_id || doc.id)));
     }
@@ -219,7 +222,7 @@ export async function ensureBatteryRentedForTransaction(input: {
       issuerTransactionId: input.issuerTransactionId || null,
       referenceId: input.referenceId || null,
       amount: input.amount,
-      status: "rented",
+      status: "active",
       updatedAt: now,
       claimedAt: now,
     },

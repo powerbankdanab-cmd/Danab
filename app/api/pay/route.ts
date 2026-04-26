@@ -91,12 +91,12 @@ export async function POST(request: NextRequest) {
     await logTransactionEvent(transaction.id, "PAYMENT_INITIATED", {
       phone: parsed.phone,
       amount: parsed.amount,
-    });
+    }, "IMPORTANT");
 
     await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_REQUEST", {
       phone: parsed.phone,
       amount: parsed.amount,
-    });
+    }, "IMPORTANT");
 
     const providerResponse = await requestWaafiPreauthorization({
       phoneNumber: parsed.phone.replace(/\D/g, ""),
@@ -108,7 +108,7 @@ export async function POST(request: NextRequest) {
     await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_RESPONSE", {
       providerResponse,
       hasTransactionId: !!providerIds.transactionId,
-    });
+    }, "IMPORTANT");
 
     const failureReason = detectFailureReason(providerResponse);
     const hasStrongFailureSignal =
@@ -133,7 +133,7 @@ export async function POST(request: NextRequest) {
         await logTransactionEvent(transaction.id, "EXPLICIT_FAILURE_DETECTED", {
           failureReason,
           response: providerResponse,
-        });
+        }, "CRITICAL");
 
         await patchPhase2Transaction({
           id: transaction.id,
@@ -168,7 +168,7 @@ export async function POST(request: NextRequest) {
         await logTransactionEvent(transaction.id, "UNCERTAIN_HOLD_DETECTED", {
           message: "Hold indicated but transactionId missing",
           response: providerResponse,
-        });
+        }, "CRITICAL");
 
         await logError({
           type: "PROVIDER_MISSING_REF",

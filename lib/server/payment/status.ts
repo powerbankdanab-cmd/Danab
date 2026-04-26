@@ -485,7 +485,7 @@ export async function getProviderDrivenPaymentStatus(
   await logTransactionEvent(transactionId, "STATUS_POLL_START", {
     providerRef: providerRefToUse,
     referenceId: providerReferenceId,
-  });
+  }, "DEBUG");
 
   const providerCheck = await checkPaymentStatusDetailed(
     providerRefToUse,
@@ -495,14 +495,14 @@ export async function getProviderDrivenPaymentStatus(
   await logTransactionEvent(transactionId, "STATUS_POLL_RESPONSE", {
     status: providerCheck.status,
     raw: providerCheck.raw,
-  });
+  }, "DEBUG");
 
   if (!providerRefToUse && providerCheck.raw && providerCheck.status !== "unknown") {
     const recoveredIds = extractWaafiIds(providerCheck.raw);
     if (recoveredIds.transactionId) {
       await logTransactionEvent(transactionId, "PROVIDER_REF_RECOVERED", {
         recoveredId: recoveredIds.transactionId,
-      });
+      }, "IMPORTANT");
 
       console.error("CRITICAL_ORPHAN_HOLD_RECOVERED", {
         transactionId,
