@@ -9,11 +9,9 @@ import {
   logTransactionEvent,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
-import { finalizeCapture, cancelHold } from "@/lib/server/payment/process-payment";
+import { finalizeCapture, cancelHold, performEjectionAndVerification } from "@/lib/server/payment/process-payment";
 import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
-import { releaseBattery, queryStationBatteries } from "@/lib/server/payment/heycharge";
-import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
 import { logError } from "@/lib/server/alerts/log-error";
 
@@ -79,35 +77,6 @@ function toReasonCode(
   }
 }
 
-async function getBatteryPresence(
-  imei: string,
-  batteryId: string,
-  slotId: string,
-): Promise<"present" | "missing" | "unknown"> {
-  try {
-    const stationBatteries = await queryStationBatteries(imei);
-    const found = stationBatteries.find(
-      (battery) =>
-        normalizeBatteryId(battery.battery_id) === normalizeBatteryId(batteryId) &&
-        battery.slot_id === slotId,
-    );
-
-    return found ? "present" : "missing";
-  } catch (error) {
-    await logError({
-      type: "STATION_QUERY_FAILED",
-      message: "Failed to query initial battery presence before unlock",
-      metadata: {
-        imei,
-        batteryId,
-        slotId,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    });
-    return "unknown";
-  }
-}
-
 function toMillis(value: unknown): number | null {
   if (!value) return null;
 
@@ -163,6 +132,10 @@ function buildStatusResponse(
     transaction.status === "captured"
   ) {
     return { status: "verified" };
+  }
+
+  if (transaction.status === "held") {
+    return { status: "paid" };
   }
 
   if (transaction.status === "paid") {
@@ -283,31 +256,18 @@ async function handleConfirmRequiredStatus(
   return { status: "confirm_required" };
 }
 
-export async function runUnlockIfNeeded(
+export async function triggerUnlockIfNeeded(
   transaction: PaymentTransactionRecord,
 ): Promise<void> {
-  if (transaction.status !== "paid" || transaction.unlockStarted) {
+  if ((transaction.status !== "paid" && transaction.status !== "held") || transaction.unlockStarted) {
     return;
   }
 
-  if (!transaction.delivery) {
-    console.error("unable_to_start_unlock_flow", {
+  if (!transaction.delivery || !transaction.providerRef) {
+    console.error("invalid_held_state", {
       transactionId: transaction.id,
-      reason: "missing_delivery_payload",
-    });
-    return;
-  }
-
-  const initialPresence = await getBatteryPresence(
-    transaction.delivery.imei,
-    transaction.delivery.batteryId,
-    transaction.delivery.slotId,
-  );
-
-  if (initialPresence !== "present") {
-    console.error("unlock_invalid_initial_state", {
-      transactionId: transaction.id,
-      initialPresence,
+      status: transaction.status,
+      providerRef: transaction.providerRef,
       delivery: transaction.delivery,
     });
 
@@ -320,80 +280,66 @@ export async function runUnlockIfNeeded(
         updatedAtTs: Timestamp.now(),
       },
     });
-
     return;
   }
 
-  const db = getDb();
-  const docRef = db
-    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
-    .doc(transaction.id);
+  if (transaction.status === "paid") {
+    try {
+      await transitionPaymentTransactionState({
+        id: transaction.id,
+        from: "paid",
+        to: "held",
+        patch: {
+          heldAt: Date.now(),
+        },
+      });
 
-  let shouldUnlock = false;
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(docRef);
-    if (!snap.exists) {
-      throw new HttpError(404, "Transaction not found");
+      await logTransactionEvent(transaction.id, "HELD", {
+        providerRef: transaction.providerRef,
+        station: transaction.delivery.stationCode,
+        batteryId: transaction.delivery.batteryId,
+        slotId: transaction.delivery.slotId,
+      }, "IMPORTANT");
+    } catch (error) {
+      if (
+        error instanceof HttpError &&
+        error.status === 409
+      ) {
+        // Another worker or status check already progressed this transaction.
+      } else {
+        throw error;
+      }
     }
-
-    const fresh = snap.data() as PaymentTransactionRecord;
-    if (fresh.status !== "paid" || fresh.unlockStarted) {
-      return;
-    }
-
-    tx.update(docRef, {
-      unlockStarted: true,
-      status: "processing",
-      processingStartedAt: new Date(),
-      updatedAt: Date.now(),
-      updatedAtTs: Timestamp.now(),
-    });
-
-    shouldUnlock = true;
-  });
-
-  if (!shouldUnlock) {
-    return;
   }
 
-  console.info("unlock_started", { transactionId: transaction.id });
-  await logTransactionEvent(transaction.id, "UNLOCK_PROCESS_STARTED", {
-    station: transaction.delivery.stationCode,
-  });
+  const refreshed = await getPaymentTransaction(transaction.id);
+  if (!refreshed || refreshed.unlockStarted || refreshed.status !== "held") {
+    return;
+  }
 
   try {
-    await releaseBattery({
+    await performEjectionAndVerification({
+      idempotencyKey: transaction.id,
+      transactionId: transaction.providerRef,
+      stationCode: transaction.delivery.stationCode,
+      phoneNumber: transaction.delivery.requestedPhoneNumber,
       imei: transaction.delivery.imei,
-      batteryId: transaction.delivery.batteryId,
-      slotId: transaction.delivery.slotId,
-    });
-
-    await patchPaymentTransaction({
-      id: transaction.id,
-      patch: {
-        status: "verifying",
-        updatedAt: Date.now(),
-        updatedAtTs: Timestamp.now(),
+      battery: {
+        battery_id: transaction.delivery.batteryId,
+        slot_id: transaction.delivery.slotId,
       },
+      preauthAudit: transaction.waafiAudit as Record<string, unknown>,
+      phoneAuthority: transaction.delivery.phoneAuthority,
+      canonicalPhoneNumber: transaction.delivery.canonicalPhoneNumber,
     });
-    await logTransactionEvent(transaction.id, "UNLOCK_SUCCESS", {});
   } catch (error) {
-    console.error("unlock_failed", {
+    await logError({
+      type: "UNLOCK_TRIGGER_FAILED",
       transactionId: transaction.id,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await logTransactionEvent(transaction.id, "UNLOCK_FAILED", {
+      message: "Failed to perform unlock and verification from held/paid recovery path",
+      metadata: {
+        status: transaction.status,
         error: error instanceof Error ? error.message : String(error),
-    });
-
-    await patchPaymentTransaction({
-      id: transaction.id,
-      patch: {
-        status: "failed",
-        failureReason: "UNLOCK_FAILED",
-        updatedAt: Date.now(),
-        updatedAtTs: Timestamp.now(),
       },
     });
   }
@@ -408,21 +354,37 @@ export async function getProviderDrivenPaymentStatus(
     throw new HttpError(404, "Transaction not found");
   }
 
-  if (transaction.status === "paid") {
+  if (transaction.status === "paid" || transaction.status === "held") {
+    const heldAtMs = toMillis(transaction.heldAt ?? transaction.updatedAt) ?? Date.now();
+    const heldAgeMs = Date.now() - heldAtMs;
+
     if (!transaction.unlockStarted) {
       console.info("unlock_fallback_triggered", {
         transactionId,
       });
 
-      runUnlockIfNeeded(transaction).catch((err) => {
-        console.error("unlock_fallback_failed", {
-          transactionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
+      await triggerUnlockIfNeeded(transaction);
+    } else if (transaction.status === "held" && heldAgeMs > 30_000) {
+      await logError({
+        type: "HELD_STALL",
+        transactionId,
+        message: "Held transaction exceeded SLA and was still waiting for unlock",
+        metadata: {
+          heldAgeMs,
+          unlockStarted: transaction.unlockStarted,
+        },
       });
+
+      await cancelHold(transaction.id, "Unlock timed out after held state");
+      return {
+        status: "failed",
+        reason_code: "UNLOCK_TIMEOUT",
+        failureReason: "UNLOCK_TIMEOUT",
+      };
     }
 
-    return buildStatusResponse(transaction);
+    const refreshed = await getPaymentTransaction(transactionId);
+    return buildStatusResponse(refreshed || transaction);
   }
 
   if (transaction.status === "processing") {
@@ -524,7 +486,7 @@ export async function getProviderDrivenPaymentStatus(
     });
   } else {
     const elapsedMs = Date.now() - createdAtMs;
-    
+
     if (
       transaction.status === "pending_payment" &&
       elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS
@@ -654,7 +616,7 @@ export async function getProviderDrivenPaymentStatus(
 
   if (providerCheck.status === "cancelled" || providerCheck.status === "failed") {
     const reason = providerCheck.reason || "PROVIDER_ERROR";
-    
+
     await logTransactionEvent(transactionId, "PROVIDER_FAILURE_DETECTED", {
       reason,
       raw: providerCheck.raw,

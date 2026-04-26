@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { isHttpError } from "@/lib/server/payment/errors";
 import { getPaymentTransaction } from "@/lib/server/payment/transactions";
-import { runUnlockIfNeeded } from "@/lib/server/payment/status";
+import { triggerUnlockIfNeeded } from "@/lib/server/payment/status";
 
 export async function POST(request: NextRequest) {
     try {
@@ -25,7 +25,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        await runUnlockIfNeeded(transaction);
+        await triggerUnlockIfNeeded(transaction);
 
         const refreshed = await getPaymentTransaction(transactionId);
         if (!refreshed) {

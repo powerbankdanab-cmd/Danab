@@ -407,7 +407,15 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .limit(limit)
     .get();
 
-  // Query 4 (Phase 4): capture_in_progress stuck for >60s (crash recovery)
+  // Query 4: held transactions that never started unlock
+  const heldSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "held")
+    .where("unlockStarted", "==", false)
+    .limit(limit)
+    .get();
+
+  // Query 5 (Phase 4): capture_in_progress stuck for >60s (crash recovery)
   const captureInProgressSnap = await db
     .collection(PAYMENT_TRANSACTIONS_COLLECTION)
     .where("status", "==", "capture_in_progress")
@@ -437,6 +445,12 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     results.push(doc.data() as PaymentTransactionRecord);
   }
 
+  // Add held transactions waiting for unlock
+  for (const doc of heldSnap.docs) {
+    if (results.length >= limit) break;
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
   // Add captured without rental (only up to limit)
   for (const doc of capturedSnap.docs) {
     if (results.length >= limit) break;
@@ -459,6 +473,19 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
   }
 
   return results;
+}
+
+export async function listHeldTransactionsWithoutUnlock(limit = 20) {
+  const db = getDb();
+  const heldSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "held")
+    .where("unlockStarted", "==", false)
+    .orderBy("updatedAt")
+    .limit(limit)
+    .get();
+
+  return heldSnap.docs.map((doc) => doc.data() as PaymentTransactionRecord);
 }
 
 export async function claimTransactionRecovery(input: {
@@ -735,8 +762,8 @@ export async function logTransactionEvent(
       const expiresAt = Timestamp.fromDate(new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000));
 
       // 7. Create Event Document
-      const eventDoc: TransactionEvent & { 
-        idempotencyKey?: string; 
+      const eventDoc: TransactionEvent & {
+        idempotencyKey?: string;
         schemaVersion: number;
         createdAtTs: Timestamp;
         actor: string;
@@ -768,10 +795,10 @@ export async function logTransactionEvent(
       if (isTerminal && !alreadyTerminal) {
         updatePatch.finalStep = event;
         updatePatch.processingTimeMs = Date.now() - (
-          typeof data.createdAt === "number" ? data.createdAt : 
-          (data.createdAt as any)?.toMillis ? (data.createdAt as any).toMillis() : 
-          (data.createdAt as any)?.seconds ? (data.createdAt as any).seconds * 1000 :
-          Date.now()
+          typeof data.createdAt === "number" ? data.createdAt :
+            (data.createdAt as any)?.toMillis ? (data.createdAt as any).toMillis() :
+              (data.createdAt as any)?.seconds ? (data.createdAt as any).seconds * 1000 :
+                Date.now()
         );
       } else if (!alreadyTerminal) {
         // Only update progress if we haven't reached a terminal state yet

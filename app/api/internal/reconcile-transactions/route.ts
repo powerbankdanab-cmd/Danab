@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   listStaleTransactionsForReconciliation,
+  listHeldTransactionsWithoutUnlock,
   claimTransactionRecovery,
   releaseTransactionRecovery,
   finalizeCapture,
@@ -8,7 +9,10 @@ import {
   transitionPaymentTransactionState,
   resumePendingPayment,
 } from "@/lib/server/payment-service";
-import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
+import {
+  getProviderDrivenPaymentStatus,
+  triggerUnlockIfNeeded,
+} from "@/lib/server/payment/status";
 import { checkPaymentStatus } from "@/lib/server/payment/waafi";
 import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 import { getOptionalEnv } from "@/lib/server/env";
@@ -43,6 +47,18 @@ async function reconcile(request: NextRequest) {
 
     // 2. Fetch Stale Transactions (Ordered by updatedAt)
     const staleTransactions = await listStaleTransactionsForReconciliation(20);
+
+    const brokenHeld = await listHeldTransactionsWithoutUnlock(20);
+    if (brokenHeld.length > 0) {
+      await logError({
+        type: "INVARIANT_BROKEN_HELD_WITHOUT_UNLOCK",
+        message: "Held transactions were found without unlockStarted set",
+        metadata: {
+          brokenCount: brokenHeld.length,
+          transactionIds: brokenHeld.map((tx) => tx.id),
+        },
+      });
+    }
 
     const stats = {
       processed: staleTransactions.length,
@@ -125,6 +141,27 @@ async function reconcile(request: NextRequest) {
             }
           });
         }
+        // Stuck verification recovery
+        else if (tx.status === "verifying") {
+          const verifyingAtMs = toMillis(tx.processingStartedAt ?? tx.updatedAt) ?? Date.now();
+          if (Date.now() - verifyingAtMs > 30_000) {
+            await logError({
+              type: "VERIFICATION_STUCK",
+              transactionId: tx.id,
+              stationCode: tx.station,
+              message: "[RECON] Stuck verification state exceeded timeout",
+              metadata: {
+                verifyingAgeMs: Date.now() - verifyingAtMs,
+                unlockStarted: tx.unlockStarted,
+              },
+            });
+
+            await cancelHold(tx.id, "Verification timed out while stuck in verifying");
+            stats.cancelled++;
+          } else {
+            stats.locked++;
+          }
+        }
         // Phase 4: verified + captureAttempted crash recovery
         else if (tx.status === "verified" && tx.captureAttempted) {
           await finalizeCapture(tx.id);
@@ -142,7 +179,36 @@ async function reconcile(request: NextRequest) {
             }
           });
         }
-        else if (tx.status === "pending_payment") {
+        else if (tx.status === "held" && tx.unlockStarted !== true) {
+          try {
+            await triggerUnlockIfNeeded(tx);
+            stats.repaired++;
+
+            await logError({
+              type: "HELD_UNLOCK_RECOVERY",
+              transactionId: tx.id,
+              stationCode: tx.station,
+              message: "[RECON] Triggered unlock recovery for held transaction",
+              metadata: {
+                action: "HELD_UNLOCK_RECOVERY",
+                station: tx.station,
+                unlockStarted: tx.unlockStarted,
+              },
+            });
+          } catch (heldRecoveryError) {
+            stats.errors++;
+            await logError({
+              type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+              transactionId: tx.id,
+              stationCode: tx.station,
+              message: "[RECON] Failed to recover held transaction",
+              metadata: {
+                error: heldRecoveryError instanceof Error ? heldRecoveryError.message : String(heldRecoveryError),
+                station: tx.station,
+              },
+            });
+          }
+        } else if (tx.status === "pending_payment") {
           const paymentResult = await checkPaymentStatus(
             tx.providerRef,
             tx.providerReferenceId,

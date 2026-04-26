@@ -10,6 +10,7 @@ export {
   patchPaymentTransaction,
   transitionPaymentTransactionState,
   listStaleTransactionsForReconciliation,
+  listHeldTransactionsWithoutUnlock,
   claimTransactionRecovery,
   releaseTransactionRecovery
 } from "@/lib/server/payment/transactions";

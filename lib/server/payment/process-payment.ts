@@ -518,6 +518,10 @@ export async function processPayment(
       );
     }
 
+    if (!transactionId || !reservedBatteryId || !battery?.slot_id) {
+      throw new HttpError(500, "INVALID_HELD_STATE");
+    }
+
     try {
       await transitionPaymentTransactionState({
         id: idempotencyKey,
@@ -528,8 +532,27 @@ export async function processPayment(
           providerIssuerRef: issuerTransactionId,
           providerReferenceId: referenceId || preauthReferenceId,
           heldAt: Date.now(),
+          waafiAudit: preauthAudit,
+          delivery: {
+            imei,
+            stationCode,
+            batteryId: reservedBatteryId,
+            slotId: battery.slot_id,
+            phoneAuthority,
+            unlockAttempts: 0,
+            requestedPhoneNumber: phoneNumber,
+            canonicalPhoneNumber,
+          },
         },
       });
+
+      await logTransactionEvent(idempotencyKey, "HELD", {
+        providerRef: transactionId,
+        station: stationCode,
+        batteryId: reservedBatteryId,
+        slotId: battery.slot_id,
+        amount,
+      }, "IMPORTANT");
     } catch (stateError) {
       let cancelError: unknown = null;
       try {
@@ -635,11 +658,23 @@ export async function processPayment(
     }
 
     await ensurePaymentTransactionState(idempotencyKey, "held");
+    const currentBattery = battery;
+    await patchPaymentTransaction({
+      id: idempotencyKey,
+      patch: {
+        unlockStarted: true,
+        processingStartedAt: Date.now(),
+      },
+    });
+    await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
+      station: stationCode,
+      batteryId: currentBattery.battery_id,
+      slotId: currentBattery.slot_id,
+    }, "IMPORTANT");
 
     let unlock: unknown = null;
     let unlockAttempts = 0;
     let lastUnlockError: unknown = null;
-    const currentBattery = battery;
     let lastKnownPresence: BatteryPresence = "unknown";
     let verifiedEjection = false;
     let unlockCommandAccepted = false;
@@ -1447,7 +1482,7 @@ export async function handleUserConfirmation(
 /**
  * Shared hardware ejection and verification logic.
  */
-async function performEjectionAndVerification(input: {
+export async function performEjectionAndVerification(input: {
   idempotencyKey: string;
   transactionId: string;
   stationCode: string;
@@ -1472,9 +1507,22 @@ async function performEjectionAndVerification(input: {
 
   await ensurePaymentTransactionState(idempotencyKey, "held");
 
+  const currentBattery = battery;
+  await patchPaymentTransaction({
+    id: idempotencyKey,
+    patch: {
+      unlockStarted: true,
+      processingStartedAt: Date.now(),
+    },
+  });
+  await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
+    station: stationCode,
+    batteryId: currentBattery.battery_id,
+    slotId: currentBattery.slot_id,
+  }, "IMPORTANT");
+
   let unlockAttempts = 0;
   let lastUnlockError: unknown = null;
-  const currentBattery = battery;
   let confidence: DeliveryConfidence = "LOW";
   let verification: VerificationResult | null = null;
 
@@ -1506,6 +1554,12 @@ async function performEjectionAndVerification(input: {
     try {
       lastUnlockStartedAt = Date.now();
       await releaseBattery({ imei, batteryId: currentBattery.battery_id, slotId: currentBattery.slot_id });
+      await logTransactionEvent(idempotencyKey, "UNLOCK_SUCCESS", {
+        attempt,
+        batteryId: currentBattery.battery_id,
+        slotId: currentBattery.slot_id,
+      }, "IMPORTANT");
+
       verification = await verifyDeliveryWithConfidence(imei, currentBattery.battery_id, currentBattery.slot_id, {
         stationCode,
         phoneNumber,
@@ -1523,13 +1577,21 @@ async function performEjectionAndVerification(input: {
       });
     } catch (err) {
       lastUnlockError = err;
+      await logTransactionEvent(idempotencyKey, "UNLOCK_FAILED", {
+        attempt,
+        error: err instanceof Error ? err.message : String(err),
+      }, "CRITICAL");
     }
-
-    if (Date.now() - processStartTime > 12000) break;
   }
 
   // Final Decision
   if (confidence === "MEDIUM") {
+    await logTransactionEvent(idempotencyKey, "VERIFICATION_MEDIUM", {
+      unlockAttempts,
+      batteryId: currentBattery.battery_id,
+      slotId: currentBattery.slot_id,
+    }, "IMPORTANT");
+
     await transitionPaymentTransactionState({
       id: idempotencyKey,
       from: "held",
@@ -1555,11 +1617,26 @@ async function performEjectionAndVerification(input: {
 
   if (confidence !== "HIGH") {
     const failureNote = (lastUnlockError instanceof Error ? lastUnlockError.message : String(lastUnlockError || "")) || `Low confidence: ${confidence}`;
+    if (confidence === "LOW") {
+      await logTransactionEvent(idempotencyKey, "VERIFICATION_LOW", {
+        unlockAttempts,
+        batteryId: currentBattery.battery_id,
+        slotId: currentBattery.slot_id,
+        failureNote,
+      }, "CRITICAL");
+    }
     await cancelHold(transactionId, "Battery ejection not verified");
     await markTransactionFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
 
     throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
   }
+
+  await logTransactionEvent(idempotencyKey, "VERIFICATION_HIGH", {
+    unlockAttempts,
+    batteryId: currentBattery.battery_id,
+    slotId: currentBattery.slot_id,
+    confidence,
+  }, "IMPORTANT");
 
   return finalizeCapture(idempotencyKey);
 }
@@ -1569,10 +1646,10 @@ async function performEjectionAndVerification(input: {
  * once it is verified as PAID.
  */
 export async function resumePendingPayment(transaction: PaymentTransactionRecord) {
-  const { id: idempotencyKey, phone: phoneNumber, station: stationCode, delivery, waafiAudit } = transaction;
+  const { id: idempotencyKey, phone: phoneNumber, station: stationCode, delivery, waafiAudit, providerRef } = transaction;
 
-  if (!delivery || !waafiAudit) {
-    throw new Error("Cannot resume pending payment: missing delivery/audit metadata");
+  if (!providerRef || !delivery || !waafiAudit) {
+    throw new Error("INVALID_HELD_STATE");
   }
 
   const { imei, batteryId, slotId } = delivery;
