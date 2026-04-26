@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   createMinimalTransaction,
   patchPhase2Transaction,
+  logTransactionEvent,
 } from "@/lib/server/payment/transactions";
 import {
   classifyWaafiPaymentStatus,
@@ -65,8 +66,6 @@ function parseAndValidateBody(body: PaymentRequestBody) {
   } as const;
 }
 
-
-
 export async function POST(request: NextRequest) {
   let body: PaymentRequestBody;
 
@@ -88,12 +87,28 @@ export async function POST(request: NextRequest) {
 
   try {
     const transaction = await createMinimalTransaction(parsed);
+
+    await logTransactionEvent(transaction.id, "PAYMENT_INITIATED", {
+      phone: parsed.phone,
+      amount: parsed.amount,
+    });
+
+    await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_REQUEST", {
+      phone: parsed.phone,
+      amount: parsed.amount,
+    });
+
     const providerResponse = await requestWaafiPreauthorization({
       phoneNumber: parsed.phone.replace(/\D/g, ""),
       amount: parsed.amount,
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
+
+    await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_RESPONSE", {
+      providerResponse,
+      hasTransactionId: !!providerIds.transactionId,
+    });
 
     const failureReason = detectFailureReason(providerResponse);
     const hasStrongFailureSignal =
@@ -113,6 +128,11 @@ export async function POST(request: NextRequest) {
         console.log("EXPLICIT_FAILURE_DETECTED:", {
           transactionId: transaction.id,
           failureReason,
+        });
+
+        await logTransactionEvent(transaction.id, "EXPLICIT_FAILURE_DETECTED", {
+          failureReason,
+          response: providerResponse,
         });
 
         await patchPhase2Transaction({
@@ -145,6 +165,11 @@ export async function POST(request: NextRequest) {
           transactionId: transaction.id,
         });
 
+        await logTransactionEvent(transaction.id, "UNCERTAIN_HOLD_DETECTED", {
+          message: "Hold indicated but transactionId missing",
+          response: providerResponse,
+        });
+
         await logError({
           type: "PROVIDER_MISSING_REF",
           transactionId: transaction.id,
@@ -170,6 +195,10 @@ export async function POST(request: NextRequest) {
       console.error("UNKNOWN_PREAUTH_STATE_FAILING_SAFE", {
         providerResponse,
         transactionId: transaction.id,
+      });
+
+      await logTransactionEvent(transaction.id, "UNKNOWN_PREAUTH_STATE_FAILURE", {
+        response: providerResponse,
       });
 
       await logError({
@@ -205,6 +234,10 @@ export async function POST(request: NextRequest) {
         providerRef: providerIds.transactionId,
         status: "pending_payment",
       },
+    });
+
+    await logTransactionEvent(transaction.id, "PAYMENT_AWAITING_PIN", {
+      providerRef: providerIds.transactionId,
     });
 
     return NextResponse.json({

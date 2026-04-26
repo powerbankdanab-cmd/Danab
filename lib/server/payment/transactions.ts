@@ -628,3 +628,24 @@ export async function guardedTransitionPaymentTransactionState(input: {
     } as PaymentTransactionRecord;
   });
 }
+export async function logTransactionEvent(
+  transactionId: string,
+  event: string,
+  metadata?: Record<string, unknown>,
+) {
+  try {
+    await getDb()
+      .collection("transaction_events")
+      .add({
+        transactionId,
+        event,
+        ...(metadata ? { metadata } : {}),
+        createdAt: Date.now(),
+      });
+  } catch (error) {
+    console.error(
+      `[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`,
+      error,
+    );
+  }
+}

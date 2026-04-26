@@ -6,6 +6,7 @@ import {
   transitionPaymentTransactionState,
   PAYMENT_TRANSACTIONS_COLLECTION,
   PaymentTransactionRecord,
+  logTransactionEvent,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
 import { finalizeCapture, cancelHold } from "@/lib/server/payment/process-payment";
@@ -357,6 +358,9 @@ export async function runUnlockIfNeeded(
   }
 
   console.info("unlock_started", { transactionId: transaction.id });
+  await logTransactionEvent(transaction.id, "UNLOCK_PROCESS_STARTED", {
+    station: transaction.delivery.stationCode,
+  });
 
   try {
     await releaseBattery({
@@ -373,10 +377,14 @@ export async function runUnlockIfNeeded(
         updatedAtTs: Timestamp.now(),
       },
     });
+    await logTransactionEvent(transaction.id, "UNLOCK_SUCCESS", {});
   } catch (error) {
     console.error("unlock_failed", {
       transactionId: transaction.id,
       error: error instanceof Error ? error.message : String(error),
+    });
+    await logTransactionEvent(transaction.id, "UNLOCK_FAILED", {
+        error: error instanceof Error ? error.message : String(error),
     });
 
     await patchPaymentTransaction({
@@ -474,14 +482,28 @@ export async function getProviderDrivenPaymentStatus(
     providerReferenceId = transactionId;
   }
 
+  await logTransactionEvent(transactionId, "STATUS_POLL_START", {
+    providerRef: providerRefToUse,
+    referenceId: providerReferenceId,
+  });
+
   const providerCheck = await checkPaymentStatusDetailed(
     providerRefToUse,
     providerReferenceId,
   );
 
+  await logTransactionEvent(transactionId, "STATUS_POLL_RESPONSE", {
+    status: providerCheck.status,
+    raw: providerCheck.raw,
+  });
+
   if (!providerRefToUse && providerCheck.raw && providerCheck.status !== "unknown") {
     const recoveredIds = extractWaafiIds(providerCheck.raw);
     if (recoveredIds.transactionId) {
+      await logTransactionEvent(transactionId, "PROVIDER_REF_RECOVERED", {
+        recoveredId: recoveredIds.transactionId,
+      });
+
       console.error("CRITICAL_ORPHAN_HOLD_RECOVERED", {
         transactionId,
         recoveredProviderRef: recoveredIds.transactionId,
@@ -571,12 +593,20 @@ export async function getProviderDrivenPaymentStatus(
           };
         }
 
+        await logTransactionEvent(transactionId, "PROTECTED_ORPHAN_PREVENTION_ACTIVE", {
+          elapsedMs,
+        });
+
         console.warn("PROTECTED_ORPHAN_PREVENTION: 30s threshold reached for missingProviderRef", {
           transactionId,
           phone: transaction.phone,
         });
         return { status: "pending_payment" };
       }
+
+      await logTransactionEvent(transactionId, "ORPHAN_PAYMENT_DETECTED", {
+        elapsedMs,
+      });
 
       console.error("ORPHAN_PAYMENT_DETECTED", {
         transactionId,
@@ -625,6 +655,11 @@ export async function getProviderDrivenPaymentStatus(
   if (providerCheck.status === "cancelled" || providerCheck.status === "failed") {
     const reason = providerCheck.reason || "PROVIDER_ERROR";
     
+    await logTransactionEvent(transactionId, "PROVIDER_FAILURE_DETECTED", {
+      reason,
+      raw: providerCheck.raw,
+    });
+
     const status = await completePhase2Transaction({
       id: transactionId,
       status: "failed",
@@ -644,6 +679,10 @@ export async function getProviderDrivenPaymentStatus(
   }
 
   if (providerCheck.status === "paid") {
+    await logTransactionEvent(transactionId, "PROVIDER_PAID_DETECTED", {
+      providerRef: providerRefToUse,
+    });
+
     await completePhase2Transaction({
       id: transactionId,
       status: "paid",

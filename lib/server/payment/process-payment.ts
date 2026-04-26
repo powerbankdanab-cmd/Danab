@@ -34,6 +34,7 @@ import {
   patchPaymentTransaction,
   transitionPaymentTransactionState,
   PaymentTransactionRecord,
+  logTransactionEvent,
 } from "@/lib/server/payment/transactions";
 import { reconcileTransactionById } from "@/lib/server/payment/reconciliation";
 import {
@@ -1232,6 +1233,11 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
 
       // ── Transition to capture_in_progress ─────────────────────────
       if (tx.status !== "capture_in_progress") {
+        await logTransactionEvent(idempotencyKey, "CAPTURE_INITIATED", {
+          providerRef: transactionId,
+          attempt: retryCount + 1,
+        });
+
         await transitionPaymentTransactionState({
           id: idempotencyKey,
           from: "verified",
@@ -1306,6 +1312,11 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
         },
       });
 
+      await logTransactionEvent(idempotencyKey, "PROVIDER_CAPTURE_SUCCESS", {
+        providerCaptureRef: captureRef,
+        attempt: retryCount + 1,
+      });
+
       await logError({
         type: "CAPTURE_SUCCESS",
         transactionId: idempotencyKey,
@@ -1349,6 +1360,11 @@ export async function cancelHold(idempotencyKey: string, reason: string): Promis
   }
 
   if (tx.providerRef) {
+    await logTransactionEvent(idempotencyKey, "CANCELLING_PROVIDER_HOLD", {
+      providerRef: tx.providerRef,
+      reason,
+    });
+
     await cancelWaafiPreauthorization({
       transactionId: tx.providerRef,
       description: reason,
@@ -1392,6 +1408,10 @@ export async function handleUserConfirmation(
   if (!tx || tx.status !== "confirm_required") {
     throw new HttpError(400, `Confirmation not allowed for status: ${tx?.status || "unknown"}`);
   }
+
+  await logTransactionEvent(idempotencyKey, "USER_CONFIRMATION_RECEIVED", {
+    confirmed,
+  });
 
   await logError({
     type: "USER_CONFIRMATION",
