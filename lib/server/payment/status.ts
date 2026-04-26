@@ -536,12 +536,35 @@ export async function getProviderDrivenPaymentStatus(
 
   if (!providerRefToUse) {
     const createdAtMs = toMillis(transaction.createdAt);
+    const elapsedMs = createdAtMs ? Date.now() - createdAtMs : 0;
 
-    if (createdAtMs && Date.now() - createdAtMs > 30_000) {
+    if (elapsedMs > 30_000) {
       if (transaction.missingProviderRef === true) {
-        // DO NOT fail blindly if we suspect a hold exists without a ref.
-        // Keep it pending_payment so it can be resolved manually or via deeper reconciliation.
-        console.warn("PROTECTED_ORPHAN_PREVENTION: 30s timeout reached but missingProviderRef is set", {
+        // SECOND TIMEOUT: After 3 minutes, we must terminate the state to avoid infinite pending.
+        if (elapsedMs > 180_000) {
+          console.error("UNRESOLVABLE_HOLD_TIMEOUT", { transactionId });
+
+          await logError({
+            type: "UNRESOLVABLE_HOLD",
+            transactionId,
+            message: "Hold likely created but transactionId never recovered after 180s",
+            metadata: { phone: transaction.phone },
+          });
+
+          await completePhase2Transaction({
+            id: transactionId,
+            status: "failed",
+            failureReason: "PROVIDER_ERROR",
+          });
+
+          return {
+            status: "failed",
+            reason_code: "PROVIDER_ERROR",
+            failureReason: "PROVIDER_ERROR",
+          };
+        }
+
+        console.warn("PROTECTED_ORPHAN_PREVENTION: 30s threshold reached for missingProviderRef", {
           transactionId,
           phone: transaction.phone,
         });
