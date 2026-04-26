@@ -468,7 +468,7 @@ export async function getProviderDrivenPaymentStatus(
   let providerReferenceId: string | null = null;
 
   if (!providerRefToUse) {
-    console.warn("MISSING providerRef - attempting fallback recovery via transactionId", {
+    console.warn("FALLBACK_PROVIDER_LOOKUP_USED: Attempting recovery via transactionId (referenceId)", {
       transactionId,
     });
     providerReferenceId = transactionId;
@@ -507,7 +507,14 @@ export async function getProviderDrivenPaymentStatus(
       transaction.status === "pending_payment" &&
       elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS
     ) {
-      if (providerRefToUse && (providerCheck.status === "pending" || providerCheck.status === "paid")) {
+      // If the provider already marked it as paid, we should NOT cancel it.
+      // We should let the polling logic below handle the successful transition.
+      if (providerCheck.status === "paid") {
+        console.warn("TIMEOUT_PREEMPTED: Provider is PAID, skipping timeout failure", { transactionId });
+        return { status: "pending_payment" };
+      }
+
+      if (providerRefToUse && providerCheck.status === "pending") {
         console.error("CRITICAL_TIMEOUT_CANCEL: Cancelling orphaned provider hold due to timeout", { transactionId, providerRefToUse });
         try {
           await cancelWaafiPreauthorization({
