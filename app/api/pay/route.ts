@@ -152,6 +152,28 @@ export async function POST(request: NextRequest) {
     });
 
     if (!providerIds.transactionId) {
+      const waafiStatus = classifyWaafiPaymentStatus(providerResponse);
+
+      if (waafiStatus === "pending" || waafiStatus === "paid") {
+        console.error("CRITICAL_ORPHAN_HOLD_RISK: Waafi hold created but no transactionId returned", {
+          transactionId: transaction.id,
+          response: providerResponse,
+        });
+
+        await patchPhase2Transaction({
+          id: transaction.id,
+          patch: {
+            status: "pending_payment",
+          },
+        });
+
+        return NextResponse.json({
+          transactionId: transaction.id,
+          status: "pending_payment",
+          providerRef: null,
+        });
+      }
+
       const failureReason = detectFailureReason(providerResponse);
 
       console.log("NO PROVIDER REF CASE:", {

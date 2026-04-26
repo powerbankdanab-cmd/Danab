@@ -7,7 +7,7 @@ import {
   PAYMENT_TRANSACTIONS_COLLECTION,
   PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";
-import { checkPaymentStatusDetailed } from "@/lib/server/payment/waafi";
+import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
 import { finalizeCapture, cancelHold } from "@/lib/server/payment/process-payment";
 import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
@@ -464,6 +464,36 @@ export async function getProviderDrivenPaymentStatus(
     return buildStatusResponse(transaction);
   }
 
+  let providerRefToUse = transaction.providerRef;
+  let providerReferenceId: string | null = null;
+
+  if (!providerRefToUse) {
+    console.warn("MISSING providerRef - attempting fallback recovery via transactionId", {
+      transactionId,
+    });
+    providerReferenceId = transactionId;
+  }
+
+  const providerCheck = await checkPaymentStatusDetailed(
+    providerRefToUse,
+    providerReferenceId,
+  );
+
+  if (!providerRefToUse && providerCheck.raw && providerCheck.status !== "unknown") {
+    const recoveredIds = extractWaafiIds(providerCheck.raw);
+    if (recoveredIds.transactionId) {
+      console.error("CRITICAL_ORPHAN_HOLD_RECOVERED", {
+        transactionId,
+        recoveredProviderRef: recoveredIds.transactionId,
+      });
+      await patchPaymentTransaction({
+        id: transaction.id,
+        patch: { providerRef: recoveredIds.transactionId },
+      });
+      providerRefToUse = recoveredIds.transactionId;
+    }
+  }
+
   const createdAtMs = toMillis(transaction.createdAt);
   if (!createdAtMs) {
     console.error("MISSING createdAt - cannot evaluate timeout", {
@@ -472,17 +502,23 @@ export async function getProviderDrivenPaymentStatus(
     });
   } else {
     const elapsedMs = Date.now() - createdAtMs;
-    console.log("TIME CHECK:", {
-      transactionId,
-      createdAtMs,
-      now: Date.now(),
-      elapsedMs,
-    });
-
+    
     if (
       transaction.status === "pending_payment" &&
       elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS
     ) {
+      if (providerRefToUse && (providerCheck.status === "pending" || providerCheck.status === "paid")) {
+        console.error("CRITICAL_TIMEOUT_CANCEL: Cancelling orphaned provider hold due to timeout", { transactionId, providerRefToUse });
+        try {
+          await cancelWaafiPreauthorization({
+            transactionId: providerRefToUse,
+            description: "Payment pending_payment timed out",
+          });
+        } catch (e) {
+          console.error("Failed to cancel orphan hold on timeout", e);
+        }
+      }
+
       const status = await completePhase2Transaction({
         id: transactionId,
         status: "failed",
@@ -498,24 +534,19 @@ export async function getProviderDrivenPaymentStatus(
     }
   }
 
-  if (!transaction.providerRef) {
+  if (!providerRefToUse && providerCheck.status === "unknown") {
     console.info("payment_status_checked", {
       transactionId,
       providerRef: null,
-      providerStatus: "missing_provider_ref",
+      providerStatus: "missing_provider_ref_unrecoverable",
     });
 
     return { status: "pending_payment" };
   }
 
-  const providerCheck = await checkPaymentStatusDetailed(
-    transaction.providerRef,
-    null,
-  );
-
   console.info("payment_status_checked", {
     transactionId,
-    providerRef: transaction.providerRef,
+    providerRef: providerRefToUse,
     providerStatus: providerCheck.status,
     providerResponseCode:
       providerCheck.raw?.responseCode !== undefined
