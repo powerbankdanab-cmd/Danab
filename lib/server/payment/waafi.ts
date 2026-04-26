@@ -301,10 +301,44 @@ export function classifyWaafiPaymentStatus(
   return "unknown";
 }
 
+export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_ERROR" {
+  const text =
+    (raw?.responseMsg || "") +
+    " " +
+    (raw?.params?.state || "") +
+    " " +
+    (raw?.errorCode || "");
+
+  const normalized = text.toLowerCase();
+
+  if (
+    normalized.includes("insufficient") ||
+    normalized.includes("balance") ||
+    normalized.includes("not enough") ||
+    normalized.includes("haraaga") ||
+    normalized.includes("funds")
+  ) {
+    return "INSUFFICIENT_FUNDS";
+  }
+
+  if (
+    normalized.includes("cancel") ||
+    normalized.includes("dismiss") ||
+    normalized.includes("abort") ||
+    normalized.includes("user") ||
+    normalized.includes("revers")
+  ) {
+    return "USER_CANCELLED";
+  }
+
+  return "PROVIDER_ERROR";
+}
+
 export type WaafiPaymentStatusCheck = {
   status: "pending" | "paid" | "cancelled" | "failed" | "unknown";
   raw?: WaafiResponse;
   error?: string;
+  reason?: "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_ERROR";
 };
 
 export async function checkPaymentStatusDetailed(
@@ -322,7 +356,11 @@ export async function checkPaymentStatusDetailed(
       });
       const transactionStatus = classifyWaafiPaymentStatus(byTransactionId);
       if (transactionStatus !== "unknown") {
-        return { status: transactionStatus, raw: byTransactionId };
+        return { 
+          status: transactionStatus, 
+          raw: byTransactionId,
+          reason: detectFailureReason(byTransactionId)
+        };
       }
     }
 
@@ -333,6 +371,7 @@ export async function checkPaymentStatusDetailed(
       return {
         status: classifyWaafiPaymentStatus(byReferenceId),
         raw: byReferenceId,
+        reason: detectFailureReason(byReferenceId)
       };
     }
 

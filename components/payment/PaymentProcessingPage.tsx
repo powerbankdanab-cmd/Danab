@@ -33,6 +33,7 @@ type ApiResponse = {
   | "failed";
   reason_code?:
   | "USER_CANCELLED"
+  | "INSUFFICIENT_FUNDS"
   | "INSUFFICIENT_BALANCE"
   | "WRONG_PIN"
   | "TIMEOUT"
@@ -144,8 +145,8 @@ export function PaymentProcessingPage() {
       return "TIMEOUT";
     }
 
-    if (rawReason === "INSUFFICIENT_BALANCE") {
-      return "INSUFFICIENT_BALANCE";
+    if (rawReason === "INSUFFICIENT_FUNDS" || rawReason === "INSUFFICIENT_BALANCE") {
+      return "INSUFFICIENT_FUNDS";
     }
 
     if (rawReason === "PROVIDER_ERROR") {
@@ -172,6 +173,10 @@ export function PaymentProcessingPage() {
   ) => {
     if (reason === "USER_CANCELLED") {
       return "Waad joojisay lacag bixinta. You cancelled the payment.";
+    }
+
+    if (reason === "INSUFFICIENT_FUNDS") {
+      return "Haraagaagu kuma filna. Fadlan lacag ku dar oo isku day mar kale.";
     }
 
     if (reason === "TIMEOUT") {
@@ -208,7 +213,7 @@ export function PaymentProcessingPage() {
       return "Bixinta waa la joojiyay";
     }
 
-    if (reason === "INSUFFICIENT_BALANCE") {
+    if (reason === "INSUFFICIENT_FUNDS" || reason === "INSUFFICIENT_BALANCE") {
       return "Haraaga kuma filna";
     }
 

@@ -33,6 +33,7 @@ export type PaymentStatusResponse = {
   | "failed";
   reason_code?:
   | "USER_CANCELLED"
+  | "INSUFFICIENT_FUNDS"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
@@ -40,6 +41,7 @@ export type PaymentStatusResponse = {
   | "INVALID_INITIAL_STATE";
   failureReason?:
   | "USER_CANCELLED"
+  | "INSUFFICIENT_FUNDS"
   | "TIMEOUT"
   | "PROVIDER_ERROR"
   | "UNLOCK_FAILED"
@@ -53,6 +55,10 @@ function toReasonCode(
 ): PaymentStatusResponse["reason_code"] {
   if (failureReason === "USER_CANCELLED") {
     return "USER_CANCELLED";
+  }
+
+  if (failureReason === "INSUFFICIENT_FUNDS") {
+    return "INSUFFICIENT_FUNDS";
   }
 
   if (failureReason === "TIMEOUT") {
@@ -536,41 +542,24 @@ export async function getProviderDrivenPaymentStatus(
     return { status: "pending_payment" };
   }
 
-  if (providerCheck.status === "cancelled") {
+  if (providerCheck.status === "cancelled" || providerCheck.status === "failed") {
+    const reason = providerCheck.reason || "PROVIDER_ERROR";
+    
     const status = await completePhase2Transaction({
       id: transactionId,
       status: "failed",
-      failureReason: "USER_CANCELLED",
+      failureReason: reason,
     });
 
-    console.info("payment_failed", {
+    console.info(`payment_${providerCheck.status}`, {
       transactionId,
-      failureReason: "USER_CANCELLED",
+      failureReason: reason,
     });
 
     return {
       status,
-      reason_code: "USER_CANCELLED",
-      failureReason: "USER_CANCELLED",
-    };
-  }
-
-  if (providerCheck.status === "failed") {
-    const status = await completePhase2Transaction({
-      id: transactionId,
-      status: "failed",
-      failureReason: "PROVIDER_FAILED",
-    });
-
-    console.info("payment_failed", {
-      transactionId,
-      failureReason: "PROVIDER_FAILED",
-    });
-
-    return {
-      status,
-      reason_code: "PROVIDER_ERROR",
-      failureReason: "PROVIDER_ERROR",
+      reason_code: reason,
+      failureReason: reason,
     };
   }
 
