@@ -534,12 +534,27 @@ export async function getProviderDrivenPaymentStatus(
     }
   }
 
-  if (!providerRefToUse && providerCheck.status === "unknown") {
-    console.info("payment_status_checked", {
-      transactionId,
-      providerRef: null,
-      providerStatus: "missing_provider_ref_unrecoverable",
-    });
+  if (!providerRefToUse) {
+    const createdAtMs = toMillis(transaction.createdAt);
+
+    if (createdAtMs && Date.now() - createdAtMs > 30_000) {
+      console.error("ORPHAN_PAYMENT_DETECTED", {
+        transactionId,
+        phone: transaction.phone,
+      });
+
+      await completePhase2Transaction({
+        id: transactionId,
+        status: "failed",
+        failureReason: "PROVIDER_ERROR",
+      });
+
+      return {
+        status: "failed",
+        reason_code: "PROVIDER_ERROR",
+        failureReason: "PROVIDER_ERROR",
+      };
+    }
 
     return { status: "pending_payment" };
   }

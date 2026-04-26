@@ -10,6 +10,7 @@ import {
   requestWaafiPreauthorization,
   detectFailureReason,
 } from "@/lib/server/payment/waafi";
+import { logError } from "@/lib/server/alerts/log-error";
 
 type PaymentRequestBody = {
   phone?: string;
@@ -64,49 +65,7 @@ function parseAndValidateBody(body: PaymentRequestBody) {
   } as const;
 }
 
-function looksUserCancelled(value: unknown) {
-  const text = String(value || "").toLowerCase();
-  return (
-    text.includes("cancel") ||
-    text.includes("dismiss") ||
-    text.includes("abandon") ||
-    text.includes("abort") ||
-    text.includes("closed by user") ||
-    text.includes("closed") ||
-    text.includes("decline") ||
-    text.includes("revers") ||
-    text.includes("user")
-  );
-}
 
-function looksLikeWaafiUserCancelled(response: unknown) {
-  const payload = response as {
-    params?: Record<string, unknown>;
-    responseMsg?: unknown;
-    message?: unknown;
-    errorCode?: unknown;
-    error?: unknown;
-  };
-
-  const state = String(payload.params?.state || "").toLowerCase();
-  const message = String(payload.responseMsg || payload.message || "").toLowerCase();
-  const error = String(payload.errorCode || payload.error || "").toLowerCase();
-
-  return (
-    state.includes("cancel") ||
-    state.includes("abort") ||
-    state.includes("decline") ||
-    message.includes("cancel") ||
-    message.includes("user") ||
-    message.includes("abort") ||
-    message.includes("dismiss") ||
-    message.includes("closed") ||
-    message.includes("decline") ||
-    error.includes("cancel") ||
-    error.includes("user") ||
-    error.includes("abort")
-  );
-}
 
 export async function POST(request: NextRequest) {
   let body: PaymentRequestBody;
@@ -135,90 +94,78 @@ export async function POST(request: NextRequest) {
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
-    console.log("WAAFI PREAUTH RAW:", providerResponse);
-    const providerStatus = classifyWaafiPaymentStatus(providerResponse);
 
-    console.info("payment_request_sent", {
-      phone: parsed.phone,
-      transactionId: transaction.id,
-      providerRef: providerIds.transactionId || null,
-      providerStatus,
-      providerResponseCode:
-        providerResponse.responseCode !== undefined
-          ? String(providerResponse.responseCode)
-          : null,
-      providerErrorCode: providerResponse.errorCode || null,
-      providerState: providerResponse.params?.state || null,
-    });
+    const failureReason = detectFailureReason(providerResponse);
+    const hasStrongFailureSignal =
+      failureReason === "USER_CANCELLED" ||
+      failureReason === "INSUFFICIENT_FUNDS" ||
+      failureReason === "PROVIDER_DECLINED";
 
-    if (!providerIds.transactionId) {
-      const waafiStatus = classifyWaafiPaymentStatus(providerResponse);
+    const isApproved =
+      providerResponse?.responseCode === 2001 &&
+      providerResponse?.params?.state === "APPROVED";
 
-      if (waafiStatus === "pending" || waafiStatus === "paid") {
-        console.error("CRITICAL_ORPHAN_HOLD_RISK: Waafi hold created but no transactionId returned", {
+    const hasTransactionId = !!providerIds.transactionId;
+
+    if (!hasTransactionId) {
+      if (hasStrongFailureSignal) {
+        console.log("EXPLICIT_FAILURE_DETECTED:", {
           transactionId: transaction.id,
-          response: providerResponse,
+          failureReason,
         });
 
         await patchPhase2Transaction({
           id: transaction.id,
           patch: {
-            status: "pending_payment",
+            status: "failed",
+            failureReason,
           },
         });
 
-        return NextResponse.json({
-          transactionId: transaction.id,
-          status: "pending_payment",
-          providerRef: null,
-        });
+        return NextResponse.json(
+          {
+            status: "failed",
+            reason_code: failureReason,
+            failureReason,
+            error:
+              failureReason === "INSUFFICIENT_FUNDS"
+                ? "Insufficient balance"
+                : failureReason === "PROVIDER_DECLINED"
+                ? "Payment declined"
+                : "Payment cancelled by user",
+          },
+          { status: 409 },
+        );
       }
 
-      const failureReason = detectFailureReason(providerResponse);
+      // UNCERTAIN_HOLD case
+      console.error("UNCERTAIN_PREAUTH_STATE", {
+        providerResponse,
+        transactionId: transaction.id,
+        phone: parsed.phone,
+      });
 
-      console.log("NO PROVIDER REF CASE:", {
-        response: providerResponse,
-        classifiedAs: failureReason,
+      await logError({
+        type: "PROVIDER_INCONSISTENT_RESPONSE",
+        transactionId: transaction.id,
+        message: "Waafi response indicates success/uncertainty but missing transactionId",
+        metadata: providerResponse,
       });
 
       await patchPhase2Transaction({
         id: transaction.id,
         patch: {
-          status: "failed",
-          failureReason,
+          status: "pending_payment",
         },
       });
 
-      console.info("payment_failed", {
+      return NextResponse.json({
         transactionId: transaction.id,
-        failureReason,
+        status: "pending_payment",
       });
-
-      return NextResponse.json(
-        {
-          status: "failed",
-          reason_code: failureReason,
-          failureReason,
-          error:
-            failureReason === "INSUFFICIENT_FUNDS"
-              ? "Insufficient balance"
-              : failureReason === "PROVIDER_DECLINED"
-              ? "Payment declined"
-              : failureReason === "USER_CANCELLED"
-              ? "Payment cancelled by user"
-              : "Payment provider error",
-        },
-        {
-          status:
-            failureReason === "INSUFFICIENT_FUNDS" ||
-            failureReason === "PROVIDER_DECLINED" ||
-            failureReason === "USER_CANCELLED"
-              ? 409
-              : 502,
-        }
-      );
     }
 
+    // hasTransactionId exists
     await patchPhase2Transaction({
       id: transaction.id,
       patch: {
@@ -229,42 +176,32 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       transactionId: transaction.id,
-      status: transaction.record.status,
+      status: "pending_payment",
       providerRef: providerIds.transactionId,
     });
   } catch (error) {
-    console.log("WAAFI PREAUTH ERROR:", error);
-    
-    const failureReason = detectFailureReason(error);
+    console.error("WAAFI_PREAUTH_EXCEPTION", error);
 
-    console.info("provider_error", {
-      stage: "payment_request_sent",
-      error: String((error as { message?: unknown })?.message || error).toLowerCase(),
-      failureReason,
+    // logError is async but we don't necessarily need to await it before returning 502, 
+    // though it's safer to ensure it finishes.
+    await logError({
+      type: "PROVIDER_REQUEST_FAILED",
+      message: "Exception during Waafi preauth request",
+      metadata: { 
+        error: error instanceof Error ? error.message : String(error),
+        phone: parsed.phone,
+        amount: parsed.amount
+      }
     });
 
     return NextResponse.json(
       {
         status: "failed",
-        reason_code: failureReason,
-        failureReason,
-        error:
-          failureReason === "INSUFFICIENT_FUNDS"
-            ? "Insufficient balance"
-            : failureReason === "PROVIDER_DECLINED"
-            ? "Payment declined"
-            : failureReason === "USER_CANCELLED"
-            ? "Payment cancelled by user"
-            : "Payment provider error",
+        reason_code: "PROVIDER_ERROR",
+        failureReason: "PROVIDER_ERROR",
+        error: "Payment provider error",
       },
-      {
-        status:
-          failureReason === "INSUFFICIENT_FUNDS" ||
-          failureReason === "PROVIDER_DECLINED" ||
-          failureReason === "USER_CANCELLED"
-            ? 409
-            : 500,
-      }
+      { status: 502 },
     );
   }
 }
