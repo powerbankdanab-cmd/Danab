@@ -200,6 +200,14 @@ export async function markRentalReturned(params: {
   returnStationId: string;
   currentState: "present" | "missing"; // Explicitly passed from caller
 }) {
+  const db = getDb();
+  const normalizedBatteryId = normalizeBatteryId(params.batteryId) || params.batteryId;
+  const now = Date.now();
+  const nowTs = Timestamp.fromMillis(now);
+
+  const batteryRef = db.collection(BATTERY_STATE_COLLECTION).doc(normalizedBatteryId);
+  const rentalsCol = db.collection(RENTALS_COLLECTION);
+
   // 1. STATE-MACHINE SIGNAL HANDLING
   // If the battery is missing, we MUST purge any existing stability metrics 
   // to ensure a fresh 10s timer if it is re-inserted later (Test 6 Safety).
@@ -225,14 +233,6 @@ export async function markRentalReturned(params: {
 
   // Only proceed with return logic if battery is actually detected
   if (params.currentState !== "present") return;
-
-  const db = getDb();
-  const normalizedBatteryId = normalizeBatteryId(params.batteryId) || params.batteryId;
-  const now = Date.now();
-  const nowTs = Timestamp.fromMillis(now);
-
-  const batteryRef = db.collection(BATTERY_STATE_COLLECTION).doc(normalizedBatteryId);
-  const rentalsCol = db.collection(RENTALS_COLLECTION);
 
   let shouldLogMismatch = false;
   let logMismatchData: any = null;
@@ -267,9 +267,6 @@ export async function markRentalReturned(params: {
     transactionIdToLog = rentalData.transactionId;
     rentalIdToLog = rentalId;
     rentalStartedAt = rentalData.startedAt;
-
-    // 3. IDEMPOTENCY GUARD: Prevent double-processing
-    if (rentalData.status === "returned") return;
 
     // 4. TRANSITION GUARD (Strict Missing -> Present)
     // Only attempt to close if the battery was previously assigned (missing)

@@ -784,7 +784,3 @@ export async function logTransactionEvent(
     console.error(`[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`, error);
   }
 }
-  } catch (error) {
-    console.error(`[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`, error);
-  }
-}
