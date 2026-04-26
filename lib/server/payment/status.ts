@@ -14,7 +14,8 @@ import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
 import { logError } from "@/lib/server/alerts/log-error";
-import { getAvailableBattery, reserveBattery } from "@/lib/server/payment/heycharge";
+import { getAvailableBattery } from "@/lib/server/payment/heycharge";
+import { reserveBattery } from "@/lib/server/payment/battery-lock";
 import { getStationConfigByCode } from "@/lib/server/station-config";
 
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
