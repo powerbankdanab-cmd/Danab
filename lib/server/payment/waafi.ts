@@ -302,16 +302,16 @@ export function classifyWaafiPaymentStatus(
 }
 
 export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_DECLINED" | "PROVIDER_ERROR" {
+  if (!raw || typeof raw !== "object") {
+    return "PROVIDER_ERROR";
+  }
+
   const text =
     (raw?.responseMsg || "") +
     " " +
     (raw?.params?.state || "") +
     " " +
-    (raw?.errorCode || "") +
-    " " +
-    (raw?.message || "") +
-    " " +
-    (typeof raw === "string" ? raw : "");
+    (raw?.errorCode || "");
 
   const normalized = text.toLowerCase();
 
