@@ -82,6 +82,7 @@ export type PaymentTransactionRecord = {
   captureAttemptedAt?: number;
   providerCaptureRef?: string | null;
   captureRetryCount?: number;
+  missingProviderRef?: boolean;
 };
 
 type JsonObject = Record<string, unknown>;

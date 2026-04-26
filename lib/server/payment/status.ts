@@ -538,6 +538,16 @@ export async function getProviderDrivenPaymentStatus(
     const createdAtMs = toMillis(transaction.createdAt);
 
     if (createdAtMs && Date.now() - createdAtMs > 30_000) {
+      if (transaction.missingProviderRef === true) {
+        // DO NOT fail blindly if we suspect a hold exists without a ref.
+        // Keep it pending_payment so it can be resolved manually or via deeper reconciliation.
+        console.warn("PROTECTED_ORPHAN_PREVENTION: 30s timeout reached but missingProviderRef is set", {
+          transactionId,
+          phone: transaction.phone,
+        });
+        return { status: "pending_payment" };
+      }
+
       console.error("ORPHAN_PAYMENT_DETECTED", {
         transactionId,
         phone: transaction.phone,

@@ -101,9 +101,10 @@ export async function POST(request: NextRequest) {
       failureReason === "INSUFFICIENT_FUNDS" ||
       failureReason === "PROVIDER_DECLINED";
 
-    const isApproved =
-      providerResponse?.responseCode === 2001 &&
-      providerResponse?.params?.state === "APPROVED";
+    const indicatesHold =
+      providerResponse?.responseCode === 2001 ||
+      providerResponse?.params?.state === "APPROVED" ||
+      providerResponse?.params?.state === "FORAPPROVAL";
 
     const hasTransactionId = !!providerIds.transactionId;
 
@@ -138,31 +139,63 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      // UNCERTAIN_HOLD case
-      console.error("UNCERTAIN_PREAUTH_STATE", {
+      if (indicatesHold) {
+        console.error("HOLD_WITHOUT_TRANSACTION_ID", {
+          providerResponse,
+          transactionId: transaction.id,
+        });
+
+        await logError({
+          type: "PROVIDER_MISSING_REF",
+          transactionId: transaction.id,
+          message: "Hold likely created but transactionId missing",
+          metadata: providerResponse,
+        });
+
+        await patchPhase2Transaction({
+          id: transaction.id,
+          patch: {
+            status: "pending_payment",
+            missingProviderRef: true,
+          },
+        });
+
+        return NextResponse.json({
+          transactionId: transaction.id,
+          status: "pending_payment",
+        });
+      }
+
+      // True unknown -> safe fail
+      console.error("UNKNOWN_PREAUTH_STATE_FAILING_SAFE", {
         providerResponse,
         transactionId: transaction.id,
-        phone: parsed.phone,
       });
 
       await logError({
         type: "PROVIDER_INCONSISTENT_RESPONSE",
         transactionId: transaction.id,
-        message: "Waafi response indicates success/uncertainty but missing transactionId",
+        message: "Waafi response indicates success/uncertainty but missing transactionId and no hold state",
         metadata: providerResponse,
       });
 
       await patchPhase2Transaction({
         id: transaction.id,
         patch: {
-          status: "pending_payment",
+          status: "failed",
+          failureReason: "PROVIDER_ERROR",
         },
       });
 
-      return NextResponse.json({
-        transactionId: transaction.id,
-        status: "pending_payment",
-      });
+      return NextResponse.json(
+        {
+          status: "failed",
+          reason_code: "PROVIDER_ERROR",
+          failureReason: "PROVIDER_ERROR",
+          error: "Payment provider error",
+        },
+        { status: 502 },
+      );
     }
 
     // hasTransactionId exists
@@ -177,7 +210,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       transactionId: transaction.id,
       status: "pending_payment",
-      providerRef: providerIds.transactionId,
     });
   } catch (error) {
     console.error("WAAFI_PREAUTH_EXCEPTION", error);
