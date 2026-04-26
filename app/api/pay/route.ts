@@ -11,13 +11,16 @@ import {
   requestWaafiPreauthorization,
   detectFailureReason,
 } from "@/lib/server/payment/waafi";
+import { ensureDeliveryContext } from "@/lib/server/payment/status";
 import { logError } from "@/lib/server/alerts/log-error";
 import { checkUserRestrictions } from "@/lib/server/payment/rentals";
+import { getStationConfigByCode } from "@/lib/server/station-config";
 
 type PaymentRequestBody = {
   phone?: string;
   phoneNumber?: string;
   amount?: number;
+  stationCode?: string;
 };
 
 function failedPaymentResponse(
@@ -56,6 +59,9 @@ function parseAndValidateBody(body: PaymentRequestBody) {
     : phoneDigits;
   const phone = `+252${localPhone}`;
   const amount = Number(body.amount);
+  const stationCode = typeof body.stationCode === "string"
+    ? body.stationCode.trim()
+    : "";
 
   if (!/^\+252\d{9}$/.test(phone) || Number.isNaN(amount) || amount <= 0) {
     return {
@@ -63,9 +69,19 @@ function parseAndValidateBody(body: PaymentRequestBody) {
     } as const;
   }
 
+  if (stationCode) {
+    const config = getStationConfigByCode(stationCode);
+    if (!config) {
+      return {
+        error: "Invalid station code",
+      } as const;
+    }
+  }
+
   return {
     phone,
     amount,
+    stationCode,
   } as const;
 }
 
@@ -100,7 +116,11 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const transaction = await createMinimalTransaction(parsed);
+    const transaction = await createMinimalTransaction({
+      phone: parsed.phone,
+      amount: parsed.amount,
+      station: parsed.stationCode || undefined,
+    });
 
     await logTransactionEvent(transaction.id, "PAYMENT_INITIATED", {
       phone: parsed.phone,
@@ -120,7 +140,10 @@ export async function POST(request: NextRequest) {
     const providerIds = extractWaafiIds(providerResponse);
 
     await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_RESPONSE", {
+      phone: parsed.phone,
+      amount: parsed.amount,
       providerResponse,
+      providerRef: providerIds.transactionId || null,
       hasTransactionId: !!providerIds.transactionId,
     }, "IMPORTANT");
 
@@ -137,6 +160,39 @@ export async function POST(request: NextRequest) {
 
     const hasTransactionId = !!providerIds.transactionId;
 
+    if (indicatesHold && hasTransactionId) {
+      await patchPhase2Transaction({
+        id: transaction.id,
+        patch: {
+          status: "held",
+          providerRef: providerIds.transactionId,
+          heldAt: Date.now(),
+          unlockStarted: false,
+        },
+      });
+
+      // Eagerly acquire delivery context if we have a stationCode
+      if (parsed.stationCode) {
+        await ensureDeliveryContext({
+          id: transaction.id,
+          station: parsed.stationCode,
+          phone: parsed.phone,
+          status: "held",
+        });
+      }
+
+      await logTransactionEvent(transaction.id, "PROVIDER_HOLD_DETECTED", {
+        phone: parsed.phone,
+        amount: parsed.amount,
+        providerRef: providerIds.transactionId,
+      }, "CRITICAL");
+
+      return NextResponse.json({
+        transactionId: transaction.id,
+        status: "held",
+      });
+    }
+
     if (!hasTransactionId) {
       if (hasStrongFailureSignal) {
         console.log("EXPLICIT_FAILURE_DETECTED:", {
@@ -145,7 +201,8 @@ export async function POST(request: NextRequest) {
         });
 
         await logTransactionEvent(transaction.id, "EXPLICIT_FAILURE_DETECTED", {
-          failureReason,
+          phone: parsed.phone,
+          amount: parsed.amount,
           response: providerResponse,
         }, "CRITICAL");
 
@@ -166,8 +223,8 @@ export async function POST(request: NextRequest) {
               failureReason === "INSUFFICIENT_FUNDS"
                 ? "Insufficient balance"
                 : failureReason === "PROVIDER_DECLINED"
-                ? "Payment declined"
-                : "Payment cancelled by user",
+                  ? "Payment declined"
+                  : "Payment cancelled by user",
           },
           { status: 409 },
         );
@@ -180,6 +237,8 @@ export async function POST(request: NextRequest) {
         });
 
         await logTransactionEvent(transaction.id, "UNCERTAIN_HOLD_DETECTED", {
+          phone: parsed.phone,
+          amount: parsed.amount,
           message: "Hold indicated but transactionId missing",
           response: providerResponse,
         }, "CRITICAL");
@@ -212,6 +271,8 @@ export async function POST(request: NextRequest) {
       });
 
       await logTransactionEvent(transaction.id, "UNKNOWN_PREAUTH_STATE_FAILURE", {
+        phone: parsed.phone,
+        amount: parsed.amount,
         response: providerResponse,
       });
 
@@ -251,6 +312,8 @@ export async function POST(request: NextRequest) {
     });
 
     await logTransactionEvent(transaction.id, "PAYMENT_AWAITING_PIN", {
+      phone: parsed.phone,
+      amount: parsed.amount,
       providerRef: providerIds.transactionId,
     });
 
@@ -266,7 +329,7 @@ export async function POST(request: NextRequest) {
     await logError({
       type: "PROVIDER_REQUEST_FAILED",
       message: "Exception during Waafi preauth request",
-      metadata: { 
+      metadata: {
         error: error instanceof Error ? error.message : String(error),
         phone: parsed.phone,
         amount: parsed.amount

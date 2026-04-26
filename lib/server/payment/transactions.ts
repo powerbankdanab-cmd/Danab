@@ -8,6 +8,7 @@ export const PAYMENT_TRANSACTIONS_COLLECTION = "transactions";
 export type MinimalTransactionRecord = {
   phone: string;
   amount: number;
+  station?: string;
   status: "pending_payment";
   providerRef?: string | null;
   failureReason?: string | null;
@@ -106,20 +107,27 @@ type JsonObject = Record<string, unknown>;
 export async function createMinimalTransaction(input: {
   phone: string;
   amount: number;
+  station?: string;
 }) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc();
   const now = Date.now();
   const record: MinimalTransactionRecord = {
     phone: input.phone,
     amount: input.amount,
+    station: input.station,
     status: "pending_payment",
     unlockStarted: false,
     createdAt: now,
     updatedAt: now,
   };
 
-  const docRef = await getDb()
-    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
-    .add(record);
+  await docRef.set({
+    id: docRef.id,
+    ...record,
+    createdAtTs: Timestamp.now(),
+    updatedAtTs: Timestamp.now(),
+  });
 
   return {
     id: docRef.id,
@@ -743,7 +751,13 @@ export async function logTransactionEvent(
       // 4. ATOMIC READ (inside transaction)
       // Guarantees sequence monotonic ordering and immutable terminal state check.
       const snap = await tx.get(txRef);
-      if (!snap.exists) return; // Silent exit if transaction was deleted or invalid
+      if (!snap.exists) {
+        console.error(
+          `[ORPHAN_EVENT_DETECTED] Transaction missing for event ${event}. transactionId=${transactionId}`,
+          { event, transactionId, metadata },
+        );
+        return;
+      }
 
       const data = snap.data() as PaymentTransactionRecord;
       const nextSeq = (data.eventCount || 0) + 1;

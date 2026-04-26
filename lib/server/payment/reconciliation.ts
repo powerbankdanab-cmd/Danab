@@ -28,6 +28,7 @@ import {
   isWaafiCaptured,
   queryWaafiTransactionStatus,
 } from "@/lib/server/payment/waafi";
+import { triggerUnlockIfNeeded, getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 
 const RECOVERY_LEASE_MS = 30_000;
 const UNKNOWN_RECONCILE_BASE_DELAY_MS = 15_000;
@@ -318,7 +319,9 @@ async function reconcileCaptureUnknown(
 
 export async function reconcileTransactions(limit = 50): Promise<ReconcileSummary> {
   const workerId = `reconcile_${process.pid}_${Date.now()}`;
-  const candidates = await listTransactionsForReconciliation(limit);
+  // Use the broader stale list to catch held and pending_payment cases
+  const { listStaleTransactionsForReconciliation } = await import("@/lib/server/payment/transactions");
+  const candidates = await listStaleTransactionsForReconciliation(limit);
 
   const summary: ReconcileSummary = {
     scanned: candidates.length,
@@ -388,6 +391,16 @@ export async function reconcileTransactions(limit = 50): Promise<ReconcileSummar
           summary.failed += 1;
         } else if (result === "unknown_retained") {
           summary.unknownRetained += 1;
+        }
+      } else if (current.status === "held" || current.status === "pending_payment") {
+        // Progression for early-stage transactions
+        if (current.status === "held" && !current.unlockStarted) {
+           await triggerUnlockIfNeeded(current);
+           summary.repaired += 1;
+        } else {
+           // pending_payment or held-but-started (which might be stuck)
+           await getProviderDrivenPaymentStatus(current.id);
+           summary.repaired += 1;
         }
       }
     } catch (error) {

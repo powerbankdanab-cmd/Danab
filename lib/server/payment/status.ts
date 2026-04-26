@@ -14,6 +14,8 @@ import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
 import { logError } from "@/lib/server/alerts/log-error";
+import { getAvailableBattery, reserveBattery } from "@/lib/server/payment/heycharge";
+import { getStationConfigByCode } from "@/lib/server/station-config";
 
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 const PROCESSING_TIMEOUT_MS = 30_000;
@@ -263,12 +265,10 @@ export async function triggerUnlockIfNeeded(
     return;
   }
 
-  if (!transaction.delivery || !transaction.providerRef) {
-    console.error("invalid_held_state", {
+  if (!transaction.providerRef) {
+    console.error("invalid_held_state: missing providerRef", {
       transactionId: transaction.id,
       status: transaction.status,
-      providerRef: transaction.providerRef,
-      delivery: transaction.delivery,
     });
 
     await patchPaymentTransaction({
@@ -281,6 +281,13 @@ export async function triggerUnlockIfNeeded(
       },
     });
     return;
+  }
+
+  // Repair delivery context if missing but station is known
+  if (!transaction.delivery) {
+    const delivery = await ensureDeliveryContext(transaction);
+    if (!delivery) return;
+    transaction.delivery = delivery;
   }
 
   if (transaction.status === "paid") {
@@ -661,4 +668,70 @@ export async function getProviderDrivenPaymentStatus(
   }
 
   return { status: "pending_payment" };
+}
+
+/**
+ * Ensures that a transaction has a delivery context.
+ * If missing, it attempts to acquire a battery and slot from the specified station.
+ */
+export async function ensureDeliveryContext(
+  transaction: Pick<PaymentTransactionRecord, "id" | "station" | "phone" | "status" | "delivery">
+): Promise<PaymentTransactionRecord["delivery"] | null> {
+  if (transaction.delivery) {
+    return transaction.delivery;
+  }
+
+  if (!transaction.station) {
+    return null;
+  }
+
+  const stationConfig = getStationConfigByCode(transaction.station);
+  if (!stationConfig) {
+    return null;
+  }
+
+  try {
+    const battery = await getAvailableBattery(stationConfig.imei);
+    if (!battery) {
+      return null;
+    }
+
+    const reserved = await reserveBattery(stationConfig.imei, battery.battery_id, transaction.phone);
+    if (!reserved) {
+      return null;
+    }
+
+    const delivery = {
+      imei: stationConfig.imei,
+      stationCode: transaction.station,
+      batteryId: battery.battery_id,
+      slotId: battery.slot_id,
+      phoneAuthority: "requested_phone_only",
+      unlockAttempts: 0,
+      requestedPhoneNumber: transaction.phone,
+      canonicalPhoneNumber: transaction.phone,
+    };
+
+    await patchPaymentTransaction({
+      id: transaction.id,
+      patch: {
+        delivery,
+        updatedAt: Date.now(),
+      },
+    });
+
+    await logTransactionEvent(transaction.id, "DELIVERY_CONTEXT_ACQUIRED", {
+      station: transaction.station,
+      batteryId: battery.battery_id,
+      slotId: battery.slot_id,
+    }, "IMPORTANT");
+
+    return delivery;
+  } catch (error) {
+    console.error("ensureDeliveryContext_failed", {
+      transactionId: transaction.id,
+      error,
+    });
+    return null;
+  }
 }
