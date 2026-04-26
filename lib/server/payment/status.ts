@@ -361,29 +361,43 @@ export async function getProviderDrivenPaymentStatus(
   if (!transaction) {
     throw new HttpError(404, "Transaction not found");
   }
-
   if (transaction.status === "paid" || transaction.status === "held") {
     const heldAtMs = toMillis(transaction.heldAt ?? transaction.updatedAt) ?? Date.now();
     const heldAgeMs = Date.now() - heldAtMs;
 
     if (!transaction.unlockStarted) {
+      // SLA Boundary: 30 seconds for held state resolution
+      if (heldAgeMs > 30_000) {
+        await logTransactionEvent(transaction.id, "SLA_BREACH_HELD_STALL", {
+          heldAgeMs,
+          status: transaction.status,
+        }, "CRITICAL");
+
+        await logError({
+          type: "HELD_STALL",
+          transactionId,
+          message: "Held transaction exceeded SLA and was still waiting for unlock",
+          metadata: {
+            heldAgeMs,
+            unlockStarted: transaction.unlockStarted,
+          },
+        });
+
+        await cancelHold(transaction.id, "Unlock timed out after held state SLA breach");
+        return {
+          status: "failed",
+          reason_code: "UNLOCK_TIMEOUT",
+          failureReason: "UNLOCK_TIMEOUT",
+        };
+      }
+
       console.info("unlock_fallback_triggered", {
         transactionId,
       });
 
       await triggerUnlockIfNeeded(transaction);
-    } else if (transaction.status === "held" && heldAgeMs > 30_000) {
-      await logError({
-        type: "HELD_STALL",
-        transactionId,
-        message: "Held transaction exceeded SLA and was still waiting for unlock",
-        metadata: {
-          heldAgeMs,
-          unlockStarted: transaction.unlockStarted,
-        },
-      });
-
-      await cancelHold(transaction.id, "Unlock timed out after held state");
+    } else if (transaction.status === "held" && heldAgeMs > 60_000) {
+      // Secondary fallback for started but stuck in held
       return {
         status: "failed",
         reason_code: "UNLOCK_TIMEOUT",
@@ -721,11 +735,12 @@ export async function ensureDeliveryContext(
       },
     });
 
-    await logTransactionEvent(transaction.id, "DELIVERY_CONTEXT_ACQUIRED", {
+    await logTransactionEvent(transaction.id, "AUTO_REPAIR_DELIVERY_CONTEXT", {
       station: transaction.station,
       batteryId: battery.battery_id,
       slotId: battery.slot_id,
-    }, "IMPORTANT");
+      reason: "Missing delivery context in held/paid state",
+    }, "CRITICAL");
 
     return delivery;
   } catch (error) {

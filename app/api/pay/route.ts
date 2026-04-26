@@ -4,6 +4,7 @@ import {
   createMinimalTransaction,
   patchPhase2Transaction,
   logTransactionEvent,
+  getPaymentTransaction,
 } from "@/lib/server/payment/transactions";
 import {
   classifyWaafiPaymentStatus,
@@ -11,7 +12,7 @@ import {
   requestWaafiPreauthorization,
   detectFailureReason,
 } from "@/lib/server/payment/waafi";
-import { ensureDeliveryContext } from "@/lib/server/payment/status";
+import { ensureDeliveryContext, triggerUnlockIfNeeded } from "@/lib/server/payment/status";
 import { logError } from "@/lib/server/alerts/log-error";
 import { checkUserRestrictions } from "@/lib/server/payment/rentals";
 import { getStationConfigByCode } from "@/lib/server/station-config";
@@ -173,12 +174,20 @@ export async function POST(request: NextRequest) {
 
       // Eagerly acquire delivery context if we have a stationCode
       if (parsed.stationCode) {
-        await ensureDeliveryContext({
+        const delivery = await ensureDeliveryContext({
           id: transaction.id,
           station: parsed.stationCode,
           phone: parsed.phone,
           status: "held",
         });
+
+        // Immediate Execution Contract: Trigger unlock right away
+        if (delivery) {
+          const refreshed = await getPaymentTransaction(transaction.id);
+          if (refreshed) {
+            await triggerUnlockIfNeeded(refreshed);
+          }
+        }
       }
 
       await logTransactionEvent(transaction.id, "PROVIDER_HOLD_DETECTED", {

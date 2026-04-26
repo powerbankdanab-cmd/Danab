@@ -382,9 +382,9 @@ export async function reconcileTransactions(limit = 50): Promise<ReconcileSummar
         } else if (result === "unknown_retained") {
           summary.unknownRetained += 1;
         }
-      } else if (current.status === "verified" && current.captureAttempted) {
-        // Phase 4: crash between commit call and state write
-        const result = await reconcileVerifiedCrash(current, fence);
+      } else if (current.status === "verified") {
+        // Capture guarantee: ejection verified but capture not yet triggered/completed
+        const result = await reconcileVerified(current, fence);
         if (result === "repaired") {
           summary.repaired += 1;
         } else if (result === "failed") {
@@ -675,6 +675,42 @@ async function reconcileVerifiedCrash(
   // Ambiguous — but since we're in verified (not capture_in_progress),
   // the commit call may not have reached the provider yet. Safe to retry later.
   return "unknown_retained";
+}
+
+/**
+ * Reconciles a transaction in verified status (ejection confirmed).
+ * Ensures it progresses to capture.
+ */
+async function reconcileVerified(
+  transaction: PaymentTransactionRecord,
+  fence: RecoveryFence,
+): Promise<"repaired" | "failed" | "unknown_retained" | "noop"> {
+  if (transaction.status !== "verified") {
+    return "noop";
+  }
+
+  // If captureAttempted is true, we use the specific crash recovery logic
+  if (transaction.captureAttempted) {
+    return reconcileVerifiedCrash(transaction, fence);
+  }
+
+  await logTransactionEvent(transaction.id, "AUTO_TRIGGER_CAPTURE_RECOVERY", {
+    reason: "Transaction stuck in verified state without capture attempt",
+  }, "IMPORTANT");
+
+  try {
+    const { finalizeCapture } = await import("@/lib/server/payment/process-payment");
+    await finalizeCapture(transaction.id);
+    return "repaired";
+  } catch (error) {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.RECONCILIATION_FAILED,
+      transactionId: transaction.id,
+      message: "Failed to trigger capture recovery for verified transaction",
+      metadata: { error: String(error) },
+    });
+    return "unknown_retained";
+  }
 }
 
 export async function repairTransactionIfNeeded(id: string) {
