@@ -33,6 +33,7 @@ import {
   getPaymentTransaction,
   patchPaymentTransaction,
   transitionPaymentTransactionState,
+  markUnlockStarted,
   PaymentTransactionRecord,
   logTransactionEvent,
 } from "@/lib/server/payment/transactions";
@@ -1123,9 +1124,15 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
     return {
       status: "captured",
       success: true,
+      rentalId: tx.rentalId,
       battery_id: tx.delivery?.batteryId,
       slot_id: tx.delivery?.slotId,
     };
+  }
+
+  // ── Idempotency: capture already confirmed, just finish rental ───
+  if (tx.captureCompleted && tx.status === "captured") {
+    // Rental step will handle the rest
   }
 
   const {
@@ -1393,16 +1400,46 @@ export async function cancelHold(idempotencyKey: string, reason: string): Promis
     throw new HttpError(400, "Transaction in invalid state for cancellation");
   }
 
+  // Split-brain guard: do NOT cancel if unlock already started
+  if (tx.unlockStarted) {
+    await logError({
+      type: "CANCEL_ABORTED_UNLOCK_STARTED",
+      transactionId: idempotencyKey,
+      message: "Cancellation aborted because unlock has already started",
+      metadata: { status: tx.status, unlockStarted: tx.unlockStarted },
+    });
+    throw new HttpError(400, "Cannot cancel a transaction that has already started unlock");
+  }
+
   if (tx.providerRef) {
     await logTransactionEvent(idempotencyKey, "CANCELLING_PROVIDER_HOLD", {
       providerRef: tx.providerRef,
       reason,
     }, "IMPORTANT");
 
-    await cancelWaafiPreauthorization({
+    const cancelResponse = await cancelWaafiPreauthorization({
       transactionId: tx.providerRef,
       description: reason,
     });
+
+    if (cancelResponse?.responseCode !== 200 && cancelResponse?.responseCode !== 5206) {
+       // 5206 typically means already cancelled or not found
+       await logError({
+         type: CRITICAL_ERROR_TYPES.PROVIDER_CANCEL_FAILED,
+         transactionId: idempotencyKey,
+         message: "CRITICAL: Provider cancellation failed to confirm. Money may still be held!",
+         metadata: {
+           responseCode: cancelResponse?.responseCode,
+           responseMsg: cancelResponse?.responseMsg,
+           providerRef: tx.providerRef,
+         },
+       });
+       // We still mark it failed locally but the critical error will alert ops
+    } else {
+       await logTransactionEvent(idempotencyKey, "PROVIDER_CANCEL_CONFIRMED", {
+         providerRef: tx.providerRef,
+       }, "IMPORTANT");
+    }
   }
 
   await markTransactionFailed(idempotencyKey, reason);
@@ -1505,16 +1542,12 @@ export async function performEjectionAndVerification(input: {
     canonicalPhoneNumber
   } = input;
 
-  await ensurePaymentTransactionState(idempotencyKey, "held");
-
-  const currentBattery = battery;
-  await patchPaymentTransaction({
-    id: idempotencyKey,
-    patch: {
-      unlockStarted: true,
-      processingStartedAt: Date.now(),
-    },
-  });
+  // ── Atomic exactly-once guard ──────────────────────────────
+  const started = await markUnlockStarted(idempotencyKey);
+  if (!started) {
+    console.info("unlock_already_started_skipping", { idempotencyKey });
+    return;
+  }
   await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
     station: stationCode,
     batteryId: currentBattery.battery_id,

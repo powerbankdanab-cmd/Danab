@@ -322,6 +322,7 @@ export async function triggerUnlockIfNeeded(
 
   const refreshed = await getPaymentTransaction(transaction.id);
   if (!refreshed || refreshed.unlockStarted || refreshed.status !== "held") {
+    // Exactly-once guard: if already started or status changed, exit.
     return;
   }
 

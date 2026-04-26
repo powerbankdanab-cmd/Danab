@@ -18,6 +18,7 @@ import {
   listTransactionsForReconciliation,
   PAYMENT_TRANSACTIONS_COLLECTION,
   releaseTransactionRecovery,
+  logTransactionEvent,
   type RecoveryFence,
   type PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";

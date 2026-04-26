@@ -306,6 +306,52 @@ export async function transitionPaymentTransactionState(input: {
       ...(nextDoc as JsonObject),
     } as PaymentTransactionRecord;
   });
+export async function markUnlockStarted(id: string) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) throw new HttpError(404, "Transaction not found");
+
+    const current = snap.data() as PaymentTransactionRecord;
+    if (current.unlockStarted) return false; // Already started
+
+    if (current.status !== "held" && current.status !== "paid") {
+       throw new HttpError(409, "Invalid status for unlock", { status: current.status });
+    }
+
+    tx.update(docRef, {
+      unlockStarted: true,
+      processingStartedAt: Date.now(),
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+
+    return true;
+  });
+}
+
+export async function markCaptureAttempted(id: string) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) throw new HttpError(404, "Transaction not found");
+
+    const current = snap.data() as PaymentTransactionRecord;
+    if (current.captureAttempted) return false;
+
+    tx.update(docRef, {
+      captureAttempted: true,
+      captureAttemptedAt: Date.now(),
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+
+    return true;
+  });
 }
 
 export async function patchPaymentTransaction(input: {
