@@ -12,6 +12,7 @@ import {
   detectFailureReason,
 } from "@/lib/server/payment/waafi";
 import { logError } from "@/lib/server/alerts/log-error";
+import { checkUserRestrictions } from "@/lib/server/payment/rentals";
 
 type PaymentRequestBody = {
   phone?: string;
@@ -24,7 +25,9 @@ function failedPaymentResponse(
     | "USER_CANCELLED"
     | "INSUFFICIENT_FUNDS"
     | "PROVIDER_DECLINED"
-    | "PROVIDER_ERROR",
+    | "PROVIDER_ERROR"
+    | "ACTIVE_RENTAL_OVERDUE"
+    | "ACTIVE_RENTAL_LOST",
   error: string,
   status: number,
 ) {
@@ -82,6 +85,17 @@ export async function POST(request: NextRequest) {
       "PROVIDER_ERROR",
       parsed.error || "Missing valid phone and amount",
       400,
+    );
+  }
+
+  const restriction = await checkUserRestrictions(parsed.phone);
+  if (restriction.restricted) {
+    return failedPaymentResponse(
+      restriction.reason!,
+      restriction.reason === "ACTIVE_RENTAL_OVERDUE"
+        ? "You have an overdue battery. Please return it before renting again."
+        : "Your account is blocked due to a lost battery. Please contact support.",
+      403,
     );
   }
 

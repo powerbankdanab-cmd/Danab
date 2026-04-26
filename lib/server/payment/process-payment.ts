@@ -1008,6 +1008,12 @@ async function finalizeCaptureRentalStep(
         stationId: stationCode,
         slotId,
         batteryId,
+        imei,
+        phoneAuthority,
+        requestedPhoneNumber: phoneNumber,
+        amount,
+        issuerTransactionId,
+        referenceId,
       });
 
       await patchPaymentTransaction({

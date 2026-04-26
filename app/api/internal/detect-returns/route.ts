@@ -43,7 +43,8 @@ export async function GET() {
           // If no active rental exists, it's a no-op (battery is already returned or was never rented).
           await markRentalReturned({
             batteryId: battery.battery_id,
-            returnStationId: stationCode
+            returnStationId: stationCode,
+            currentState: "present"
           });
         }
       } catch (stationError) {

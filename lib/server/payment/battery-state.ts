@@ -223,6 +223,7 @@ export async function ensureBatteryRentedForTransaction(input: {
       referenceId: input.referenceId || null,
       amount: input.amount,
       status: "active",
+      lastSeenState: "missing",
       updatedAt: now,
       claimedAt: now,
     },

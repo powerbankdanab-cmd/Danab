@@ -13,7 +13,7 @@ export async function GET() {
     // 1. Query for expired events
     const snapshot = await db
       .collection("transaction_events")
-      .where("expiresAt", "<=", now)
+      .where("expiresAt", "<=", new Date(now))
       .limit(500) // Batch deletes to avoid timeout
       .get();
 

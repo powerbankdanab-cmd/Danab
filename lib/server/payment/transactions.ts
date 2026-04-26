@@ -98,7 +98,7 @@ export interface TransactionEvent {
   sequence: number;
   metadata?: Record<string, unknown>;
   createdAt: number;
-  expiresAt: number; // For retention cleanup
+  expiresAt: Timestamp; // For Firestore Native TTL (must be a Timestamp)
 }
 
 type JsonObject = Record<string, unknown>;
@@ -645,17 +645,60 @@ export async function guardedTransitionPaymentTransactionState(input: {
   });
 }
 /**
+ * Explicit set of events that terminate a transaction's lifecycle.
+ */
+const TERMINAL_EVENTS = new Set([
+  "PROVIDER_CAPTURE_SUCCESS",
+  "PAYMENT_FAILED",
+  "TIMEOUT",
+  "EXPLICIT_FAILURE_DETECTED",
+  "UNKNOWN_PREAUTH_STATE_FAILURE",
+  "RENTAL_RETURN_CONFIRMED",
+]);
+
+/**
+ * Events that MUST have an idempotency key to prevent logical duplication.
+ */
+const CRITICAL_EVENTS = new Set([
+  "PROVIDER_PAID_SUCCESS",
+  "PROVIDER_CAPTURE_SUCCESS",
+  "UNLOCK_STARTED",
+  "RENTAL_CREATED",
+  "RENTAL_RETURN_CONFIRMED",
+]);
+
+/**
+ * High-frequency noise that should never touch Firestore.
+ */
+const POLLING_EVENTS = new Set([
+  "STATUS_POLL_START",
+  "STATUS_POLL_RESULT",
+  "INVENTORY_POLL",
+]);
+
+/**
  * Logs a transaction event with production-grade controls (levels, sequence, deduplication).
+ * Enforces atomicity: Sequence increment and event write occur in the same transaction.
  */
 export async function logTransactionEvent(
   transactionId: string,
   event: string,
   metadata?: Record<string, unknown>,
   level: EventLevel = "INFO",
+  idempotencyKey?: string,
+  actor: "api" | "worker" | "reconciliation" | "system" = "system",
 ) {
-  // Level 1: Filter out noise (DEBUG events are console-only)
-  if (level === "DEBUG") {
-    console.debug(`[DEBUG][${transactionId}] ${event}`, metadata || "");
+  // 1. EARLY EXIT: Filter polling noise before ANY database calls
+  if (level === "DEBUG" || POLLING_EVENTS.has(event)) {
+    console.debug(`[DEBUG][${actor}][${transactionId}] ${event}`, metadata || "");
+    return;
+  }
+
+  // 2. CRITICAL POLICY ENFORCEMENT
+  // We BLOCK the write if a critical event is missing its idempotency key.
+  // "Better to lose observability than to corrupt it with duplicates."
+  if (CRITICAL_EVENTS.has(event) && !idempotencyKey) {
+    console.error(`[CRITICAL_POLICY_BLOCK] Missing idempotencyKey for event: ${event}. Transaction: ${transactionId}`);
     return;
   }
 
@@ -664,55 +707,83 @@ export async function logTransactionEvent(
     const eventCol = db.collection("transaction_events");
     const txRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(transactionId);
 
+    // 3. DETERMINISTIC ID RESOLUTION
+    // Computed BEFORE entering transaction to ensure consistent reference across retries.
+    const eventId = idempotencyKey ? `${transactionId}_${idempotencyKey}` : eventCol.doc().id;
+    const eventDocRef = eventCol.doc(eventId);
+
     await db.runTransaction(async (tx) => {
-      // 1. Get current sequence and deduplication context
+      // 4. ATOMIC READ (inside transaction)
+      // Guarantees sequence monotonic ordering and immutable terminal state check.
       const snap = await tx.get(txRef);
-      if (!snap.exists) return;
+      if (!snap.exists) return; // Silent exit if transaction was deleted or invalid
 
       const data = snap.data() as PaymentTransactionRecord;
-      const sequence = (data.eventCount || 0) + 1;
+      const nextSeq = (data.eventCount || 0) + 1;
+      const alreadyTerminal = TERMINAL_EVENTS.has(data.finalStep || "");
 
-      // 2. Simple Deduplication for IMPORTANT/CRITICAL events
-      // (Optional: prevent rapid fire of same event)
-      // This is a business logic decision. For now, we'll just log.
+      // 5. ATOMIC IDEMPOTENCY CHECK
+      if (idempotencyKey) {
+        const existing = await tx.get(eventDocRef);
+        if (existing.exists) return; // Logical duplicate skip
+      }
 
-      // 3. Create Event Document
-      const eventDocRef = eventCol.doc();
-      const expiresAt = level === "CRITICAL" || level === "IMPORTANT"
-        ? Date.now() + 30 * 24 * 60 * 60 * 1000 // 30 days
-        : Date.now() + 7 * 24 * 60 * 60 * 1000;  // 7 days
+      // 6. Retention Tier Calculation
+      let ttlDays = 7;
+      if (level === "CRITICAL") ttlDays = 90;
+      else if (level === "IMPORTANT") ttlDays = 30;
+      const expiresAt = Timestamp.fromDate(new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000));
 
-      const eventDoc: TransactionEvent = {
+      // 7. Create Event Document
+      const eventDoc: TransactionEvent & { 
+        idempotencyKey?: string; 
+        schemaVersion: number;
+        createdAtTs: Timestamp;
+        actor: string;
+      } = {
         transactionId,
         event,
         level,
-        sequence,
-        metadata: metadata || {},
+        sequence: nextSeq,
+        metadata: JSON.parse(JSON.stringify(metadata || {})),
         createdAt: Date.now(),
+        createdAtTs: Timestamp.now(),
         expiresAt,
+        schemaVersion: 1,
+        actor,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
       };
 
       tx.set(eventDocRef, eventDoc);
 
-      // 4. Update Transaction Summary
-      tx.update(txRef, {
-        eventCount: sequence,
+      // 8. Guarded Summary Update
+      // Invariant: FIRST terminal event wins. Subsequent events do not overwrite the terminal outcome.
+      const isTerminal = TERMINAL_EVENTS.has(event);
+      const updatePatch: JsonObject = {
+        eventCount: nextSeq,
         updatedAt: Date.now(),
         updatedAtTs: Timestamp.now(),
-        // If it's a terminal event, update finalStep
-        ...(event.endsWith("_SUCCESS") || event.endsWith("_FAILED") || event === "TIMEOUT"
-          ? {
-              finalStep: event,
-              processingTimeMs: Date.now() - (
-                typeof data.createdAt === "number" ? data.createdAt : 
-                (data.createdAt as any)?.toMillis ? (data.createdAt as any).toMillis() : 
-                (data.createdAt as any)?.seconds ? (data.createdAt as any).seconds * 1000 :
-                Date.now()
-              ),
-            }
-          : {}),
-      });
+      };
+
+      if (isTerminal && !alreadyTerminal) {
+        updatePatch.finalStep = event;
+        updatePatch.processingTimeMs = Date.now() - (
+          typeof data.createdAt === "number" ? data.createdAt : 
+          (data.createdAt as any)?.toMillis ? (data.createdAt as any).toMillis() : 
+          (data.createdAt as any)?.seconds ? (data.createdAt as any).seconds * 1000 :
+          Date.now()
+        );
+      } else if (!alreadyTerminal) {
+        // Only update progress if we haven't reached a terminal state yet
+        updatePatch.finalStep = event;
+      }
+
+      tx.update(txRef, updatePatch);
     });
+  } catch (error) {
+    console.error(`[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`, error);
+  }
+}
   } catch (error) {
     console.error(`[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`, error);
   }
