@@ -43,7 +43,8 @@ type ApiResponse = {
   | "UNLOCK_TIMEOUT"
   | "VERIFICATION_FAILED"
   | "SLA_BREACH"
-  | "INVALID_INITIAL_STATE";
+  | "INVALID_INITIAL_STATE"
+  | "STATION_OFFLINE";
   failureReason?: string;
   providerRef?: string | null;
   message?: string;
@@ -140,7 +141,7 @@ export function PaymentProcessingPage() {
       .trim()
       .toUpperCase();
 
-    if (rawReason === "USER_CANCELLED" || rawReason === "INSUFFICIENT_FUNDS" || rawReason === "PROVIDER_DECLINED" || rawReason === "PROVIDER_ERROR" || rawReason === "TIMEOUT" || rawReason === "UNLOCK_FAILED" || rawReason === "UNLOCK_TIMEOUT" || rawReason === "VERIFICATION_FAILED" || rawReason === "SLA_BREACH" || rawReason === "INVALID_INITIAL_STATE" || rawReason === "WRONG_PIN") {
+    if (rawReason === "USER_CANCELLED" || rawReason === "INSUFFICIENT_FUNDS" || rawReason === "PROVIDER_DECLINED" || rawReason === "PROVIDER_ERROR" || rawReason === "TIMEOUT" || rawReason === "UNLOCK_FAILED" || rawReason === "UNLOCK_TIMEOUT" || rawReason === "VERIFICATION_FAILED" || rawReason === "SLA_BREACH" || rawReason === "INVALID_INITIAL_STATE" || rawReason === "WRONG_PIN" || rawReason === "STATION_OFFLINE") {
       return rawReason as ApiResponse["reason_code"];
     }
 
@@ -198,6 +199,10 @@ export function PaymentProcessingPage() {
       return "Lacag bixinta waxay qaadatay waqti dheer. Fadlan la xiriir taageerada macaamiisha.";
     }
 
+    if (reason === "STATION_OFFLINE") {
+      return "Station-kaan hadda ma shaqeynayo. Fadlan tijaabi mid kale.";
+    }
+
     return "Wax khalad ah ayaa dhacay, fadlan mar kale isku day. Something went wrong, please try again.";
   };
 
@@ -242,6 +247,10 @@ export function PaymentProcessingPage() {
 
     if (reason === "SLA_BREACH") {
       return "Waqti dheer ayay qaadatay";
+    }
+
+    if (reason === "STATION_OFFLINE") {
+      return "Station-ka waa offline";
     }
 
     return "Lacag bixinta ma dhicin";
@@ -437,7 +446,7 @@ export function PaymentProcessingPage() {
           const reason = normalizeFailureReason(data);
           setStatus("FAILED");
           setFailureReason(reason);
-          setErrorMessage(getFriendlyFailureMessage(reason));
+          setErrorMessage(data.error || getFriendlyFailureMessage(reason));
           updateStepStatus("init", "failed");
           return;
         }

@@ -12,7 +12,11 @@ import {
   requestWaafiPreauthorization,
   detectFailureReason,
 } from "@/lib/server/payment/waafi";
-import { ensureDeliveryContext, triggerUnlockIfNeeded } from "@/lib/server/payment/status";
+import { 
+  ensureDeliveryContext, 
+  triggerUnlockIfNeeded, 
+  isStationHealthy 
+} from "@/lib/server/payment/status";
 import { logError } from "@/lib/server/alerts/log-error";
 import { checkUserRestrictions } from "@/lib/server/payment/rentals";
 import { getStationConfigByCode } from "@/lib/server/station-config";
@@ -31,7 +35,8 @@ function failedPaymentResponse(
     | "PROVIDER_DECLINED"
     | "PROVIDER_ERROR"
     | "ACTIVE_RENTAL_OVERDUE"
-    | "ACTIVE_RENTAL_LOST",
+    | "ACTIVE_RENTAL_LOST"
+    | "STATION_OFFLINE",
   error: string,
   status: number,
 ) {
@@ -114,6 +119,18 @@ export async function POST(request: NextRequest) {
         : "Your account is blocked due to a lost battery. Please contact support.",
       403,
     );
+  }
+
+  // Phase 6: Station Health Entry Gate (Critical Invariant Enforcement)
+  if (parsed.stationCode) {
+    const healthy = await isStationHealthy(parsed.stationCode);
+    if (!healthy) {
+      return failedPaymentResponse(
+        "STATION_OFFLINE",
+        "This station is currently unavailable. Please try another station.",
+        409,
+      );
+    }
   }
 
   try {

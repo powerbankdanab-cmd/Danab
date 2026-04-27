@@ -766,7 +766,11 @@ export async function isStationHealthy(stationCode: string): Promise<boolean> {
   const now = Date.now();
   const threshold = now - (15 * 60 * 1000); // 15 mins
 
+  const config = getStationConfigByCode(stationCode);
+  if (!config) return false;
+
   try {
+    // 1. Blackhole Check: Persistent failure detection
     const recentFailuresSnap = await db.collection("errors")
       .where("stationCode", "==", stationCode)
       .where("createdAt", ">", threshold)
@@ -774,10 +778,23 @@ export async function isStationHealthy(stationCode: string): Promise<boolean> {
       .limit(3)
       .get();
 
-    // If 3+ ejection failures in 15 mins, consider station unhealthy
-    return recentFailuresSnap.size < 3;
+    if (recentFailuresSnap.size >= 3) {
+      console.warn("station_health_check: unhealthy (blackholed)", { stationCode });
+      return false;
+    }
+
+    // 2. Online Check: Connectivity verification
+    const { queryStationBatteries } = await import("@/lib/server/payment/heycharge");
+    try {
+      await queryStationBatteries(config.imei);
+    } catch (err) {
+      console.warn("station_health_check: offline (query failed)", { stationCode, err: String(err) });
+      return false;
+    }
+
+    return true;
   } catch (err) {
     console.error("isStationHealthy_check_failed", { stationCode, err });
-    return true; // Default to healthy to avoid false blocking
+    return true; // Default to healthy to avoid false blocking on DB error
   }
 }
