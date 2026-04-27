@@ -19,6 +19,7 @@ import {
   PAYMENT_TRANSACTIONS_COLLECTION,
   releaseTransactionRecovery,
   logTransactionEvent,
+  toMillis,
   type RecoveryFence,
   type PaymentTransactionRecord,
 } from "@/lib/server/payment/transactions";
@@ -32,6 +33,8 @@ import {
 import { triggerUnlockIfNeeded, getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 
 const RECOVERY_LEASE_MS = 30_000;
+const HELD_STALL_SLA_MS = 45_000; // 45s SLA for hardware flow
+const HELD_RESUME_COOLDOWN_MS = 20_000; // 20s between resume attempts
 const UNKNOWN_RECONCILE_BASE_DELAY_MS = 30_000; // Start at 30s
 const UNKNOWN_RECONCILE_MAX_DELAY_MS = 30 * 60_000; // Max 30 min
 const UNKNOWN_RECONCILE_MAX_ATTEMPTS = 15;
@@ -147,11 +150,50 @@ async function reconcileCaptured(
     return "noop" as const;
   }
   if (transaction.rentalCreated) {
-    return "noop" as const;
+    // Even if rental created, check provider truth for symmetric repair
+    return reconcileCapturedSymmetric(transaction, fence);
   }
 
   await ensureRentalForCapturedTransaction(transaction, fence);
   return "repaired" as const;
+}
+
+/**
+ * Phase 7: Symmetric Repair. 
+ * If we think it's captured but provider says it's cancelled, we must repair toward provider.
+ */
+async function reconcileCapturedSymmetric(
+  transaction: PaymentTransactionRecord,
+  fence: RecoveryFence,
+): Promise<"noop" | "repaired" | "failed"> {
+  let waafiStatus;
+  try {
+    waafiStatus = await queryWaafiTransactionStatus({
+      transactionId: transaction.providerRef || null,
+      referenceId: transaction.providerReferenceId || null,
+    });
+  } catch (error) {
+    return "noop";
+  }
+
+  if (isWaafiCancelled(waafiStatus)) {
+     await logError({
+       type: CRITICAL_ERROR_TYPES.CRITICAL_SPLIT_BRAIN_DETECTED,
+       transactionId: transaction.id,
+       message: "SYMMETRIC SPLIT-BRAIN: Local CAPTURED but Provider says CANCELLED. Repairing toward Provider.",
+       metadata: { waafiStatus: waafiStatus.params?.state }
+     });
+
+     await guardedTransitionPaymentTransactionState({
+       fence,
+       from: "captured",
+       to: "failed",
+       patch: { failedAt: Date.now(), failureReason: "Symmetric repair: Provider says cancelled" }
+     });
+     return "failed";
+  }
+
+  return "noop";
 }
 
 function getUnknownReconcileBackoffMs(retryCount: number) {
@@ -160,21 +202,6 @@ function getUnknownReconcileBackoffMs(retryCount: number) {
   return exp + jitter;
 }
 
-type TimestampLike = number | Date | { toMillis?: () => number } | { seconds?: number } | null | undefined;
-
-function toMillis(value: TimestampLike): number | null {
-  if (typeof value === "number") return value;
-  if (value instanceof Date) return value.getTime();
-  if (value && typeof value === "object") {
-    if (typeof (value as { toMillis?: unknown }).toMillis === "function") {
-      return (value as { toMillis: () => number }).toMillis();
-    }
-    if (typeof (value as { seconds?: unknown }).seconds === "number") {
-      return (value as { seconds: number }).seconds * 1000;
-    }
-  }
-  return null;
-}
 
 async function scheduleUnknownRetry(
   transaction: PaymentTransactionRecord,
@@ -403,16 +430,14 @@ export async function reconcileTransactions(limit = 50): Promise<ReconcileSummar
         } else if (result === "unknown_retained") {
           summary.unknownRetained += 1;
         }
-      } else if (current.status === "held" || current.status === "pending_payment") {
-        // Progression for early-stage transactions
-        if (current.status === "held" && !current.unlockStarted) {
-           await triggerUnlockIfNeeded(current);
-           summary.repaired += 1;
-        } else {
-           // pending_payment or held-but-started (which might be stuck)
-           await getProviderDrivenPaymentStatus(current.id);
-           summary.repaired += 1;
-        }
+      } else if (current.status === "held" || current.status === "pending_payment" || current.status === "paid") {
+        const result = await reconcileEarlyStage(current, fence);
+        if (result === "repaired") summary.repaired += 1;
+        else if (result === "failed") summary.failed += 1;
+      } else if (current.status === "cancel_pending") {
+        const result = await reconcileCancelPending(current, fence);
+        if (result === "failed") summary.failed += 1;
+        else if (result === "repaired") summary.repaired += 1;
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -472,7 +497,7 @@ async function reconcileCaptureInProgress(
       captureAttempted: transaction.captureAttempted,
       captureCompleted: transaction.captureCompleted,
       providerCaptureRef: transaction.providerCaptureRef,
-      ageMs: Date.now() - (transaction.captureAttemptedAt || 0),
+      ageMs: Date.now() - (toMillis(transaction.captureAttemptedAt) || 0),
     },
   });
 
@@ -692,6 +717,138 @@ async function reconcileVerifiedCrash(
  * Reconciles a transaction in verified status (ejection confirmed).
  * Ensures it progresses to capture.
  */
+async function reconcileEarlyStage(
+  transaction: PaymentTransactionRecord,
+  fence: RecoveryFence,
+): Promise<"repaired" | "failed" | "unknown_retained" | "noop"> {
+  const lastUpdate = toMillis(transaction.updatedAt) || Date.now();
+  const age = Date.now() - lastUpdate;
+
+  // 1. Pending Payment Recovery
+  if (transaction.status === "pending_payment") {
+    await getProviderDrivenPaymentStatus(transaction.id);
+    return "repaired";
+  }
+
+  // 2. Paid -> Held Recovery
+  if (transaction.status === "paid") {
+    await getProviderDrivenPaymentStatus(transaction.id);
+    return "repaired";
+  }
+
+  // 3. Held State Recovery (SLA enforcement & Resumption)
+  if (transaction.status === "held") {
+    // Case A: Never started
+    if (!transaction.unlockStarted) {
+      await triggerUnlockIfNeeded(transaction);
+      return "repaired";
+    }
+
+    // Case B: Started but not finished (Check SLA)
+    if (!transaction.unlockCompleted && !transaction.unlockFailed) {
+      // If it's over the SLA (45s), we must auto-cancel to protect user funds
+      if (age > HELD_STALL_SLA_MS) {
+        await logError({
+          type: CRITICAL_ERROR_TYPES.SLA_BREACH_DETECTED,
+          transactionId: transaction.id,
+          message: `SLA Breach: Transaction held for ${Math.floor(age/1000)}s without unlock completion. Auto-cancelling.`,
+          metadata: { age, status: "held", unlockStarted: true }
+        });
+
+        const { cancelHold } = await import("@/lib/server/payment/process-payment");
+        await cancelHold(transaction.id, "SLA_BREACH: Hardware flow timed out");
+        return "failed";
+      }
+
+      // If it's older than 20s, try one resume attempt
+      if (age > HELD_RESUME_COOLDOWN_MS) {
+        await triggerUnlockIfNeeded(transaction);
+        return "repaired";
+      }
+    }
+  }
+
+  return "noop";
+}
+
+/**
+ * Phase 6: Reconcile transactions that were ordered to cancel but haven't been verified yet.
+ */
+async function reconcileCancelPending(
+  transaction: PaymentTransactionRecord,
+  fence: RecoveryFence,
+): Promise<"repaired" | "failed" | "unknown_retained" | "noop"> {
+  if (transaction.status !== "cancel_pending") return "noop";
+
+  const age = Date.now() - (toMillis(transaction.updatedAt) || Date.now());
+
+  let waafiStatus;
+  try {
+    waafiStatus = await queryWaafiTransactionStatus({
+      transactionId: transaction.providerRef || null,
+      referenceId: transaction.providerReferenceId || null,
+    });
+  } catch (error) {
+    // If provider check keeps failing and we are way past SLA, move to failed locally but alert
+    if (age > 120_000) {
+      await logError({
+        type: "CANCEL_UNRESOLVED",
+        transactionId: transaction.id,
+        message: "SLA BREACH: cancel_pending unresolved after 2 mins (Provider Error). Force marking as FAILED.",
+        metadata: { age, error: String(error) }
+      });
+      await guardedTransitionPaymentTransactionState({
+        fence,
+        from: "cancel_pending",
+        to: "failed",
+        patch: { failedAt: Date.now(), failureReason: "SLA_BREACH: Provider verification timed out" }
+      });
+      return "failed";
+    }
+    return "unknown_retained";
+  }
+
+  // Case A: Confirmed Cancelled -> Move to terminal failed state
+  if (isWaafiCancelled(waafiStatus)) {
+    await guardedTransitionPaymentTransactionState({
+      fence,
+      from: "cancel_pending",
+      to: "failed",
+      patch: { 
+        failedAt: Date.now(),
+        failureReason: transaction.failureReason || "Cancellation verified by provider",
+      }
+    });
+    return "failed";
+  }
+
+  // Case B: Confirmed Captured -> SPLIT BRAIN detected!
+  if (isWaafiCaptured(waafiStatus)) {
+    await logError({
+      type: CRITICAL_ERROR_TYPES.CRITICAL_SPLIT_BRAIN_DETECTED,
+      transactionId: transaction.id,
+      message: "Split-brain detected during cancel_pending reconciliation: Provider says CAPTURED but system tried to CANCEL.",
+      metadata: { waafiStatus: waafiStatus.params?.state }
+    });
+
+    await guardedTransitionPaymentTransactionState({
+      fence,
+      from: "cancel_pending",
+      to: "captured",
+      patch: { 
+        capturedAt: Date.now(),
+        rentalCreated: false, // Audit will catch and repair this
+      }
+    });
+    return "repaired";
+  }
+
+  // Case C: Still pending or unresolved -> schedule retry
+  await scheduleUnknownRetry(transaction, fence, "Cancellation verification pending at provider");
+  return "unknown_retained";
+}
+
+
 async function reconcileVerified(
   transaction: PaymentTransactionRecord,
   fence: RecoveryFence,
@@ -713,7 +870,7 @@ async function reconcileVerified(
 
   // Case 2: Capture was attempted but we don't know the result (crash/timeout)
   if (transaction.captureAttempted) {
-    const age = Date.now() - (transaction.captureAttemptedAt || 0);
+    const age = Date.now() - (toMillis(transaction.captureAttemptedAt) || 0);
     
     // If it's very recent, wait for it to settle
     if (age < 30_000) {
@@ -886,7 +1043,7 @@ export async function auditCaptureInvariants(limit = 100): Promise<{
   for (const doc of captureInProgressSnap.docs) {
     scanned++;
     const tx = doc.data() as PaymentTransactionRecord;
-    const ageMs = Date.now() - (tx.captureAttemptedAt || 0);
+    const ageMs = Date.now() - (toMillis(tx.captureAttemptedAt) || 0);
 
     if (ageMs > STALE_CAPTURE_THRESHOLD_MS) {
       violations.push({

@@ -17,6 +17,14 @@ export type MinimalTransactionRecord = {
   updatedAt: Date | Timestamp | number;
 };
 
+export function toMillis(val: any): number | null {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "number") return val;
+  if (val instanceof Date) return val.getTime();
+  if (val && typeof val.toMillis === "function") return val.toMillis();
+  return null;
+}
+
 export type PaymentTransactionStatus =
   | "initiated"
   | "held"
@@ -30,7 +38,8 @@ export type PaymentTransactionStatus =
   | "failed"
   | "confirm_required"
   | "capture_unknown"
-  | "resolving";
+  | "resolving"
+  | "cancel_pending";
 
 export type PaymentDeliveryContext = {
   imei: string;
@@ -54,6 +63,7 @@ export type PaymentTransactionRecord = {
   unlockStarted?: boolean;
   unlockCompleted?: boolean;
   unlockFailed?: boolean;
+  unlockRetryCount?: number;
   processingStartedAt?: Date | Timestamp | number;
   createdAt: Date | Timestamp | number;
   updatedAt: Date | Timestamp | number;
@@ -268,6 +278,27 @@ export async function ensurePaymentTransactionState(
   return record;
 }
 
+export async function markTransactionCancelPending(id: string, reason: string) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) return;
+    const current = snap.data() as PaymentTransactionRecord;
+    
+    // If already terminal, don't move to cancel_pending
+    if (current.status === "failed" || current.status === "captured") return;
+
+    tx.update(docRef, {
+      status: "cancel_pending",
+      failureReason: reason,
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+  });
+}
+
 export async function transitionPaymentTransactionState(input: {
   id: string;
   from: PaymentTransactionStatus;
@@ -319,28 +350,25 @@ export async function markUnlockStarted(id: string) {
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
     const current = snap.data() as PaymentTransactionRecord;
-    
-    // If already completed or failed definitively, do not restart
+    const retryCount = (current.unlockRetryCount || 0) + 1;
+
+    if (retryCount > 3) {
+      return "MAX_RETRIES_EXCEEDED";
+    }
+
     if (current.unlockCompleted) return "ALREADY_COMPLETED";
     if (current.unlockFailed) return "ALREADY_FAILED";
-    
-    // If already started, we allow the caller to decide if they want to resume/retry
-    if (current.unlockStarted) return "ALREADY_STARTED";
 
-    if (current.status !== "held" && current.status !== "paid") {
-       throw new HttpError(409, "Invalid status for unlock", { status: current.status });
-    }
+    const result = current.unlockStarted ? "ALREADY_STARTED" : "SUCCESS";
 
     tx.update(docRef, {
       unlockStarted: true,
-      unlockCompleted: false,
-      unlockFailed: false,
-      processingStartedAt: Date.now(),
+      unlockRetryCount: retryCount,
       updatedAt: Date.now(),
       updatedAtTs: Timestamp.now(),
     });
 
-    return "SUCCESS";
+    return result;
   });
 }
 

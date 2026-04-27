@@ -7,13 +7,14 @@ import {
   PAYMENT_TRANSACTIONS_COLLECTION,
   PaymentTransactionRecord,
   logTransactionEvent,
+  toMillis,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
 import { finalizeCapture, cancelHold, performEjectionAndVerification } from "@/lib/server/payment/process-payment";
 import { getDb } from "@/lib/server/firebase-admin";
 import { Timestamp } from "firebase-admin/firestore";
 import { verifyDeliveryWithConfidence } from "@/lib/server/payment/delivery-verification";
-import { logError } from "@/lib/server/alerts/log-error";
+import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 import { getAvailableBattery } from "@/lib/server/payment/heycharge";
 import { reserveBattery } from "@/lib/server/payment/battery-lock";
 import { getStationConfigByCode } from "@/lib/server/station-config";
@@ -80,31 +81,6 @@ function toReasonCode(
   }
 }
 
-function toMillis(value: unknown): number | null {
-  if (!value) return null;
-
-  if (typeof value === "number") return value;
-
-  if (value instanceof Date) return value.getTime();
-
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { toMillis?: unknown }).toMillis === "function"
-  ) {
-    return (value as { toMillis: () => number }).toMillis();
-  }
-
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { seconds?: unknown }).seconds === "number"
-  ) {
-    return (value as { seconds: number }).seconds * 1000;
-  }
-
-  return null;
-}
 
 function buildStatusResponse(
   transaction: PaymentTransactionRecord,
@@ -265,6 +241,21 @@ export async function triggerUnlockIfNeeded(
   // If already finished or failed, nothing to do
   if (transaction.unlockCompleted || transaction.unlockFailed) {
     return;
+  }
+
+  // Phase 5: Station Health Protection
+  if (transaction.delivery?.stationCode) {
+    const healthy = await isStationHealthy(transaction.delivery.stationCode);
+    if (!healthy) {
+       await logError({
+         type: CRITICAL_ERROR_TYPES.DELIVERY_VERIFICATION,
+         transactionId: transaction.id,
+         stationCode: transaction.delivery.stationCode,
+         message: "Station blacklisted due to recent failures. Skipping unlock attempt.",
+       });
+       // Do not auto-cancel yet, let reconciliation handle or manual repair
+       return;
+    }
   }
 
   // If already started but not finished, we check if we should resume (e.g. after crash)
@@ -768,5 +759,25 @@ export async function ensureDeliveryContext(
       error,
     });
     return null;
+  }
+}
+export async function isStationHealthy(stationCode: string): Promise<boolean> {
+  const db = (await import("@/lib/server/firebase-admin")).getDb();
+  const now = Date.now();
+  const threshold = now - (15 * 60 * 1000); // 15 mins
+
+  try {
+    const recentFailuresSnap = await db.collection("errors")
+      .where("stationCode", "==", stationCode)
+      .where("createdAt", ">", threshold)
+      .where("type", "==", CRITICAL_ERROR_TYPES.VERIFICATION_FAILED)
+      .limit(3)
+      .get();
+
+    // If 3+ ejection failures in 15 mins, consider station unhealthy
+    return recentFailuresSnap.size < 3;
+  } catch (err) {
+    console.error("isStationHealthy_check_failed", { stationCode, err });
+    return true; // Default to healthy to avoid false blocking
   }
 }

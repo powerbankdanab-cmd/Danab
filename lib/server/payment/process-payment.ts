@@ -39,6 +39,8 @@ import {
   markCaptureAttempted,
   PaymentTransactionRecord,
   logTransactionEvent,
+  toMillis,
+  markTransactionCancelPending,
 } from "@/lib/server/payment/transactions";
 import { reconcileTransactionById } from "@/lib/server/payment/reconciliation";
 import {
@@ -72,29 +74,6 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type TimestampLike =
-  | number
-  | Date
-  | {
-    toMillis?: () => number;
-    seconds?: number;
-  }
-  | null
-  | undefined;
-
-function toMillis(value: TimestampLike): number | null {
-  if (typeof value === "number") return value;
-  if (value instanceof Date) return value.getTime();
-  if (value && typeof value === "object") {
-    if (typeof value.toMillis === "function") {
-      return value.toMillis();
-    }
-    if (typeof value.seconds === "number") {
-      return value.seconds * 1000;
-    }
-  }
-  return null;
-}
 
 async function getBatterySnapshot(
   imei: string,
@@ -1451,7 +1430,7 @@ export async function cancelHold(idempotencyKey: string, reason: string): Promis
     }
   }
 
-  await markTransactionFailed(idempotencyKey, reason);
+  await markTransactionCancelPending(idempotencyKey, reason);
 
   // Post-cancellation verification: Ensure provider agrees it's not captured
   try {
@@ -1580,6 +1559,18 @@ export async function performEjectionAndVerification(input: {
   // ── Atomic exactly-once guard ──────────────────────────────
   const startResult = await markUnlockStarted(idempotencyKey);
   
+  if (startResult === "MAX_RETRIES_EXCEEDED") {
+     await logError({
+       type: CRITICAL_ERROR_TYPES.DELIVERY_VERIFICATION,
+       transactionId: idempotencyKey,
+       stationCode,
+       message: "MAX_HARDWARE_RETRIES_EXCEEDED: Capping resume attempts to prevent infinite loop.",
+     });
+     await markUnlockFailed(idempotencyKey, "Maximum hardware resume attempts exceeded");
+     await cancelHold(transactionId, "Hardware flow failed multiple resume attempts");
+     return;
+  }
+
   if (startResult === "ALREADY_COMPLETED" || startResult === "ALREADY_FAILED") {
     console.info("unlock_already_terminal_skipping", { idempotencyKey, startResult });
     return;
@@ -1619,7 +1610,7 @@ export async function performEjectionAndVerification(input: {
       console.error("Critical: Failed to cancel hold in failed verify", cancelErr);
     }
 
-    await markTransactionFailed(idempotencyKey, "Battery missing before unlock");
+    await markTransactionCancelPending(idempotencyKey, "Battery missing before unlock");
     throw new HttpError(409, "Battery is no longer in slot. Please retry.");
   }
 
@@ -1653,10 +1644,17 @@ export async function performEjectionAndVerification(input: {
       });
     } catch (err) {
       lastUnlockError = err;
+      const isPermanent = isHardwareFailurePermanent(err);
+
       await logTransactionEvent(idempotencyKey, "UNLOCK_FAILED", {
         attempt,
         error: err instanceof Error ? err.message : String(err),
+        isPermanent,
       }, "CRITICAL");
+
+      if (isPermanent) {
+        break; // Stop retrying if hardware is definitively broken
+      }
     }
   }
 
@@ -1703,7 +1701,7 @@ export async function performEjectionAndVerification(input: {
     }
     await markUnlockFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
     await cancelHold(transactionId, "Battery ejection not verified");
-    await markTransactionFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
+    await markTransactionCancelPending(idempotencyKey, `Ejection not verified: ${failureNote}`);
 
     throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
   }
@@ -1753,4 +1751,23 @@ export async function resumePendingPayment(transaction: PaymentTransactionRecord
     phoneAuthority: delivery.phoneAuthority || "async_confirmed",
     canonicalPhoneNumber: phoneNumber,
   });
+}
+
+export function isHardwareFailurePermanent(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  
+  // Example permanent failure signals from hardware API
+  const hardSignals = [
+    "slot blocked",
+    "mechanical fault",
+    "invalid slot",
+    "station hardware error",
+    "unsupported operation",
+    "battery lock error",
+    "slot mechanical jam",
+    "board communication failure",
+    "emergency stop active"
+  ];
+
+  return hardSignals.some(signal => msg.includes(signal));
 }

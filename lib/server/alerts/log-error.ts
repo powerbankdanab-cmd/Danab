@@ -206,7 +206,22 @@ export async function logError(input: LogErrorInput): Promise<LogErrorResult> {
     return { logged, alertStatus: null };
   }
 
-  // Persistent deduplication to prevent alert fatigue
+  // Station-level deduplication (Cross-transaction correlation)
+  if (input.stationCode) {
+    try {
+      const windowMinutes = 60;
+      const windowId = Math.floor(Date.now() / (windowMinutes * 60 * 1000));
+      const stationLockRef = getDb().collection("alert_locks").doc(`station_${input.stationCode}_${input.type}_${windowId}`);
+      await stationLockRef.create({ createdAt: Date.now() });
+    } catch (e: any) {
+      if (e.code === 6) { // ALREADY_EXISTS
+        console.warn(`[ALERT_STATION_DEDUPLICATED] Skipping duplicate station alert for Station: ${input.stationCode}, Type: ${input.type}`);
+        return { logged, alertStatus: null };
+      }
+    }
+  }
+
+  // Persistent deduplication per transaction
   if (input.transactionId) {
     try {
       const lockRef = getDb().collection("alert_locks").doc(`${input.transactionId}_${input.type}`);
