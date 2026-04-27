@@ -355,9 +355,16 @@ export async function markUnlockStarted(id: string) {
 
     const current = snap.data() as PaymentTransactionRecord;
     const now = Date.now();
-    const retryCount = (current.unlockRetryCount || 0) + 1;
+    let retryCount = (current.unlockRetryCount || 0) + 1;
 
-    // Strict Retry Storm Protection: Max 3 total, Max 2 per 5 minutes
+    // Reset logic: If the last attempt was over 10 minutes ago, 
+    // we assume a transient outage might have cleared. 
+    // Reset to attempt 1 to allow a fresh cycle.
+    if (current.lastUnlockAttemptAt && (now - current.lastUnlockAttemptAt > 10 * 60 * 1000)) {
+       retryCount = 1;
+    }
+
+    // Strict Retry Storm Protection: Max 3 total per cycle, Max 2 per 5 minutes
     if (retryCount > 3) {
       return "MAX_RETRIES_EXCEEDED";
     }
@@ -365,10 +372,6 @@ export async function markUnlockStarted(id: string) {
     if (current.lastUnlockAttemptAt) {
       const fiveMinsAgo = now - (5 * 60 * 1000);
       if (current.lastUnlockAttemptAt > fiveMinsAgo && retryCount >= 2) {
-         // If we already tried within 5 mins and this is at least the 2nd attempt, 
-         // we should probably slow down or wait for worker.
-         // BUT, for the VERY FIRST retry (attempt 2), we allow it once. 
-         // If they try a 3rd time within 5 mins, we block.
          if (retryCount >= 3) return "RATE_LIMITED";
       }
     }

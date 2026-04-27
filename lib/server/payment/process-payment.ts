@@ -1101,6 +1101,17 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
     throw new HttpError(400, `Transaction in invalid state for capture: ${tx?.status}`);
   }
 
+  // ── Hard Guard: No money without delivery ────────────────────────
+  if (!tx.verifiedAt && tx.status !== "captured") {
+    await logError({
+      type: "CAPTURE_WITHOUT_VERIFICATION",
+      transactionId: idempotencyKey,
+      message: "CRITICAL: Capture attempted before hardware verification was recorded",
+      metadata: { status: tx.status, unlockStarted: tx.unlockStarted }
+    });
+    return { status: tx.status, error: "CAPTURE_WITHOUT_VERIFICATION" };
+  }
+
   // ── Idempotency: already fully complete ──────────────────────────
   if (tx.status === "captured" && tx.rentalCreated) {
     return {

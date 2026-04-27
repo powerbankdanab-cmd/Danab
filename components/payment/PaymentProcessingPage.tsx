@@ -128,7 +128,7 @@ export function PaymentProcessingPage() {
   const [steps, setSteps] = useState<PaymentStep[]>([
     { id: "init", label: "Payment initiated", somaliLabel: "Lacag bixinta waa la bilaabay", status: "pending" },
     { id: "pending", label: "Waiting for PIN on your phone", somaliLabel: "Fadlan dhammee PIN-ka taleefankaaga", status: "pending" },
-    { id: "confirmed", label: "Payment confirmed", somaliLabel: "Lacagta waa la xaqiijiyay", status: "pending" },
+    { id: "confirmed", label: "Payment confirmed", somaliLabel: "Lacagta waxaa lagu hayaa hold", status: "pending" },
     { id: "unlocking", label: "Releasing power bank", somaliLabel: "Sii deynta power bank-ga", status: "pending" },
     { id: "verifying", label: "Verifying", somaliLabel: "Hubinta inuu si sax ah u soo baxay", status: "pending" },
     { id: "success", label: "Power bank ready", somaliLabel: "Power Bank Waa Diyaar", status: "pending" },
@@ -558,7 +558,7 @@ export function PaymentProcessingPage() {
           updateStepStatus("unlocking", "completed");
           updateStepStatus("verifying", "completed");
           updateStepStatus("success", "completed");
-          setBatteryInfo({ batteryId: data.battery_id || "" , slotId: data.slot_id || "" });
+          setBatteryInfo({ batteryId: data.battery_id || "", slotId: data.slot_id || "" });
           setIsSlowPolling(false);
           console.info("PAYMENT_VERIFIED", { transactionId });
           setStatus("SUCCESS");

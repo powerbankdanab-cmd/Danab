@@ -9,6 +9,7 @@ import {
   logTransactionEvent,
   toMillis,
   markUnlockStarted,
+  markTransactionCancelPending,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
 import { finalizeCapture, cancelHold, performEjectionAndVerification } from "@/lib/server/payment/process-payment";
@@ -239,6 +240,22 @@ export async function triggerUnlockIfNeeded(
       attempt: refreshed.unlockRetryCount || 0,
       reason: "ALREADY_STARTED"
     };
+  }
+
+  // 1.5. Station Health Invariant: Don't unlock if station is dead
+  if (refreshed.station) {
+    const healthy = await isStationHealthy(refreshed.station);
+    if (!healthy) {
+      await logError({
+        type: "STATION_HEALTH_FAILURE",
+        transactionId: refreshed.id,
+        message: "Station health check failed before unlock. Cancelling.",
+        metadata: { stationCode: refreshed.station }
+      });
+
+      await markTransactionCancelPending(transactionId, "Station unhealthy before unlock");
+      return { started: false, reason: "STATION_OFFLINE" };
+    }
   }
 
   // 2. Execution Guarantee: Trigger the hardware
