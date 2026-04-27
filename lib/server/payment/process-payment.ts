@@ -34,6 +34,9 @@ import {
   patchPaymentTransaction,
   transitionPaymentTransactionState,
   markUnlockStarted,
+  markUnlockCompleted,
+  markUnlockFailed,
+  markCaptureAttempted,
   PaymentTransactionRecord,
   logTransactionEvent,
 } from "@/lib/server/payment/transactions";
@@ -1274,6 +1277,13 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
 
       // ── Transition to capture_in_progress ─────────────────────────
       if (tx.status !== "capture_in_progress") {
+        const attempted = await markCaptureAttempted(idempotencyKey);
+        
+        // If already attempted by another worker, let them finish or wait for next reconciliation
+        if (!attempted && !tx.captureAttempted) {
+           return; 
+        }
+
         await logTransactionEvent(idempotencyKey, "CAPTURE_INITIATED", {
           providerRef: transactionId,
           attempt: retryCount + 1,
@@ -1284,8 +1294,7 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
           from: "verified",
           to: "capture_in_progress",
           patch: {
-            captureAttempted: true,
-            captureAttemptedAt: Date.now(),
+            // markCaptureAttempted already set captureAttempted: true
             captureRetryCount: retryCount + 1,
           },
         });
@@ -1443,6 +1452,30 @@ export async function cancelHold(idempotencyKey: string, reason: string): Promis
   }
 
   await markTransactionFailed(idempotencyKey, reason);
+
+  // Post-cancellation verification: Ensure provider agrees it's not captured
+  try {
+    const providerStatus = await queryWaafiTransactionStatus({ transactionId: tx.providerRef! });
+    if (isWaafiCaptured(providerStatus)) {
+      await logError({
+        type: CRITICAL_ERROR_TYPES.CRITICAL_SPLIT_BRAIN_DETECTED,
+        transactionId: idempotencyKey,
+        message: "CRITICAL: Transaction marked failed but provider confirms CAPTURED",
+        metadata: { providerRef: tx.providerRef, reason }
+      });
+      // Force transition to captured to repair state
+      await transitionPaymentTransactionState({
+        id: idempotencyKey,
+        from: "failed",
+        to: "captured",
+        patch: { capturedAt: Date.now(), captureCompleted: true, failureReason: "REPAIRED_FROM_SPLIT_BRAIN" }
+      });
+    }
+  } catch (err) {
+    // Non-fatal but should be logged
+    console.warn("Post-cancel verification failed", { idempotencyKey, err });
+  }
+
   return { status: "failed", success: true };
 }
 
@@ -1542,24 +1575,34 @@ export async function performEjectionAndVerification(input: {
     canonicalPhoneNumber
   } = input;
 
+  const currentBattery = battery;
+
   // ── Atomic exactly-once guard ──────────────────────────────
-  const started = await markUnlockStarted(idempotencyKey);
-  if (!started) {
-    console.info("unlock_already_started_skipping", { idempotencyKey });
+  const startResult = await markUnlockStarted(idempotencyKey);
+  
+  if (startResult === "ALREADY_COMPLETED" || startResult === "ALREADY_FAILED") {
+    console.info("unlock_already_terminal_skipping", { idempotencyKey, startResult });
     return;
   }
-  await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
-    station: stationCode,
-    batteryId: currentBattery.battery_id,
-    slotId: currentBattery.slot_id,
-  }, "IMPORTANT");
+
+  if (startResult === "ALREADY_STARTED") {
+    await logTransactionEvent(idempotencyKey, "AUTO_RESUME_UNLOCK_RECOVERY", {
+      reason: "Transaction was started but not completed/failed",
+    }, "IMPORTANT");
+  } else {
+    await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
+      station: stationCode,
+      batteryId: battery.battery_id,
+      slotId: battery.slot_id,
+    }, "IMPORTANT");
+  }
 
   let unlockAttempts = 0;
   let lastUnlockError: unknown = null;
   let confidence: DeliveryConfidence = "LOW";
   let verification: VerificationResult | null = null;
 
-  const preUnlockSnapshot = await getBatterySnapshot(imei, currentBattery.battery_id, currentBattery.slot_id);
+  const preUnlockSnapshot = await getBatterySnapshot(imei, battery.battery_id, battery.slot_id);
 
   if (preUnlockSnapshot.presence !== "present") {
     await logError({
@@ -1586,14 +1629,14 @@ export async function performEjectionAndVerification(input: {
     unlockAttempts = attempt;
     try {
       lastUnlockStartedAt = Date.now();
-      await releaseBattery({ imei, batteryId: currentBattery.battery_id, slotId: currentBattery.slot_id });
+      await releaseBattery({ imei, batteryId: battery.battery_id, slotId: battery.slot_id });
       await logTransactionEvent(idempotencyKey, "UNLOCK_SUCCESS", {
         attempt,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
+        batteryId: battery.battery_id,
+        slotId: battery.slot_id,
       }, "IMPORTANT");
 
-      verification = await verifyDeliveryWithConfidence(imei, currentBattery.battery_id, currentBattery.slot_id, {
+      verification = await verifyDeliveryWithConfidence(imei, battery.battery_id, battery.slot_id, {
         stationCode,
         phoneNumber,
         transactionId: idempotencyKey
@@ -1621,8 +1664,8 @@ export async function performEjectionAndVerification(input: {
   if (confidence === "MEDIUM") {
     await logTransactionEvent(idempotencyKey, "VERIFICATION_MEDIUM", {
       unlockAttempts,
-      batteryId: currentBattery.battery_id,
-      slotId: currentBattery.slot_id,
+      batteryId: battery.battery_id,
+      slotId: battery.slot_id,
     }, "IMPORTANT");
 
     await transitionPaymentTransactionState({
@@ -1634,8 +1677,8 @@ export async function performEjectionAndVerification(input: {
         delivery: {
           imei,
           stationCode,
-          batteryId: currentBattery.battery_id,
-          slotId: currentBattery.slot_id,
+          batteryId: battery.battery_id,
+          slotId: battery.slot_id,
           phoneAuthority,
           unlockAttempts,
           requestedPhoneNumber: phoneNumber,
@@ -1653,21 +1696,23 @@ export async function performEjectionAndVerification(input: {
     if (confidence === "LOW") {
       await logTransactionEvent(idempotencyKey, "VERIFICATION_LOW", {
         unlockAttempts,
-        batteryId: currentBattery.battery_id,
-        slotId: currentBattery.slot_id,
+        batteryId: battery.battery_id,
+        slotId: battery.slot_id,
         failureNote,
       }, "CRITICAL");
     }
+    await markUnlockFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
     await cancelHold(transactionId, "Battery ejection not verified");
     await markTransactionFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
 
     throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
   }
 
+  await markUnlockCompleted(idempotencyKey);
   await logTransactionEvent(idempotencyKey, "VERIFICATION_HIGH", {
     unlockAttempts,
-    batteryId: currentBattery.battery_id,
-    slotId: currentBattery.slot_id,
+    batteryId: battery.battery_id,
+    slotId: battery.slot_id,
     confidence,
   }, "IMPORTANT");
 

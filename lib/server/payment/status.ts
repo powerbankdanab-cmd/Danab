@@ -262,7 +262,25 @@ async function handleConfirmRequiredStatus(
 export async function triggerUnlockIfNeeded(
   transaction: PaymentTransactionRecord,
 ): Promise<void> {
-  if ((transaction.status !== "paid" && transaction.status !== "held") || transaction.unlockStarted) {
+  // If already finished or failed, nothing to do
+  if (transaction.unlockCompleted || transaction.unlockFailed) {
+    return;
+  }
+
+  // If already started but not finished, we check if we should resume (e.g. after crash)
+  if (transaction.unlockStarted) {
+     const age = Date.now() - toMillis(transaction.processingStartedAt || transaction.updatedAt)!;
+     if (age < 15_000) { // 15s cooldown before resuming a 'started' unlock
+       return;
+     }
+     
+     await logTransactionEvent(transaction.id, "AUTO_RESUME_UNLOCK_RECOVERY", {
+       reason: "Transaction was started but not completed/failed",
+       ageMs: age
+     }, "IMPORTANT");
+  }
+
+  if (transaction.status !== "paid" && transaction.status !== "held") {
     return;
   }
 

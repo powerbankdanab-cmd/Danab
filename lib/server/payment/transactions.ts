@@ -52,6 +52,8 @@ export type PaymentTransactionRecord = {
   amount: number;
   providerRef: string | null;
   unlockStarted?: boolean;
+  unlockCompleted?: boolean;
+  unlockFailed?: boolean;
   processingStartedAt?: Date | Timestamp | number;
   createdAt: Date | Timestamp | number;
   updatedAt: Date | Timestamp | number;
@@ -306,6 +308,8 @@ export async function transitionPaymentTransactionState(input: {
       ...(nextDoc as JsonObject),
     } as PaymentTransactionRecord;
   });
+}
+
 export async function markUnlockStarted(id: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
@@ -315,7 +319,13 @@ export async function markUnlockStarted(id: string) {
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
     const current = snap.data() as PaymentTransactionRecord;
-    if (current.unlockStarted) return false; // Already started
+    
+    // If already completed or failed definitively, do not restart
+    if (current.unlockCompleted) return "ALREADY_COMPLETED";
+    if (current.unlockFailed) return "ALREADY_FAILED";
+    
+    // If already started, we allow the caller to decide if they want to resume/retry
+    if (current.unlockStarted) return "ALREADY_STARTED";
 
     if (current.status !== "held" && current.status !== "paid") {
        throw new HttpError(409, "Invalid status for unlock", { status: current.status });
@@ -323,12 +333,14 @@ export async function markUnlockStarted(id: string) {
 
     tx.update(docRef, {
       unlockStarted: true,
+      unlockCompleted: false,
+      unlockFailed: false,
       processingStartedAt: Date.now(),
       updatedAt: Date.now(),
       updatedAtTs: Timestamp.now(),
     });
 
-    return true;
+    return "SUCCESS";
   });
 }
 
@@ -346,6 +358,44 @@ export async function markCaptureAttempted(id: string) {
     tx.update(docRef, {
       captureAttempted: true,
       captureAttemptedAt: Date.now(),
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+
+    return true;
+  });
+}
+
+export async function markUnlockCompleted(id: string) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) throw new HttpError(404, "Transaction not found");
+
+    tx.update(docRef, {
+      unlockCompleted: true,
+      unlockFailed: false,
+      updatedAt: Date.now(),
+      updatedAtTs: Timestamp.now(),
+    });
+
+    return true;
+  });
+}
+
+export async function markUnlockFailed(id: string, reason: string) {
+  const db = getDb();
+  const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) throw new HttpError(404, "Transaction not found");
+
+    tx.update(docRef, {
+      unlockFailed: true,
+      failureReason: reason,
       updatedAt: Date.now(),
       updatedAtTs: Timestamp.now(),
     });

@@ -32,10 +32,20 @@ import {
 import { triggerUnlockIfNeeded, getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 
 const RECOVERY_LEASE_MS = 30_000;
-const UNKNOWN_RECONCILE_BASE_DELAY_MS = 15_000;
-const UNKNOWN_RECONCILE_MAX_DELAY_MS = 15 * 60_000;
-const UNKNOWN_RECONCILE_MAX_ATTEMPTS = 12;
+const UNKNOWN_RECONCILE_BASE_DELAY_MS = 30_000; // Start at 30s
+const UNKNOWN_RECONCILE_MAX_DELAY_MS = 30 * 60_000; // Max 30 min
+const UNKNOWN_RECONCILE_MAX_ATTEMPTS = 15;
 const UNKNOWN_RECONCILE_MANUAL_REVIEW_AGE_MS = 2 * 60 * 60_000;
+
+function calculateNextReconcileDelay(attempt: number): number {
+  // Exponential backoff: 30s, 60s, 120s, 240s...
+  const base = UNKNOWN_RECONCILE_BASE_DELAY_MS * Math.pow(2, attempt);
+  const capped = Math.min(base, UNKNOWN_RECONCILE_MAX_DELAY_MS);
+  
+  // Add 10-20% jitter to prevent "thundering herd"
+  const jitter = 0.8 + Math.random() * 0.4; // 80% to 120%
+  return Math.floor(capped * jitter);
+}
 
 type ReconcileSummary = {
   scanned: number;
@@ -690,11 +700,31 @@ async function reconcileVerified(
     return "noop";
   }
 
-  // If captureAttempted is true, we use the specific crash recovery logic
+  // Case 1: Capture was already confirmed by provider before a crash
+  if (transaction.captureCompleted) {
+     await guardedTransitionPaymentTransactionState({
+       fence,
+       from: "verified",
+       to: "captured",
+       patch: { capturedAt: Date.now(), rentalCreated: false }
+     });
+     return "repaired";
+  }
+
+  // Case 2: Capture was attempted but we don't know the result (crash/timeout)
   if (transaction.captureAttempted) {
+    const age = Date.now() - (transaction.captureAttemptedAt || 0);
+    
+    // If it's very recent, wait for it to settle
+    if (age < 30_000) {
+      return "unknown_retained";
+    }
+
+    // Otherwise, check provider truth
     return reconcileVerifiedCrash(transaction, fence);
   }
 
+  // Case 3: Capture was never even attempted (stalled)
   await logTransactionEvent(transaction.id, "AUTO_TRIGGER_CAPTURE_RECOVERY", {
     reason: "Transaction stuck in verified state without capture attempt",
   }, "IMPORTANT");
