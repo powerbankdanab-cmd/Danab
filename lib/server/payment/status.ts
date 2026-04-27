@@ -8,6 +8,7 @@ import {
   PaymentTransactionRecord,
   logTransactionEvent,
   toMillis,
+  markUnlockStarted,
 } from "@/lib/server/payment/transactions";
 import { checkPaymentStatusDetailed, extractWaafiIds, cancelWaafiPreauthorization } from "@/lib/server/payment/waafi";
 import { finalizeCapture, cancelHold, performEjectionAndVerification } from "@/lib/server/payment/process-payment";
@@ -23,9 +24,12 @@ const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 const PROCESSING_TIMEOUT_MS = 30_000;
 const CONFIRM_REQUIRED_TIMEOUT_MS = 120_000;
 
+export type PaymentStage = "payment" | "unlock" | "verification" | "capture" | "system";
+
 export type PaymentStatusResponse = {
   status:
   | "pending_payment"
+  | "held"
   | "paid"
   | "processing"
   | "verifying"
@@ -33,6 +37,7 @@ export type PaymentStatusResponse = {
   | "verified"
   | "capture_in_progress"
   | "captured"
+  | "partial_success"
   | "failed";
   reason_code?:
   | "USER_CANCELLED"
@@ -44,19 +49,11 @@ export type PaymentStatusResponse = {
   | "UNLOCK_TIMEOUT"
   | "VERIFICATION_FAILED"
   | "SLA_BREACH"
-  | "INVALID_INITIAL_STATE";
-  failureReason?:
-  | "USER_CANCELLED"
-  | "INSUFFICIENT_FUNDS"
-  | "PROVIDER_DECLINED"
-  | "PROVIDER_ERROR"
-  | "TIMEOUT"
-  | "UNLOCK_FAILED"
-  | "UNLOCK_TIMEOUT"
-  | "VERIFICATION_FAILED"
-  | "SLA_BREACH"
-  | "INVALID_INITIAL_STATE";
+  | "INVALID_INITIAL_STATE"
+  | "STATION_OFFLINE";
+  stage?: PaymentStage | "system";
   unlockStarted?: boolean;
+  recovered?: boolean;
 };
 
 function toReasonCode(
@@ -75,34 +72,106 @@ function toReasonCode(
     case "VERIFICATION_FAILED":
     case "SLA_BREACH":
     case "INVALID_INITIAL_STATE":
+    case "STATION_OFFLINE":
       return code as PaymentStatusResponse["reason_code"];
     default:
       return undefined;
   }
 }
 
+function inferStage(
+  reasonCode: PaymentStatusResponse["reason_code"],
+  storedStage?: string | null,
+): PaymentStage {
+  if (
+    storedStage === "payment" ||
+    storedStage === "unlock" ||
+    storedStage === "verification" ||
+    storedStage === "capture"
+  ) {
+    return storedStage;
+  }
+
+  switch (reasonCode) {
+    case "USER_CANCELLED":
+    case "INSUFFICIENT_FUNDS":
+    case "PROVIDER_DECLINED":
+    case "PROVIDER_ERROR":
+    case "TIMEOUT":
+    case "STATION_OFFLINE":
+      return "payment";
+    case "UNLOCK_FAILED":
+    case "UNLOCK_TIMEOUT":
+    case "INVALID_INITIAL_STATE":
+      return "unlock";
+    case "VERIFICATION_FAILED":
+      return "verification";
+    case "SLA_BREACH":
+      return "verification";
+    default:
+      return "payment";
+  }
+}
 
 function buildStatusResponse(
   transaction: PaymentTransactionRecord,
 ): PaymentStatusResponse {
-  if (transaction.status === "failed") {
+  const recovered = (transaction.recoveryAttempts ?? 0) > 0;
+
+  // Terminal States (Failures)
+  if (transaction.status === "failed" || transaction.status === "cancel_pending") {
+    const reasonCode = toReasonCode(transaction.failureReason);
+    let stage = inferStage(reasonCode, transaction.failureStage);
+    
+    if (!stage) {
+      logError({
+        type: "INVARIANT_VIOLATION",
+        transactionId: transaction.id,
+        message: "Failure response requested but stage is missing. Falling back to system stage.",
+      });
+      stage = "system";
+    }
+
+    const isPartialSuccess =
+      stage === "unlock" &&
+      (reasonCode === "UNLOCK_FAILED" || reasonCode === "UNLOCK_TIMEOUT");
+
+    // partial_success ONLY if we have a guarantee that funds are not captured
+    // In our system, this is represented by status being held (pre-failure) 
+    // or actively being cancelled (cancel_pending) or marked failed after cancel.
+    if (isPartialSuccess && transaction.status !== "cancel_pending" && !transaction.failedAt) {
+      logError({
+        type: "INVARIANT_VIOLATION",
+        transactionId: transaction.id,
+        message: "Partial success claimed but no cancellation guarantee found. Downgrading to failed.",
+      });
+      return {
+        status: "failed",
+        reason_code: "PROVIDER_ERROR",
+        stage: "system",
+        recovered,
+      };
+    }
+
     return {
-      status: "failed",
-      reason_code: toReasonCode(transaction.failureReason),
-      failureReason: toReasonCode(transaction.failureReason),
+      status: isPartialSuccess ? "partial_success" : "failed",
+      reason_code: reasonCode,
+      stage,
+      recovered,
     };
   }
 
+  // Active States
   if (transaction.status === "processing") {
-    return { status: "processing" };
+    return { status: "processing", stage: "unlock", recovered };
   }
 
   if (transaction.status === "verifying") {
-    return { status: "verifying" };
+    return { status: "verifying", stage: "verification", recovered };
   }
 
   if (transaction.status === "confirm_required") {
-    return { status: "confirm_required" };
+    return { status: "confirm_required", stage: "verification", recovered };
   }
 
   if (
@@ -110,18 +179,158 @@ function buildStatusResponse(
     transaction.status === "capture_in_progress" ||
     transaction.status === "captured"
   ) {
-    return { status: "verified" };
+    return { 
+      status: transaction.status === "captured" ? "captured" : "verified", 
+      stage: transaction.status === "captured" ? "capture" : "verification", 
+      recovered 
+    };
   }
 
-  if (transaction.status === "held") {
-    return { status: "paid" };
+  if (transaction.status === "held" || transaction.status === "paid") {
+    return { 
+      status: "held", 
+      stage: transaction.unlockStarted ? "unlock" : "payment", 
+      recovered 
+    };
   }
 
+  return { status: "pending_payment", stage: "payment", recovered };
+}
+
+/**
+ * PURE READ ONLY PATH for UI polling.
+ */
+export async function getProviderDrivenPaymentStatus(
+  transactionId: string,
+): Promise<PaymentStatusResponse> {
+  const transaction = await getPaymentTransaction(transactionId);
+
+  if (!transaction) {
+    throw new HttpError(404, "Transaction not found");
+  }
+
+  return buildStatusResponse(transaction);
+}
+
+/**
+ * Atomic and idempotent trigger for the hardware unlock process.
+ */
+export async function triggerUnlockIfNeeded(
+  transactionId: string,
+): Promise<{ started: boolean; attempt?: number; reason?: string }> {
+  // 1. Atomic Guard: Attempt to mark the transaction as started.
+  // This uses a database transaction internally to prevent race conditions.
+  const result = await markUnlockStarted(transactionId);
+
+  if (result === "ALREADY_COMPLETED") return { started: false, reason: "ALREADY_COMPLETED" };
+  if (result === "ALREADY_FAILED") return { started: false, reason: "ALREADY_FAILED" };
+  if (result === "MAX_RETRIES_EXCEEDED") {
+    console.error("unlock_max_retries_exceeded", { transactionId });
+    return { started: false, reason: "MAX_RETRIES_EXCEEDED" };
+  }
+
+  // Fetch the fresh transaction record
+  const refreshed = await getPaymentTransaction(transactionId);
+  if (!refreshed) return { started: false, reason: "NOT_FOUND" };
+
+  if (result === "ALREADY_STARTED") {
+    return {
+      started: true,
+      attempt: refreshed.unlockRetryCount || 0,
+      reason: "ALREADY_STARTED"
+    };
+  }
+
+  // 2. Execution Guarantee: Trigger the hardware
+  try {
+    if (!refreshed.delivery) {
+       // Attempt to repair delivery context if missing
+       const delivery = await ensureDeliveryContext(refreshed);
+       if (!delivery) {
+         throw new Error("Missing delivery context for unlock and repair failed");
+       }
+       refreshed.delivery = delivery;
+    }
+
+    await performEjectionAndVerification({
+      idempotencyKey: refreshed.id,
+      transactionId: refreshed.providerRef || "UNKNOWN",
+      stationCode: refreshed.delivery.stationCode,
+      phoneNumber: refreshed.delivery.requestedPhoneNumber,
+      imei: refreshed.delivery.imei,
+      battery: {
+        battery_id: refreshed.delivery.batteryId,
+        slot_id: refreshed.delivery.slotId,
+      },
+      preauthAudit: refreshed.waafiAudit as Record<string, unknown>,
+      phoneAuthority: refreshed.delivery.phoneAuthority,
+      canonicalPhoneNumber: refreshed.delivery.canonicalPhoneNumber,
+    });
+
+    return {
+      started: true,
+      attempt: refreshed.unlockRetryCount || 1
+    };
+  } catch (error) {
+    await logError({
+      type: "UNLOCK_TRIGGER_FAILED",
+      transactionId: refreshed.id,
+      message: "Failed to perform unlock and verification from execution path",
+      metadata: {
+        status: refreshed.status,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+
+    return {
+      started: false,
+      attempt: refreshed.unlockRetryCount || 0,
+      reason: error instanceof Error ? error.message : "UNKNOWN_ERROR"
+    };
+  }
+}
+
+/**
+ * Reconciles the transaction state by checking the provider and hardware status.
+ * This function has side effects and should be called by workers or explicit trigger routes.
+ */
+export async function reconcileTransactionStatus(
+  transactionId: string,
+): Promise<PaymentStatusResponse> {
+  const transaction = await getPaymentTransaction(transactionId);
+  if (!transaction) throw new HttpError(404, "Transaction not found");
+
+  // 1. Handle hardware verification if in confirm_required state
+  if (transaction.status === "confirm_required") {
+    return await handleConfirmRequiredStatus(transaction);
+  }
+
+  // 2. Handle payment provider verification if in pending_payment state
+  if (transaction.status === "pending_payment") {
+    return await performProviderReconciliation(transaction);
+  }
+
+  // 3. Handle stuck 'paid' state (transition to 'held')
   if (transaction.status === "paid") {
-    return { status: "paid" };
+     if (!transaction.delivery) {
+        await ensureDeliveryContext(transaction);
+     }
+     
+     try {
+       await transitionPaymentTransactionState({
+         id: transaction.id,
+         from: "paid",
+         to: "held",
+         patch: { heldAt: Date.now() },
+       });
+       const updated = await getPaymentTransaction(transactionId);
+       return buildStatusResponse(updated || transaction);
+     } catch (e) {
+       // Conflict or error
+     }
   }
 
-  return { status: "pending_payment" };
+  return buildStatusResponse(transaction);
 }
 
 async function handleConfirmRequiredStatus(
@@ -167,341 +376,48 @@ async function handleConfirmRequiredStatus(
       unlockStartedAt,
     );
   } catch (error) {
-    await logError({
-      type: "VERIFICATION_TIMEOUT",
-      transactionId: transaction.id,
-      stationCode: transaction.delivery.stationCode,
-      phoneNumber: transaction.delivery.requestedPhoneNumber,
-      message: "Background verification failed while resolving confirm_required",
-      metadata: {
-        error: error instanceof Error ? error.message : String(error),
-      },
-    });
-
     const elapsedMs = Date.now() - confirmRequiredAtMs;
     if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
-      await logError({
-        type: "verification_final_check_failed",
-        transactionId: transaction.id,
-        stationCode: transaction.delivery.stationCode,
-        message: "Final confirm_required verification attempt failed due to system error",
-        metadata: { elapsedMs },
-      });
       await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
-      return { status: "failed", reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+      return { status: "failed", reason_code: "TIMEOUT", stage: "verification" };
     }
-
     return { status: "confirm_required" };
   }
 
   if (verification.confidence === "HIGH") {
-    await logError({
-      type: "verification_recovered",
-      transactionId: transaction.id,
-      stationCode: transaction.delivery.stationCode,
-      message: "Confirm_required transaction recovered with HIGH verification",
-      metadata: {
-        unlockStartedAt,
-        missingDetectedAt: verification.missingDetectedAt,
-      },
-    });
-
     await finalizeCapture(transaction.id);
     const refreshed = await getPaymentTransaction(transaction.id);
-    if (!refreshed) {
-      throw new HttpError(404, "Transaction not found");
-    }
-
-    return buildStatusResponse(refreshed);
+    return buildStatusResponse(refreshed || transaction);
   }
 
   const elapsedMs = Date.now() - confirmRequiredAtMs;
   if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
-    await logError({
-      type: "verification_final_check_failed",
-      transactionId: transaction.id,
-      stationCode: transaction.delivery.stationCode,
-      message: "Confirm_required final verification attempt did not reach HIGH confidence",
-      metadata: {
-        elapsedMs,
-        confidence: verification.confidence,
-      },
-    });
-
     await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
-    return { status: "failed", reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+    return { status: "failed", reason_code: "TIMEOUT", stage: "verification" };
   }
 
   return { status: "confirm_required" };
 }
 
-export async function triggerUnlockIfNeeded(
+async function performProviderReconciliation(
   transaction: PaymentTransactionRecord,
-): Promise<void> {
-  // If already finished or failed, nothing to do
-  if (transaction.unlockCompleted || transaction.unlockFailed) {
-    return;
-  }
-
-  // Phase 5: Station Health Protection
-  if (transaction.delivery?.stationCode) {
-    const healthy = await isStationHealthy(transaction.delivery.stationCode);
-    if (!healthy) {
-       await logError({
-         type: CRITICAL_ERROR_TYPES.DELIVERY_VERIFICATION,
-         transactionId: transaction.id,
-         stationCode: transaction.delivery.stationCode,
-         message: "Station blacklisted due to recent failures. Skipping unlock attempt.",
-       });
-       // Do not auto-cancel yet, let reconciliation handle or manual repair
-       return;
-    }
-  }
-
-  // If already started but not finished, we check if we should resume (e.g. after crash)
-  if (transaction.unlockStarted) {
-     const age = Date.now() - toMillis(transaction.processingStartedAt || transaction.updatedAt)!;
-     if (age < 15_000) { // 15s cooldown before resuming a 'started' unlock
-       return;
-     }
-     
-     await logTransactionEvent(transaction.id, "AUTO_RESUME_UNLOCK_RECOVERY", {
-       reason: "Transaction was started but not completed/failed",
-       ageMs: age
-     }, "IMPORTANT");
-  }
-
-  if (transaction.status !== "paid" && transaction.status !== "held") {
-    return;
-  }
-
-  if (!transaction.providerRef) {
-    console.error("invalid_held_state: missing providerRef", {
-      transactionId: transaction.id,
-      status: transaction.status,
-    });
-
-    await patchPaymentTransaction({
-      id: transaction.id,
-      patch: {
-        status: "failed",
-        failureReason: "INVALID_INITIAL_STATE",
-        updatedAt: Date.now(),
-        updatedAtTs: Timestamp.now(),
-      },
-    });
-    return;
-  }
-
-  // Repair delivery context if missing but station is known
-  if (!transaction.delivery) {
-    const delivery = await ensureDeliveryContext(transaction);
-    if (!delivery) return;
-    transaction.delivery = delivery;
-  }
-
-  if (transaction.status === "paid") {
-    try {
-      await transitionPaymentTransactionState({
-        id: transaction.id,
-        from: "paid",
-        to: "held",
-        patch: {
-          heldAt: Date.now(),
-        },
-      });
-
-      await logTransactionEvent(transaction.id, "HELD", {
-        providerRef: transaction.providerRef,
-        station: transaction.delivery.stationCode,
-        batteryId: transaction.delivery.batteryId,
-        slotId: transaction.delivery.slotId,
-      }, "IMPORTANT");
-    } catch (error) {
-      if (
-        error instanceof HttpError &&
-        error.status === 409
-      ) {
-        // Another worker or status check already progressed this transaction.
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  const refreshed = await getPaymentTransaction(transaction.id);
-  if (!refreshed || refreshed.unlockStarted || refreshed.status !== "held") {
-    // Exactly-once guard: if already started or status changed, exit.
-    return;
-  }
-
-  try {
-    await performEjectionAndVerification({
-      idempotencyKey: transaction.id,
-      transactionId: transaction.providerRef,
-      stationCode: transaction.delivery.stationCode,
-      phoneNumber: transaction.delivery.requestedPhoneNumber,
-      imei: transaction.delivery.imei,
-      battery: {
-        battery_id: transaction.delivery.batteryId,
-        slot_id: transaction.delivery.slotId,
-      },
-      preauthAudit: transaction.waafiAudit as Record<string, unknown>,
-      phoneAuthority: transaction.delivery.phoneAuthority,
-      canonicalPhoneNumber: transaction.delivery.canonicalPhoneNumber,
-    });
-  } catch (error) {
-    await logError({
-      type: "UNLOCK_TRIGGER_FAILED",
-      transactionId: transaction.id,
-      message: "Failed to perform unlock and verification from held/paid recovery path",
-      metadata: {
-        status: transaction.status,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    });
-  }
-}
-
-export async function getProviderDrivenPaymentStatus(
-  transactionId: string,
 ): Promise<PaymentStatusResponse> {
-  const transaction = await getPaymentTransaction(transactionId);
-
-  if (!transaction) {
-    throw new HttpError(404, "Transaction not found");
-  }
-  if (transaction.status === "paid" || transaction.status === "held") {
-    const heldAtMs = toMillis(transaction.heldAt ?? transaction.updatedAt) ?? Date.now();
-    const heldAgeMs = Date.now() - heldAtMs;
-
-    if (!transaction.unlockStarted) {
-      // SLA Boundary: 30 seconds for held state resolution
-      if (heldAgeMs > 30_000) {
-        await logTransactionEvent(transaction.id, "SLA_BREACH_HELD_STALL", {
-          heldAgeMs,
-          status: transaction.status,
-        }, "CRITICAL");
-
-        await logError({
-          type: "HELD_STALL",
-          transactionId,
-          message: "Held transaction exceeded SLA and was still waiting for unlock",
-          metadata: {
-            heldAgeMs,
-            unlockStarted: transaction.unlockStarted,
-          },
-        });
-
-        await cancelHold(transaction.id, "Unlock timed out after held state SLA breach");
-        return {
-          status: "failed",
-          reason_code: "UNLOCK_TIMEOUT",
-          failureReason: "UNLOCK_TIMEOUT",
-        };
-      }
-
-      console.info("unlock_fallback_triggered", {
-        transactionId,
-      });
-
-      await triggerUnlockIfNeeded(transaction);
-    } else if (transaction.status === "held" && heldAgeMs > 60_000) {
-      // Secondary fallback for started but stuck in held
-      return {
-        status: "failed",
-        reason_code: "UNLOCK_TIMEOUT",
-        failureReason: "UNLOCK_TIMEOUT",
-      };
-    }
-
-    const refreshed = await getPaymentTransaction(transactionId);
-    return buildStatusResponse(refreshed || transaction);
-  }
-
-  if (transaction.status === "processing") {
-    const processingStartedAtMs = toMillis(transaction.processingStartedAt);
-    if (
-      processingStartedAtMs !== null &&
-      Date.now() - processingStartedAtMs > PROCESSING_TIMEOUT_MS
-    ) {
-      await transitionPaymentTransactionState({
-        id: transactionId,
-        from: "processing",
-        to: "failed",
-        patch: {
-          failureReason: "UNLOCK_TIMEOUT",
-        },
-      });
-
-      console.error("unlock_timeout", { transactionId });
-      console.info("payment_failed", {
-        transactionId,
-        failureReason: "UNLOCK_TIMEOUT",
-      });
-
-      return {
-        status: "failed",
-        reason_code: "UNLOCK_TIMEOUT",
-        failureReason: "UNLOCK_TIMEOUT",
-      };
-    }
-
-    return buildStatusResponse(transaction);
-  }
-
-  if (transaction.status === "confirm_required") {
-    return await handleConfirmRequiredStatus(transaction);
-  }
-
-  if (transaction.status === "verifying") {
-    return buildStatusResponse(transaction);
-  }
-
-  if (transaction.status === "verified") {
-    return buildStatusResponse(transaction);
-  }
-
-  if (transaction.status === "failed") {
-    return buildStatusResponse(transaction);
-  }
-
+  const transactionId = transaction.id;
   let providerRefToUse = transaction.providerRef;
   let providerReferenceId: string | null = null;
 
   if (!providerRefToUse) {
-    console.warn("FALLBACK_PROVIDER_LOOKUP_USED: Attempting recovery via transactionId (referenceId)", {
-      transactionId,
-    });
     providerReferenceId = transactionId;
   }
-
-  await logTransactionEvent(transactionId, "STATUS_POLL_START", {
-    providerRef: providerRefToUse,
-    referenceId: providerReferenceId,
-  }, "DEBUG");
 
   const providerCheck = await checkPaymentStatusDetailed(
     providerRefToUse,
     providerReferenceId,
   );
 
-  await logTransactionEvent(transactionId, "STATUS_POLL_RESPONSE", {
-    status: providerCheck.status,
-    raw: providerCheck.raw,
-  }, "DEBUG");
-
   if (!providerRefToUse && providerCheck.raw && providerCheck.status !== "unknown") {
     const recoveredIds = extractWaafiIds(providerCheck.raw);
     if (recoveredIds.transactionId) {
-      await logTransactionEvent(transactionId, "PROVIDER_REF_RECOVERED", {
-        recoveredId: recoveredIds.transactionId,
-      }, "IMPORTANT");
-
-      console.error("CRITICAL_ORPHAN_HOLD_RECOVERED", {
-        transactionId,
-        recoveredProviderRef: recoveredIds.transactionId,
-      });
       await patchPaymentTransaction({
         id: transaction.id,
         patch: { providerRef: recoveredIds.transactionId },
@@ -511,220 +427,74 @@ export async function getProviderDrivenPaymentStatus(
   }
 
   const createdAtMs = toMillis(transaction.createdAt);
-  if (!createdAtMs) {
-    console.error("MISSING createdAt - cannot evaluate timeout", {
-      transactionId,
-      createdAt: transaction.createdAt,
-    });
-  } else {
+  if (createdAtMs) {
     const elapsedMs = Date.now() - createdAtMs;
 
-    if (
-      transaction.status === "pending_payment" &&
-      elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS
-    ) {
-      // If the provider already marked it as paid, we should NOT cancel it.
-      // We should let the polling logic below handle the successful transition.
-      if (providerCheck.status === "paid") {
-        console.warn("TIMEOUT_PREEMPTED: Provider is PAID, skipping timeout failure", { transactionId });
-        return { status: "pending_payment" };
-      }
+    if (elapsedMs >= PAYMENT_PENDING_TIMEOUT_MS) {
+      if (providerCheck.status === "paid") return { status: "pending_payment" };
 
       if (providerRefToUse && providerCheck.status === "pending") {
-        console.error("CRITICAL_TIMEOUT_CANCEL: Cancelling orphaned provider hold due to timeout", { transactionId, providerRefToUse });
         try {
           await cancelWaafiPreauthorization({
             transactionId: providerRefToUse,
             description: "Payment pending_payment timed out",
           });
-        } catch (e) {
-          console.error("Failed to cancel orphan hold on timeout", e);
-        }
+        } catch (e) {}
       }
 
       const status = await completePhase2Transaction({
         id: transactionId,
         status: "failed",
         failureReason: "TIMEOUT",
+        failureStage: "payment",
       });
 
-      console.info("payment_failed", {
-        transactionId,
-        failureReason: "TIMEOUT",
-      });
-
-      return { status, reason_code: "TIMEOUT", failureReason: "TIMEOUT" };
+      return { status, reason_code: "TIMEOUT", stage: "payment" };
     }
-  }
-
-  if (!providerRefToUse) {
-    const createdAtMs = toMillis(transaction.createdAt);
-    const elapsedMs = createdAtMs ? Date.now() - createdAtMs : 0;
-
-    if (elapsedMs > 30_000) {
-      if (transaction.missingProviderRef === true) {
-        // SECOND TIMEOUT: After 3 minutes, we must terminate the state to avoid infinite pending.
-        if (elapsedMs > 180_000) {
-          console.error("UNRESOLVABLE_HOLD_TIMEOUT", { transactionId });
-
-          await logError({
-            type: "UNRESOLVABLE_HOLD",
-            transactionId,
-            message: "Hold likely created but transactionId never recovered after 180s",
-            metadata: { phone: transaction.phone },
-          });
-
-          await completePhase2Transaction({
-            id: transactionId,
-            status: "failed",
-            failureReason: "PROVIDER_ERROR",
-          });
-
-          return {
-            status: "failed",
-            reason_code: "PROVIDER_ERROR",
-            failureReason: "PROVIDER_ERROR",
-          };
-        }
-
-        await logTransactionEvent(transactionId, "PROTECTED_ORPHAN_PREVENTION_ACTIVE", {
-          elapsedMs,
-        });
-
-        console.warn("PROTECTED_ORPHAN_PREVENTION: 30s threshold reached for missingProviderRef", {
-          transactionId,
-          phone: transaction.phone,
-        });
-        return { status: "pending_payment" };
-      }
-
-      await logTransactionEvent(transactionId, "ORPHAN_PAYMENT_DETECTED", {
-        elapsedMs,
-      });
-
-      console.error("ORPHAN_PAYMENT_DETECTED", {
-        transactionId,
-        phone: transaction.phone,
-      });
-
-      await completePhase2Transaction({
-        id: transactionId,
-        status: "failed",
-        failureReason: "PROVIDER_ERROR",
-      });
-
-      return {
-        status: "failed",
-        reason_code: "PROVIDER_ERROR",
-        failureReason: "PROVIDER_ERROR",
-      };
-    }
-
-    return { status: "pending_payment" };
-  }
-
-  console.info("payment_status_checked", {
-    transactionId,
-    providerRef: providerRefToUse,
-    providerStatus: providerCheck.status,
-    providerResponseCode:
-      providerCheck.raw?.responseCode !== undefined
-        ? String(providerCheck.raw?.responseCode)
-        : null,
-    providerErrorCode: providerCheck.raw?.errorCode || null,
-    providerState: providerCheck.raw?.params?.state || null,
-    providerMessage: providerCheck.raw?.responseMsg || null,
-  });
-
-  if (providerCheck.error) {
-    console.info("provider_error", {
-      transactionId,
-      providerRef: transaction.providerRef,
-      error: providerCheck.error,
-    });
-
-    return { status: "pending_payment" };
   }
 
   if (providerCheck.status === "cancelled" || providerCheck.status === "failed") {
-    const reason = providerCheck.reason || "PROVIDER_ERROR";
-
-    await logTransactionEvent(transactionId, "PROVIDER_FAILURE_DETECTED", {
-      reason,
-      raw: providerCheck.raw,
-    });
+    const reason = (providerCheck.reason || "PROVIDER_ERROR") as PaymentStatusResponse["reason_code"];
+    const resolvedStage = inferStage(reason);
 
     const status = await completePhase2Transaction({
       id: transactionId,
       status: "failed",
       failureReason: reason,
+      failureStage: resolvedStage,
     });
 
-    console.info(`payment_${providerCheck.status}`, {
-      transactionId,
-      failureReason: reason,
-    });
-
-    return {
-      status,
-      reason_code: reason,
-      failureReason: reason,
-    };
+    return { status, reason_code: reason, stage: resolvedStage };
   }
 
   if (providerCheck.status === "paid") {
-    await logTransactionEvent(transactionId, "PROVIDER_PAID_DETECTED", {
-      providerRef: providerRefToUse,
-    });
-
     await completePhase2Transaction({
       id: transactionId,
       status: "paid",
     });
 
-    console.info("payment_paid", { transactionId });
-
     const updatedTransaction = await getPaymentTransaction(transactionId);
-    if (!updatedTransaction) {
-      throw new HttpError(404, "Transaction not found");
-    }
-
-    return buildStatusResponse(updatedTransaction);
+    return buildStatusResponse(updatedTransaction || transaction);
   }
 
   return { status: "pending_payment" };
 }
 
-/**
- * Ensures that a transaction has a delivery context.
- * If missing, it attempts to acquire a battery and slot from the specified station.
- */
 export async function ensureDeliveryContext(
   transaction: Pick<PaymentTransactionRecord, "id" | "station" | "phone" | "status" | "delivery">
 ): Promise<PaymentTransactionRecord["delivery"] | null> {
-  if (transaction.delivery) {
-    return transaction.delivery;
-  }
-
-  if (!transaction.station) {
-    return null;
-  }
+  if (transaction.delivery) return transaction.delivery;
+  if (!transaction.station) return null;
 
   const stationConfig = getStationConfigByCode(transaction.station);
-  if (!stationConfig) {
-    return null;
-  }
+  if (!stationConfig) return null;
 
   try {
     const battery = await getAvailableBattery(stationConfig.imei);
-    if (!battery) {
-      return null;
-    }
+    if (!battery) return null;
 
     const reserved = await reserveBattery(stationConfig.imei, battery.battery_id, transaction.phone);
-    if (!reserved) {
-      return null;
-    }
+    if (!reserved) return null;
 
     const delivery = {
       imei: stationConfig.imei,
@@ -739,28 +509,16 @@ export async function ensureDeliveryContext(
 
     await patchPaymentTransaction({
       id: transaction.id,
-      patch: {
-        delivery,
-        updatedAt: Date.now(),
-      },
+      patch: { delivery, updatedAt: Date.now() },
     });
-
-    await logTransactionEvent(transaction.id, "AUTO_REPAIR_DELIVERY_CONTEXT", {
-      station: transaction.station,
-      batteryId: battery.battery_id,
-      slotId: battery.slot_id,
-      reason: "Missing delivery context in held/paid state",
-    }, "CRITICAL");
 
     return delivery;
   } catch (error) {
-    console.error("ensureDeliveryContext_failed", {
-      transactionId: transaction.id,
-      error,
-    });
+    console.error("ensureDeliveryContext_failed", { transactionId: transaction.id, error });
     return null;
   }
 }
+
 export async function isStationHealthy(stationCode: string): Promise<boolean> {
   const db = (await import("@/lib/server/firebase-admin")).getDb();
   const now = Date.now();
@@ -770,7 +528,6 @@ export async function isStationHealthy(stationCode: string): Promise<boolean> {
   if (!config) return false;
 
   try {
-    // 1. Blackhole Check: Persistent failure detection
     const recentFailuresSnap = await db.collection("errors")
       .where("stationCode", "==", stationCode)
       .where("createdAt", ">", threshold)
@@ -778,23 +535,9 @@ export async function isStationHealthy(stationCode: string): Promise<boolean> {
       .limit(3)
       .get();
 
-    if (recentFailuresSnap.size >= 3) {
-      console.warn("station_health_check: unhealthy (blackholed)", { stationCode });
-      return false;
-    }
-
-    // 2. Online Check: Connectivity verification
-    const { queryStationBatteries } = await import("@/lib/server/payment/heycharge");
-    try {
-      await queryStationBatteries(config.imei);
-    } catch (err) {
-      console.warn("station_health_check: offline (query failed)", { stationCode, err: String(err) });
-      return false;
-    }
-
+    if (recentFailuresSnap.size >= 3) return false;
     return true;
-  } catch (err) {
-    console.error("isStationHealthy_check_failed", { stationCode, err });
-    return true; // Default to healthy to avoid false blocking on DB error
+  } catch (error) {
+    return true;
   }
 }

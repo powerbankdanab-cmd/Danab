@@ -30,7 +30,16 @@ import {
   isWaafiCaptured,
   queryWaafiTransactionStatus,
 } from "@/lib/server/payment/waafi";
-import { triggerUnlockIfNeeded, getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
+import {
+  finalizeCapture,
+  cancelHold,
+  performEjectionAndVerification
+} from "@/lib/server/payment/process-payment";
+import {
+  reconcileTransactionStatus,
+  triggerUnlockIfNeeded,
+  getProviderDrivenPaymentStatus
+} from "@/lib/server/payment/status";
 
 const RECOVERY_LEASE_MS = 30_000;
 const HELD_STALL_SLA_MS = 45_000; // 45s SLA for hardware flow
@@ -726,13 +735,13 @@ async function reconcileEarlyStage(
 
   // 1. Pending Payment Recovery
   if (transaction.status === "pending_payment") {
-    await getProviderDrivenPaymentStatus(transaction.id);
+    await reconcileTransactionStatus(transaction.id);
     return "repaired";
   }
 
   // 2. Paid -> Held Recovery
   if (transaction.status === "paid") {
-    await getProviderDrivenPaymentStatus(transaction.id);
+    await reconcileTransactionStatus(transaction.id);
     return "repaired";
   }
 
@@ -740,7 +749,7 @@ async function reconcileEarlyStage(
   if (transaction.status === "held") {
     // Case A: Never started
     if (!transaction.unlockStarted) {
-      await triggerUnlockIfNeeded(transaction);
+      await triggerUnlockIfNeeded(transaction.id);
       return "repaired";
     }
 
@@ -762,7 +771,7 @@ async function reconcileEarlyStage(
 
       // If it's older than 20s, try one resume attempt
       if (age > HELD_RESUME_COOLDOWN_MS) {
-        await triggerUnlockIfNeeded(transaction);
+        await triggerUnlockIfNeeded(transaction.id);
         return "repaired";
       }
     }

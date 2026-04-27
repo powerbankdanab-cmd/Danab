@@ -1256,11 +1256,8 @@ export async function finalizeCapture(idempotencyKey: string): Promise<any> {
 
       // ── Transition to capture_in_progress ─────────────────────────
       if (tx.status !== "capture_in_progress") {
-        const attempted = await markCaptureAttempted(idempotencyKey);
-        
-        // If already attempted by another worker, let them finish or wait for next reconciliation
-        if (!attempted && !tx.captureAttempted) {
-           return; 
+        if (!(await markCaptureAttempted(idempotencyKey))) {
+          return;
         }
 
         await logTransactionEvent(idempotencyKey, "CAPTURE_INITIATED", {

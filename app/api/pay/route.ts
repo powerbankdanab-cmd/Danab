@@ -44,7 +44,7 @@ function failedPaymentResponse(
     {
       status: "failed",
       reason_code: reason,
-      failureReason: reason,
+      stage: "payment",
       error,
     },
     { status },
@@ -200,10 +200,7 @@ export async function POST(request: NextRequest) {
 
         // Immediate Execution Contract: Trigger unlock right away
         if (delivery) {
-          const refreshed = await getPaymentTransaction(transaction.id);
-          if (refreshed) {
-            await triggerUnlockIfNeeded(refreshed);
-          }
+          await triggerUnlockIfNeeded(transaction.id);
         }
       }
 
@@ -244,7 +241,7 @@ export async function POST(request: NextRequest) {
           {
             status: "failed",
             reason_code: failureReason,
-            failureReason,
+            stage: "payment",
             error:
               failureReason === "INSUFFICIENT_FUNDS"
                 ? "Insufficient balance"
@@ -321,7 +318,7 @@ export async function POST(request: NextRequest) {
         {
           status: "failed",
           reason_code: "PROVIDER_ERROR",
-          failureReason: "PROVIDER_ERROR",
+          stage: "payment",
           error: "Payment provider error",
         },
         { status: 502 },
@@ -366,7 +363,7 @@ export async function POST(request: NextRequest) {
       {
         status: "failed",
         reason_code: "PROVIDER_ERROR",
-        failureReason: "PROVIDER_ERROR",
+        stage: "payment",
         error: "Payment provider error",
       },
       { status: 502 },

@@ -64,6 +64,7 @@ export type PaymentTransactionRecord = {
   unlockCompleted?: boolean;
   unlockFailed?: boolean;
   unlockRetryCount?: number;
+  lastUnlockAttemptAt?: number;
   processingStartedAt?: Date | Timestamp | number;
   createdAt: Date | Timestamp | number;
   updatedAt: Date | Timestamp | number;
@@ -72,6 +73,7 @@ export type PaymentTransactionRecord = {
   capturedAt?: number;
   failedAt?: number;
   failureReason?: string;
+  failureStage?: "payment" | "unlock" | "verification" | "capture" | "system";
   captureUnknownAt?: number;
   confirmRequiredAt?: number;
   lastConfirmVerificationAt?: number;
@@ -221,6 +223,7 @@ export async function completePhase2Transaction(input: {
   id: string;
   status: "paid" | "failed";
   failureReason?: string;
+  failureStage?: "payment" | "unlock" | "verification" | "capture" | "system";
 }) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(input.id);
@@ -250,6 +253,7 @@ export async function completePhase2Transaction(input: {
       status: input.status,
       updatedAt: Timestamp.now(),
       ...(input.failureReason ? { failureReason: input.failureReason } : {}),
+      ...(input.failureStage ? { failureStage: input.failureStage } : {}),
     });
 
     return input.status;
@@ -350,10 +354,23 @@ export async function markUnlockStarted(id: string) {
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
     const current = snap.data() as PaymentTransactionRecord;
+    const now = Date.now();
     const retryCount = (current.unlockRetryCount || 0) + 1;
 
+    // Strict Retry Storm Protection: Max 3 total, Max 2 per 5 minutes
     if (retryCount > 3) {
       return "MAX_RETRIES_EXCEEDED";
+    }
+
+    if (current.lastUnlockAttemptAt) {
+      const fiveMinsAgo = now - (5 * 60 * 1000);
+      if (current.lastUnlockAttemptAt > fiveMinsAgo && retryCount >= 2) {
+         // If we already tried within 5 mins and this is at least the 2nd attempt, 
+         // we should probably slow down or wait for worker.
+         // BUT, for the VERY FIRST retry (attempt 2), we allow it once. 
+         // If they try a 3rd time within 5 mins, we block.
+         if (retryCount >= 3) return "RATE_LIMITED";
+      }
     }
 
     if (current.unlockCompleted) return "ALREADY_COMPLETED";
@@ -364,7 +381,8 @@ export async function markUnlockStarted(id: string) {
     tx.update(docRef, {
       unlockStarted: true,
       unlockRetryCount: retryCount,
-      updatedAt: Date.now(),
+      lastUnlockAttemptAt: now,
+      updatedAt: now,
       updatedAtTs: Timestamp.now(),
     });
 
@@ -547,6 +565,14 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .limit(limit)
     .get();
 
+  // Query 5: paid transactions that need to be transitioned to held
+  const paidSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "paid")
+    .orderBy("updatedAt")
+    .limit(limit)
+    .get();
+
   // Query 5 (Phase 4): capture_in_progress stuck for >60s (crash recovery)
   const captureInProgressSnap = await db
     .collection(PAYMENT_TRANSACTIONS_COLLECTION)
@@ -564,6 +590,14 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     .limit(limit)
     .get();
 
+  // Query 6: cancel_pending transactions
+  const cancelPendingSnap = await db
+    .collection(PAYMENT_TRANSACTIONS_COLLECTION)
+    .where("status", "==", "cancel_pending")
+    .orderBy("updatedAt")
+    .limit(limit)
+    .get();
+
   const results: PaymentTransactionRecord[] = [];
 
   // Add confirm_required
@@ -577,8 +611,20 @@ export async function listStaleTransactionsForReconciliation(limit = 20) {
     results.push(doc.data() as PaymentTransactionRecord);
   }
 
+  // Add cancel_pending
+  for (const doc of cancelPendingSnap.docs) {
+    if (results.length >= limit) break;
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
   // Add held transactions waiting for unlock
   for (const doc of heldSnap.docs) {
+    if (results.length >= limit) break;
+    results.push(doc.data() as PaymentTransactionRecord);
+  }
+
+  // Add paid transactions
+  for (const doc of paidSnap.docs) {
     if (results.length >= limit) break;
     results.push(doc.data() as PaymentTransactionRecord);
   }

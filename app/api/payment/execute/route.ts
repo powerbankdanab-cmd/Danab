@@ -25,12 +25,12 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        await triggerUnlockIfNeeded(transaction);
+        const result = await triggerUnlockIfNeeded(transactionId);
 
         const refreshed = await getPaymentTransaction(transactionId);
         if (!refreshed) {
             return NextResponse.json(
-                { error: "Transaction not found" },
+                { error: "Transaction not found after execution" },
                 { status: 404 },
             );
         }
@@ -39,6 +39,11 @@ export async function POST(request: NextRequest) {
             transactionId,
             status: refreshed.status,
             unlockStarted: !!refreshed.unlockStarted,
+            execution: {
+                started: result.started,
+                attempt: result.attempt,
+                reason: result.reason
+            }
         });
     } catch (error) {
         if (isHttpError(error)) {

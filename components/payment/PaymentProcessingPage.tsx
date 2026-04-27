@@ -25,11 +25,14 @@ import {
 type ApiResponse = {
   status?:
   | "pending_payment"
+  | "held"
   | "paid"
   | "processing"
   | "verifying"
   | "verified"
   | "confirm_required"
+  | "partial_success"
+  | "captured"
   | "failed";
   reason_code?:
   | "USER_CANCELLED"
@@ -45,7 +48,7 @@ type ApiResponse = {
   | "SLA_BREACH"
   | "INVALID_INITIAL_STATE"
   | "STATION_OFFLINE";
-  failureReason?: string;
+  stage?: "payment" | "unlock" | "verification" | "capture" | "system";
   providerRef?: string | null;
   message?: string;
   transactionId?: string;
@@ -54,6 +57,7 @@ type ApiResponse = {
   slot_id?: string;
   waafiMessage?: string;
   unlockStarted?: boolean;
+  recovered?: boolean;
 };
 
 type PaymentStep = {
@@ -114,6 +118,8 @@ export function PaymentProcessingPage() {
   const [errorMessage, setErrorMessage] = useState("");
   const [transactionId, setTransactionId] = useState("");
   const [failureReason, setFailureReason] = useState<ApiResponse["reason_code"]>();
+  const [failureStage, setFailureStage] = useState<ApiResponse["stage"]>();
+  const [isRecovered, setIsRecovered] = useState(false);
   const [isSlowPolling, setIsSlowPolling] = useState(false);
   const [batteryInfo, setBatteryInfo] = useState<{
     batteryId: string;
@@ -134,71 +140,48 @@ export function PaymentProcessingPage() {
     ));
   };
 
-  const normalizeFailureReason = (
-    data?: Pick<ApiResponse, "reason_code" | "failureReason">,
-  ): ApiResponse["reason_code"] => {
-    const rawReason = String(data?.reason_code || data?.failureReason || "")
-      .trim()
-      .toUpperCase();
-
-    if (rawReason === "USER_CANCELLED" || rawReason === "INSUFFICIENT_FUNDS" || rawReason === "PROVIDER_DECLINED" || rawReason === "PROVIDER_ERROR" || rawReason === "TIMEOUT" || rawReason === "UNLOCK_FAILED" || rawReason === "UNLOCK_TIMEOUT" || rawReason === "VERIFICATION_FAILED" || rawReason === "SLA_BREACH" || rawReason === "INVALID_INITIAL_STATE" || rawReason === "WRONG_PIN" || rawReason === "STATION_OFFLINE") {
-      return rawReason as ApiResponse["reason_code"];
-    }
-
-    if (rawReason === "INSUFFICIENT_BALANCE") {
-      return "INSUFFICIENT_FUNDS";
-    }
-
-    return undefined;
-  };
+  // normalizeFailureReason REMOVED — frontend trusts backend reason_code directly
 
   const getFriendlyFailureMessage = (
     reason?: ApiResponse["reason_code"],
+    stage?: ApiResponse["stage"],
   ) => {
+    // Stage-aware: unlock failures mean payment succeeded but device failed
+    if (stage === "unlock") {
+      if (reason === "UNLOCK_FAILED" || reason === "UNLOCK_TIMEOUT") {
+        return "Lacagta waa la xaqiijiyay laakiin qalad ayaa ka dhacay bixinta power bank-ka. Lacagta waa laguu soo celin doonaa.";
+      }
+      if (reason === "INVALID_INITIAL_STATE") {
+        return "Qalabka slot-kiisu uma diyaarnayn. Lacagta waa laguu soo celin doonaa.";
+      }
+      return "Bixinta qalabka way fashilantay. Lacagta waa laguu soo celin doonaa.";
+    }
+    if (stage === "verification") {
+      return "Waxaan xaqiijin kari waynay in qalabku soo baxay. Lacagta waa laguu soo celin doonaa.";
+    }
+    if (stage === "capture") {
+      return "Lacag qaadashadu way fashilantay. Fadlan la xiriir taageerada.";
+    }
+
+    // Payment-stage failures (by reason)
     if (reason === "USER_CANCELLED") {
       return "Waad joojisay lacag bixinta. You cancelled the payment.";
     }
-
-    if (reason === "INSUFFICIENT_FUNDS") {
+    if (reason === "INSUFFICIENT_FUNDS" || reason === "INSUFFICIENT_BALANCE") {
       return "Haraagaagu kuma filna. Fadlan lacag ku dar oo isku day mar kale.";
     }
-
     if (reason === "PROVIDER_DECLINED" || reason === "WRONG_PIN") {
       return "Lacag bixinta waa la diiday. Fadlan hubi PIN-kaaga ama in akoonkaagu xanniban yahay.";
     }
-
     if (reason === "TIMEOUT") {
       return "Waqtiga lacag bixintu wuu dhammaaday. Payment request timed out.";
     }
-
-    if (reason === "UNLOCK_TIMEOUT") {
-      return "Soo deynta qalabka ayaa qaadatay wakhti ka badan inta la oggolaaday. Unlock timed out.";
-    }
-
-    if (reason === "UNLOCK_FAILED") {
-      return "Lacagta waa la xaqiijiyay laakiin qalad ayaa ka dhacay bixinta power bank-ka. Payment was successful, but there was an issue releasing the power bank.";
-    }
-    
-    if (reason === "VERIFICATION_FAILED") {
-      return "Waxaan xaqiijin kari waynay in qalabku soo baxay. Lacagta waa laguu soo celin doonaa.";
-    }
-
-    if (reason === "INVALID_INITIAL_STATE") {
-      return "Power bank state was invalid before release. Please retry the rental or contact support.";
-    }
-
     if (reason === "PROVIDER_ERROR") {
       return "Waxaa dhacay cilad adeeg bixiyaha. There was an issue with the payment provider.";
     }
-
-    if (reason === "INSUFFICIENT_BALANCE") {
-      return "Lacag kugu filan ma jirto. You do not have enough balance.";
-    }
-
     if (reason === "SLA_BREACH") {
       return "Lacag bixinta waxay qaadatay waqti dheer. Fadlan la xiriir taageerada macaamiisha.";
     }
-
     if (reason === "STATION_OFFLINE") {
       return "Station-kaan hadda ma shaqeynayo. Fadlan tijaabi mid kale.";
     }
@@ -208,7 +191,20 @@ export function PaymentProcessingPage() {
 
   const getFailureHeading = (
     reason?: ApiResponse["reason_code"],
+    stage?: ApiResponse["stage"],
   ) => {
+    // Stage-aware headings
+    if (stage === "unlock") {
+      return "Lacagtii waa la xaqiijiyay, laakiin power bank-ga lama sii deyn karin";
+    }
+    if (stage === "verification") {
+      return "Xaqiijinta qalabka ayaa fashilantay";
+    }
+    if (stage === "capture") {
+      return "Lacag qaadashada waa fashilantay";
+    }
+
+    // Payment-stage headings
     if (reason === "USER_CANCELLED") {
       return "Bixinta waa la joojiyay";
     }
@@ -243,10 +239,6 @@ export function PaymentProcessingPage() {
 
     if (reason === "PROVIDER_ERROR") {
       return "Cilad adeeg bixiyaha";
-    }
-
-    if (reason === "SLA_BREACH") {
-      return "Waqti dheer ayay qaadatay";
     }
 
     if (reason === "STATION_OFFLINE") {
@@ -321,11 +313,12 @@ export function PaymentProcessingPage() {
       console.info("PAYMENT_EXECUTE_RESPONSE", { transactionId, status: data.status, unlockStarted: data.unlockStarted });
 
       if (!response.ok || data.status === "failed") {
-        if (data.status === "failed") {
-          const reason = normalizeFailureReason(data);
+        if (data.status === "failed" || data.status === "partial_success") {
+          const reason = data.reason_code;
           setFailureReason(reason);
-          setErrorMessage(getFriendlyFailureMessage(reason));
-          setStatus("FAILED");
+          setFailureStage(data.stage);
+          setErrorMessage(getFriendlyFailureMessage(reason, data.stage));
+          setStatus(data.status === "partial_success" ? "PARTIAL_SUCCESS" : "FAILED");
           updateStepStatus("confirmed", "failed");
         }
         return false;
@@ -438,23 +431,30 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
         console.log("PAY RESPONSE:", data);
-        console.log("FULL RESPONSE OBJECT:", data);
         console.log("REASON CODE:", data.reason_code);
-        console.log("FAILURE REASON:", data.failureReason);
 
         if (data.status === "failed" || !response.ok) {
-          const reason = normalizeFailureReason(data);
+          const reason = data.reason_code;
           setStatus("FAILED");
           setFailureReason(reason);
-          setErrorMessage(data.error || getFriendlyFailureMessage(reason));
+          setFailureStage(data.stage);
+          setErrorMessage(data.error || getFriendlyFailureMessage(reason, data.stage));
           updateStepStatus("init", "failed");
           return;
         }
 
         updateStepStatus("init", "completed");
         setTransactionId(data.transactionId || idempotencyKey);
-        updateStepStatus("pending", "active");
-        setStatus(data.providerRef ? "WAITING_PIN" : "PENDING_PAYMENT");
+
+        if (data.status === "held") {
+          updateStepStatus("pending", "completed");
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "active");
+          setStatus("PROCESSING");
+        } else {
+          updateStepStatus("pending", "active");
+          setStatus(data.providerRef ? "WAITING_PIN" : "PENDING_PAYMENT");
+        }
         console.info("PAYMENT_PENDING_STARTED", {
           transactionId: data.transactionId || idempotencyKey,
           providerEngaged: Boolean(data.providerRef),
@@ -463,7 +463,7 @@ export function PaymentProcessingPage() {
         if (!isCancelled) {
           setStatus("FAILED");
           setFailureReason("PROVIDER_ERROR");
-          setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
+          setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", "payment"));
           updateStepStatus("init", "failed");
         }
       }
@@ -516,11 +516,10 @@ export function PaymentProcessingPage() {
 
         const data: ApiResponse = await response.json();
         console.log("STATUS RESPONSE:", data);
-        console.log("FULL RESPONSE OBJECT:", data);
         console.log("REASON CODE:", data.reason_code);
-        console.log("FAILURE REASON:", data.failureReason);
 
-        if (data.status === "paid") {
+        if (data.status === "held" || data.status === "paid") {
+          setIsRecovered(data.recovered || false);
           updateStepStatus("pending", "completed");
           updateStepStatus("confirmed", "completed");
           updateStepStatus("unlocking", "active");
@@ -533,6 +532,7 @@ export function PaymentProcessingPage() {
         }
 
         if (data.status === "processing") {
+          setIsRecovered(data.recovered || false);
           updateStepStatus("pending", "completed");
           updateStepStatus("confirmed", "completed");
           updateStepStatus("unlocking", "active");
@@ -540,22 +540,25 @@ export function PaymentProcessingPage() {
           return;
         }
 
-        if (data.status === "verifying") {
-          updateStepStatus("pending", "completed");
-          updateStepStatus("confirmed", "completed");
+        if (data.stage === "verification") {
           updateStepStatus("unlocking", "completed");
           updateStepStatus("verifying", "active");
-          setStatus("PROCESSING");
-          return;
+        } else if (data.stage === "unlock") {
+          updateStepStatus("confirmed", "completed");
+          updateStepStatus("unlocking", "active");
+        } else if (data.stage === "capture") {
+          updateStepStatus("verifying", "completed");
+          updateStepStatus("success", "active");
         }
 
-        if (data.status === "verified") {
+        if (data.status === "verified" || data.status === "captured") {
+          setIsRecovered(data.recovered || false);
           updateStepStatus("pending", "completed");
           updateStepStatus("confirmed", "completed");
           updateStepStatus("unlocking", "completed");
           updateStepStatus("verifying", "completed");
           updateStepStatus("success", "completed");
-          setBatteryInfo({ batteryId: data.battery_id || "", slotId: data.slot_id || "" });
+          setBatteryInfo({ batteryId: data.battery_id || "" , slotId: data.slot_id || "" });
           setIsSlowPolling(false);
           console.info("PAYMENT_VERIFIED", { transactionId });
           setStatus("SUCCESS");
@@ -563,10 +566,23 @@ export function PaymentProcessingPage() {
           return;
         }
 
-        if (data.status === "failed") {
-          const reason = normalizeFailureReason(data);
+        if (data.status === "partial_success") {
+          setIsRecovered(data.recovered || false);
+          const reason = data.reason_code;
           setFailureReason(reason);
-          setErrorMessage(getFriendlyFailureMessage(reason));
+          setFailureStage(data.stage);
+          setErrorMessage(getFriendlyFailureMessage(reason, data.stage));
+          setIsSlowPolling(false);
+          setStatus("PARTIAL_SUCCESS");
+          stopPolling();
+          return;
+        }
+
+        if (data.status === "failed") {
+          const reason = data.reason_code;
+          setFailureReason(reason);
+          setFailureStage(data.stage);
+          setErrorMessage(getFriendlyFailureMessage(reason, data.stage));
           if (reason === "USER_CANCELLED") {
             console.info("PAYMENT_USER_CANCELLED", { transactionId });
           } else {
@@ -624,7 +640,7 @@ export function PaymentProcessingPage() {
       if (!res.ok) {
         setStatus("FAILED");
         setFailureReason("PROVIDER_ERROR");
-        setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
+        setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", "payment"));
         return;
       }
 
@@ -639,12 +655,12 @@ export function PaymentProcessingPage() {
       } else {
         setStatus("FAILED");
         setFailureReason("USER_CANCELLED");
-        setErrorMessage(getFriendlyFailureMessage("USER_CANCELLED"));
+        setErrorMessage(getFriendlyFailureMessage("USER_CANCELLED", "payment"));
       }
     } catch (error) {
       setStatus("FAILED");
       setFailureReason("PROVIDER_ERROR");
-      setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR"));
+      setErrorMessage(getFriendlyFailureMessage("PROVIDER_ERROR", "payment"));
     }
   };
 
@@ -902,6 +918,16 @@ export function PaymentProcessingPage() {
                   Waxaan hubinaynaa bixinta oo aan sii deynaynaa power bank-ga.
                 </p>
               </div>
+              {isSlowPolling && (
+                <div className="mt-4 rounded-xl bg-amber-50 p-4 border border-amber-100 animate-pulse">
+                  <p className="text-sm font-bold text-amber-800">
+                    Arrintan waxay qaadanaysaa waqti ka badan intii la filayay...
+                  </p>
+                  <p className="text-xs text-amber-700 mt-1">
+                    This is taking longer than expected. We are still working on it.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Step Progress */}
@@ -1022,6 +1048,13 @@ export function PaymentProcessingPage() {
               <h1 className="text-2xl font-bold text-slate-900 mb-2">
                 Power Bank Waa Diyaar
               </h1>
+              {isRecovered && (
+                <div className="inline-block mt-1 mb-3 rounded-full bg-blue-100 px-4 py-1.5 border border-blue-200">
+                  <p className="text-xs font-bold tracking-wide text-blue-700">
+                    WE RECOVERED YOUR TRANSACTION
+                  </p>
+                </div>
+              )}
               <p className="text-sm text-slate-600 mb-4">
                 Power bank-gaaga si guul leh ayuu u soo baxay.
               </p>
@@ -1076,6 +1109,71 @@ export function PaymentProcessingPage() {
           </div>
         );
 
+      case "PARTIAL_SUCCESS":
+        return (
+          <div className="space-y-6 py-4">
+            <div className="text-center">
+              <div className="flex justify-center mb-4">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
+                  <HelpCircleIcon className="h-8 w-8 text-amber-600" />
+                </div>
+              </div>
+              <h1 className="text-xl font-bold text-slate-900 mb-2">
+                {getFailureHeading(failureReason, failureStage)}
+              </h1>
+              {isRecovered && (
+                <div className="inline-block mb-4 rounded-full bg-blue-100 px-4 py-1.5 border border-blue-200">
+                  <p className="text-xs font-bold tracking-wide text-blue-700">
+                    WE RECOVERED YOUR TRANSACTION
+                  </p>
+                </div>
+              )}
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                <p className="text-sm font-medium text-amber-700">
+                  {errorMessage || "Lacagta waa la xaqiijiyay laakiin qalabka lama soo bixin."}
+                </p>
+                <p className="mt-2 text-xs text-amber-600">
+                  Lacagta waa laguu soo celin doonaa si toos ah.
+                </p>
+              </div>
+            </div>
+
+            {/* Step Progress */}
+            <div className="space-y-3">
+              {steps.map((step, index) => (
+                <div key={step.id} className="flex items-center gap-3">
+                  <div className="flex-shrink-0">
+                    {renderStepIcon(step.status)}
+                  </div>
+                  <div className="flex-1 text-left">
+                    <p className={cn(
+                      "text-sm font-medium",
+                      step.status === "completed" ? "text-emerald-700" :
+                        step.status === "failed" ? "text-amber-700" : "text-gray-500"
+                    )}>
+                      {step.label}
+                    </p>
+                    <p className={cn(
+                      "text-xs",
+                      step.status === "completed" ? "text-emerald-600" :
+                        step.status === "failed" ? "text-amber-600" : "text-gray-400"
+                    )}>
+                      {step.somaliLabel}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <Link
+              href="/"
+              className="flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-900 px-6 py-4 text-lg font-bold text-white hover:bg-slate-800"
+            >
+              Dib u isku day
+            </Link>
+          </div>
+        );
+
       case "FAILED":
         return (
           <div className="space-y-6 py-4">
@@ -1086,7 +1184,7 @@ export function PaymentProcessingPage() {
                 </div>
               </div>
               <h1 className="text-xl font-bold text-slate-900 mb-2">
-                {getFailureHeading(failureReason)}
+                {getFailureHeading(failureReason, failureStage)}
               </h1>
               <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
                 <p className="text-sm font-medium text-rose-700">

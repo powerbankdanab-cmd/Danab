@@ -12,7 +12,8 @@ export {
   listStaleTransactionsForReconciliation,
   listHeldTransactionsWithoutUnlock,
   claimTransactionRecovery,
-  releaseTransactionRecovery
+  releaseTransactionRecovery,
+  markUnlockStarted
 } from "@/lib/server/payment/transactions";
 export {
   processPayment,
@@ -21,6 +22,11 @@ export {
   cancelHold,
   resumePendingPayment
 } from "@/lib/server/payment/process-payment";
+export {
+  getProviderDrivenPaymentStatus,
+  triggerUnlockIfNeeded,
+  reconcileTransactionStatus,
+} from "@/lib/server/payment/status";
 export {
   getActiveStationCode,
   getStationImei,

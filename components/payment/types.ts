@@ -4,8 +4,10 @@ export type PaymentStatus =
   | "CONNECTING"
   | "PENDING_PAYMENT"
   | "WAITING_PIN"
+  | "HELD"
   | "PROCESSING"
   | "CONFIRM_REQUIRED"
+  | "PARTIAL_SUCCESS"
   | "SUCCESS"
   | "FAILED";
 
