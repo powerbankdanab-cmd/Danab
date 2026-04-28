@@ -5,11 +5,11 @@ import { logError } from "@/lib/server/alerts/log-error";
 import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 
 /**
- * Reservation TTL in milliseconds (2 minutes).
+ * Reservation TTL in milliseconds (60 seconds).
  * If a reservation is older than this, it is considered expired and can be overwritten.
  * This prevents stuck reservations from permanently blocking a battery.
  */
-const RESERVATION_TTL_MS = 2 * 60 * 1000;
+const RESERVATION_TTL_MS = 60 * 1000;
 const PHONE_PAYMENT_LOCK_TTL_MS = 6 * 60 * 1000;
 
 /**

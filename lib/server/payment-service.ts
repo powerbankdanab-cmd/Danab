@@ -16,12 +16,12 @@ export {
   markUnlockStarted
 } from "@/lib/server/payment/transactions";
 export {
-  processPayment,
   handleUserConfirmation,
   finalizeCapture,
   cancelHold,
   resumePendingPayment
 } from "@/lib/server/payment/process-payment";
+export { processPayment } from "@/lib/server/payment/process-payment-v2";
 export {
   getProviderDrivenPaymentStatus,
   triggerUnlockIfNeeded,

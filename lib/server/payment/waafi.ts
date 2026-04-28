@@ -10,7 +10,8 @@ type WaafiServiceName =
   | "API_PREAUTHORIZE"
   | "API_PREAUTHORIZE_COMMIT"
   | "API_PREAUTHORIZE_CANCEL"
-  | "API_QUERY_TRANSACTION";
+  | "API_QUERY_TRANSACTION"
+  | "API_REFUND";
 
 function normalizePhoneDigits(value: string) {
   const digits = value.replace(/\D/g, "");
@@ -299,6 +300,56 @@ export function classifyWaafiPaymentStatus(
   }
 
   return "unknown";
+}
+
+export async function requestWaafiDirectPayment({
+  phoneNumber,
+  amount,
+  referenceId,
+}: {
+  phoneNumber: string;
+  amount: number;
+  referenceId: string;
+}) {
+  return requestWaafiAction({
+    serviceName: "API_PURCHASE",
+    serviceParams: {
+      paymentMethod: "MWALLET_ACCOUNT",
+      payerInfo: { accountNo: phoneNumber },
+      transactionInfo: {
+        referenceId,
+        amount: amount.toFixed(2),
+        currency: "USD",
+        description: "Powerbank rental",
+      },
+    },
+  });
+}
+
+export async function refundWaafiPayment({
+  transactionId,
+  referenceId,
+  description,
+}: {
+  transactionId?: string | null;
+  referenceId?: string | null;
+  description?: string;
+}) {
+  const configuredService = getOptionalEnv("WAAFI_REFUND_SERVICE");
+  const serviceName = (configuredService as WaafiServiceName | null) || "API_REFUND";
+
+  if (!transactionId && !referenceId) {
+    throw new Error("Missing transactionId/referenceId for Waafi refund");
+  }
+
+  return requestWaafiAction({
+    serviceName,
+    serviceParams: {
+      ...(transactionId ? { transactionId } : {}),
+      ...(referenceId ? { referenceId } : {}),
+      description: description || "Powerbank rental auto-refund",
+    },
+  });
 }
 
 export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_FUNDS" | "PROVIDER_DECLINED" | "PROVIDER_ERROR" {
