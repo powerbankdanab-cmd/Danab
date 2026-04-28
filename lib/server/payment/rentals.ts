@@ -60,18 +60,18 @@ export async function getRentalByTransactionId(transactionId: string) {
 }
 
 /**
- * Checks if a user is blocked from renting due to overdue or lost assets.
+ * Checks if a user is blocked from renting due to an unreturned asset.
  */
 export async function checkUserRestrictions(phone: string): Promise<{
   restricted: boolean;
-  reason?: "ACTIVE_RENTAL_OVERDUE" | "ACTIVE_RENTAL_LOST";
+  reason?: "ACTIVE_RENTAL" | "ACTIVE_RENTAL_OVERDUE" | "ACTIVE_RENTAL_LOST";
 }> {
   const normalizedPhone = phone.startsWith("+") ? phone : `+${phone.replace(/\D/g, "")}`;
   const db = getDb();
   
   const snapshot = await db.collection(RENTALS_COLLECTION)
     .where("phone", "==", normalizedPhone)
-    .where("status", "in", ["overdue", "lost"])
+    .where("status", "in", ["active", "overdue", "lost"])
     .limit(1)
     .get();
 
@@ -80,9 +80,16 @@ export async function checkUserRestrictions(phone: string): Promise<{
   }
 
   const data = snapshot.docs[0].data() as RentalRecord;
+  const reason =
+    data.status === "active"
+      ? "ACTIVE_RENTAL"
+      : data.status === "overdue"
+        ? "ACTIVE_RENTAL_OVERDUE"
+        : "ACTIVE_RENTAL_LOST";
+
   return {
     restricted: true,
-    reason: data.status === "overdue" ? "ACTIVE_RENTAL_OVERDUE" : "ACTIVE_RENTAL_LOST"
+    reason,
   };
 }
 
@@ -464,4 +471,3 @@ export async function getActiveRentedBatteryIds(
 
   return activeIds;
 }
-

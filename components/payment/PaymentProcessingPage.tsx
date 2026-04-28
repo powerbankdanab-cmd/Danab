@@ -385,7 +385,7 @@ export function PaymentProcessingPage() {
           <div className="relative space-y-6 py-4 text-center">
             <div className="mx-auto h-2 w-16 rounded-full bg-gradient-to-r from-cyan-400 via-indigo-500 to-emerald-400" />
             <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">
-              {transactionId ? `TX: ${transactionId}` : "Danab Payment"}
+              Danab Payment
             </p>
             <div
               className={`mx-auto inline-flex rounded-full px-3 py-1 text-xs font-semibold ${

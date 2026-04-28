@@ -109,10 +109,7 @@ export async function POST(request: NextRequest) {
         status: "failed",
         stage: "precheck",
         reason_code: "PROVIDER_ERROR",
-        error:
-          restriction.reason === "ACTIVE_RENTAL_OVERDUE"
-            ? "You have an overdue battery. Please return it before renting again."
-            : "Your account is blocked due to a lost battery. Please contact support.",
+        error: "Battery hore ayaa lambarkaan kugu maqan, looma ogola mid kale.",
         fault: "user",
       },
       403,
