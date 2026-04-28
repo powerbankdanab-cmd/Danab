@@ -39,12 +39,13 @@ function failedPaymentResponse(
     | "STATION_OFFLINE",
   error: string,
   status: number,
+  stage: "precheck" | "payment" | "delivery" | "system" = "payment",
 ) {
   return NextResponse.json(
     {
       status: "failed",
       reason_code: reason,
-      stage: "payment",
+      stage,
       error,
     },
     { status },
@@ -97,7 +98,7 @@ export async function POST(request: NextRequest) {
   try {
     body = (await request.json()) as PaymentRequestBody;
   } catch {
-    return failedPaymentResponse("PROVIDER_ERROR", "Invalid JSON body", 400);
+    return failedPaymentResponse("PROVIDER_ERROR", "Invalid JSON body", 400, "system");
   }
 
   const parsed = parseAndValidateBody(body);
@@ -107,6 +108,7 @@ export async function POST(request: NextRequest) {
       "PROVIDER_ERROR",
       parsed.error || "Missing valid phone and amount",
       400,
+      "precheck",
     );
   }
 
@@ -118,6 +120,7 @@ export async function POST(request: NextRequest) {
         ? "You have an overdue battery. Please return it before renting again."
         : "Your account is blocked due to a lost battery. Please contact support.",
       403,
+      "precheck",
     );
   }
 
@@ -129,6 +132,7 @@ export async function POST(request: NextRequest) {
         "STATION_OFFLINE",
         "This station is currently unavailable. Please try another station.",
         409,
+        "precheck",
       );
     }
   }

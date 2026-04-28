@@ -18,6 +18,7 @@ type UIState =
   | "failed";
 
 type StatusResponse = {
+  stage?: "precheck" | "payment" | "delivery" | "unlock" | "verification" | "capture" | "system";
   status?:
     | "pending_payment"
     | "held"
@@ -35,6 +36,7 @@ type StatusResponse = {
     | "USER_CANCELLED"
     | "LOW_BATTERY"
     | "NO_BATTERIES"
+    | "PAYMENT_TIMEOUT"
     | "PROVIDER_ERROR"
     | "VERIFICATION_FAILED"
     | "UNLOCK_FAILED";
@@ -86,10 +88,36 @@ function friendlyError(reason?: StatusResponse["reason_code"], fallback?: string
   }
 }
 
+function stageAwareMessage(
+  stage?: StatusResponse["stage"],
+  reason?: StatusResponse["reason_code"],
+  fallback?: string,
+) {
+  if (stage === "precheck") {
+    if (reason === "STATION_OFFLINE") return "Station-kan ma shaqeynayo";
+    if (reason === "NO_BATTERIES") return "Ma jiro battery diyaar ah";
+    if (reason === "LOW_BATTERY") return "Battery-yadu wali way dallacayaan";
+  }
+
+  if (stage === "payment") {
+    if (reason === "USER_CANCELLED") return "Waad joojisay bixinta";
+    if (reason === "INSUFFICIENT_FUNDS") return "Haraaga kuma filna";
+    if (reason === "PAYMENT_TIMEOUT") return "Waqtiga bixintu wuu dhammaaday";
+    if (reason === "PROVIDER_ERROR") return "Cilad ayaa ka jirta bixinta";
+  }
+
+  if (stage === "delivery" || stage === "unlock" || stage === "verification" || stage === "capture") {
+    return "Lacagta waa la helay, fadlan sug...";
+  }
+
+  return friendlyError(reason, fallback);
+}
+
 export function PaymentProcessingPage() {
   const searchParams = useSearchParams();
   const requestAbortRef = useRef<AbortController | null>(null);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollStartRef = useRef<number | null>(null);
 
   const amount = useMemo(() => {
     const raw = Number(searchParams.get("amount"));
@@ -111,12 +139,73 @@ export function PaymentProcessingPage() {
   const [uiState, setUiState] = useState<UIState>("idle");
   const [transactionId, setTransactionId] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [infoMessage, setInfoMessage] = useState("");
   const [batteryInfo, setBatteryInfo] = useState<{ batteryId?: string; slotId?: string }>({});
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   const stopPolling = () => {
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
+    }
+  };
+
+  const applyStatus = (data: StatusResponse) => {
+    const mapped = mapBackendStatusToUi(data.status);
+    setUiState(mapped);
+
+    if (data.status === "failed") {
+      const deliveryLikeFailure =
+        data.stage === "unlock" ||
+        data.stage === "delivery" ||
+        data.stage === "verification" ||
+        data.stage === "capture";
+
+      if (deliveryLikeFailure) {
+        setUiState("paid");
+        setInfoMessage("Lacagta waa la helay, fadlan sug...");
+        stopPolling();
+        return;
+      }
+
+      setErrorMessage(stageAwareMessage(data.stage, data.reason_code, data.message || data.error));
+      stopPolling();
+      return;
+    }
+
+    if (data.status === "captured") {
+      setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
+      stopPolling();
+      return;
+    }
+  };
+
+  const confirmManualResult = async (confirmed: boolean) => {
+    if (!transactionId || confirmBusy) return;
+    setConfirmBusy(true);
+    try {
+      const res = await fetch("/api/pay/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transactionId, confirmed }),
+      });
+      const data: StatusResponse & { success?: boolean } = await res.json();
+      if (!res.ok || data.status === "failed") {
+        setUiState("failed");
+        setErrorMessage(stageAwareMessage(data.stage, data.reason_code, data.error || data.message));
+        return;
+      }
+      if (data.success || data.status === "captured") {
+        setUiState("success");
+        setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
+        return;
+      }
+      applyStatus(data);
+    } catch {
+      setUiState("failed");
+      setErrorMessage("Xaqiijinta gacanta way fashilantay. Fadlan mar kale isku day.");
+    } finally {
+      setConfirmBusy(false);
     }
   };
 
@@ -129,34 +218,55 @@ export function PaymentProcessingPage() {
 
     let cancelled = false;
 
+    const pollStatus = async (txId: string) => {
+      try {
+        const res = await fetch(`/api/payment/status?transactionId=${txId}`, {
+          cache: "no-store",
+        });
+        const data: StatusResponse = await res.json();
+        if (!res.ok || cancelled) return;
+
+        applyStatus(data);
+
+        const pollStartedAt = pollStartRef.current;
+        if (pollStartedAt && Date.now() - pollStartedAt > 60_000) {
+          stopPolling();
+          setInfoMessage("Waxaan wali hubinaynaa lacagta. Fadlan sug.");
+        }
+      } catch {
+        // keep polling
+      }
+    };
+
     const run = async () => {
       setUiState("prechecking");
-
-      const pollStatus = async (txId: string) => {
-        try {
-          const res = await fetch(`/api/payment/status?transactionId=${txId}`, {
-            cache: "no-store",
-          });
-          const data: StatusResponse = await res.json();
-          if (!res.ok) return;
-
-          const mapped = mapBackendStatusToUi(data.status);
-          setUiState(mapped);
-
-          if (data.status === "failed") {
-            setErrorMessage(friendlyError(data.reason_code, data.message || data.error));
-            stopPolling();
-          }
-          if (data.status === "captured") {
-            setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
-            stopPolling();
-          }
-        } catch {
-          // keep polling
-        }
-      };
+      setInfoMessage("");
+      setErrorMessage("");
 
       try {
+        requestAbortRef.current = new AbortController();
+        const precheckResponse = await fetch("/api/pay/precheck", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: requestAbortRef.current.signal,
+          body: JSON.stringify({ stationCode }),
+        });
+
+        if (!precheckResponse.ok) {
+          const precheckData: StatusResponse = await precheckResponse.json();
+          setUiState("failed");
+          setErrorMessage(
+            stageAwareMessage(
+              precheckData.stage,
+              precheckData.reason_code,
+              precheckData.error || precheckData.message,
+            ),
+          );
+          return;
+        }
+
+        setUiState("awaiting_payment");
+
         requestAbortRef.current = new AbortController();
         const response = await fetch("/api/pay", {
           method: "POST",
@@ -177,18 +287,20 @@ export function PaymentProcessingPage() {
 
         if (!response.ok || data.status === "failed") {
           setUiState("failed");
-          setErrorMessage(friendlyError(data.reason_code, data.error || data.message));
+          setErrorMessage(stageAwareMessage(data.stage, data.reason_code, data.error || data.message));
           return;
         }
 
-        if (data.success) {
+        if (data.success || data.status === "captured") {
           setUiState("success");
           setBatteryInfo({ batteryId: data.battery_id, slotId: data.slot_id });
           return;
         }
 
-        setUiState(mapBackendStatusToUi(data.status));
+        applyStatus(data);
+
         await pollStatus(txId);
+        pollStartRef.current = Date.now();
         pollIntervalRef.current = setInterval(() => void pollStatus(txId), 2000);
       } catch {
         if (!cancelled) {
@@ -198,7 +310,7 @@ export function PaymentProcessingPage() {
       }
     };
 
-    run();
+    void run();
 
     return () => {
       cancelled = true;
@@ -210,49 +322,49 @@ export function PaymentProcessingPage() {
   const content = (() => {
     if (uiState === "prechecking") {
       return {
-        title: "🔍 Checking station...",
+        title: "Checking station...",
         subtitle: "Fadlan sug, waxaan hubinaynaa station-ka...",
       };
     }
     if (uiState === "awaiting_payment") {
       return {
-        title: "📱 Enter your PIN to continue",
+        title: "Enter your PIN to continue",
         subtitle: "Gali PIN-ka si aad u bixiso",
       };
     }
     if (uiState === "processing_payment") {
       return {
-        title: "⏳ Waiting for payment confirmation...",
+        title: "Waiting for payment confirmation...",
         subtitle: "Waxaan sugaynaa xaqiijinta lacagta...",
       };
     }
     if (uiState === "paid") {
       return {
-        title: "💰 Payment received. Preparing your battery...",
+        title: "Payment received. Preparing your battery...",
         subtitle: "Lacagta waa la helay. Power bank-ga waa laguu diyaarinayaa...",
       };
     }
     if (uiState === "ejecting") {
       return {
-        title: "🔓 Releasing battery...",
+        title: "Releasing battery...",
         subtitle: "Qalabka waa la furayaa...",
       };
     }
     if (uiState === "verifying") {
       return {
-        title: "🔍 Confirming delivery...",
+        title: "Confirming delivery...",
         subtitle: "Xaqiijin ayaa socota...",
       };
     }
     if (uiState === "manual_required") {
       return {
-        title: "Manual confirmation required",
+        title: "Did the power bank come out?",
         subtitle: "Fadlan xaqiiji haddii power bank-gu soo baxay.",
       };
     }
     if (uiState === "success") {
       return {
-        title: "✅ Take your power bank",
+        title: "Take your power bank",
         subtitle: "Fadlan qaado power bank-ga",
       };
     }
@@ -273,10 +385,16 @@ export function PaymentProcessingPage() {
             <h1 className="text-xl font-bold text-slate-900">{content.title}</h1>
             <p className="text-sm text-slate-600">{content.subtitle}</p>
 
+            {infoMessage ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                <p className="text-sm font-medium text-amber-800">{infoMessage}</p>
+              </div>
+            ) : null}
+
             {uiState === "success" && (batteryInfo.batteryId || batteryInfo.slotId) ? (
               <div className="rounded-xl border-2 border-emerald-200 bg-emerald-50 p-4">
                 <p className="text-sm font-semibold text-emerald-700">
-                  Slot: {batteryInfo.slotId || "-"} • ID: {batteryInfo.batteryId || "-"}
+                  Slot: {batteryInfo.slotId || "-"} - ID: {batteryInfo.batteryId || "-"}
                 </p>
               </div>
             ) : null}
@@ -287,7 +405,28 @@ export function PaymentProcessingPage() {
               </div>
             ) : null}
 
-            {(uiState === "success" || uiState === "failed" || uiState === "manual_required") ? (
+            {uiState === "manual_required" ? (
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => void confirmManualResult(true)}
+                  disabled={confirmBusy}
+                  className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white disabled:opacity-60"
+                >
+                  Yes / Haa
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void confirmManualResult(false)}
+                  disabled={confirmBusy}
+                  className="rounded-2xl bg-rose-600 px-4 py-3 text-sm font-bold text-white disabled:opacity-60"
+                >
+                  No / Maya
+                </button>
+              </div>
+            ) : null}
+
+            {(uiState === "success" || uiState === "failed") ? (
               <Link
                 href="/"
                 className="inline-flex w-full items-center justify-center rounded-2xl bg-slate-900 px-6 py-4 text-lg font-bold text-white hover:bg-slate-800"
@@ -301,4 +440,3 @@ export function PaymentProcessingPage() {
     </div>
   );
 }
-

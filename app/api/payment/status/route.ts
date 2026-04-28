@@ -9,7 +9,15 @@ export async function GET(request: NextRequest) {
     const transactionId = searchParams.get("transactionId");
 
     if (!transactionId) {
-      return NextResponse.json({ error: "Missing transactionId" }, { status: 400 });
+      return NextResponse.json(
+        {
+          status: "failed",
+          stage: "system",
+          reason_code: "PROVIDER_ERROR",
+          error: "Missing transactionId",
+        },
+        { status: 400 },
+      );
     }
 
     const payload = await getProviderDrivenPaymentStatus(transactionId);
@@ -25,10 +33,26 @@ export async function GET(request: NextRequest) {
     }
 
     if (isHttpError(error)) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json(
+        {
+          status: "failed",
+          stage: "system",
+          reason_code: "PROVIDER_ERROR",
+          error: error.message,
+        },
+        { status: error.status },
+      );
     }
 
     console.error("Payment status endpoint error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json(
+      {
+        status: "failed",
+        stage: "system",
+        reason_code: "PROVIDER_ERROR",
+        error: "Internal server error",
+      },
+      { status: 500 },
+    );
   }
 }

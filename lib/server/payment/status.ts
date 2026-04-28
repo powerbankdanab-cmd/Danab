@@ -55,6 +55,7 @@ export type PaymentStatusResponse = {
   stage?: PaymentStage | "system";
   unlockStarted?: boolean;
   recovered?: boolean;
+  error?: string;
 };
 
 function toReasonCode(
@@ -151,6 +152,7 @@ function buildStatusResponse(
         reason_code: "PROVIDER_ERROR",
         stage: "system",
         recovered,
+        error: "System consistency check failed",
       };
     }
 
@@ -159,6 +161,9 @@ function buildStatusResponse(
       reason_code: reasonCode,
       stage,
       recovered,
+      error:
+        String(transaction.failureReason || "").trim() ||
+        (reasonCode ? `Failure: ${reasonCode}` : "Payment failed"),
     };
   }
 
