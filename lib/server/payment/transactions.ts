@@ -215,6 +215,12 @@ export async function createOrGetPaymentTransaction(input: {
       outcome: "initiated",
       unlockStarted: false,
       rentalCreated: false,
+      debugChecklist: {
+        payment: "PENDING",
+        ejection: "PENDING",
+        verification: "PENDING",
+        rentalCreated: "PENDING",
+      },
       createdAt: now,
     });
   }

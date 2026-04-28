@@ -33,18 +33,57 @@ function summarizeStatus(status: unknown) {
   return status;
 }
 
+function categorizeFailure(event: string, metadata?: AuditPatch): "USER" | "PROVIDER" | "STATION" | "SYSTEM" | "UNKNOWN" {
+  const msg = (metadata?.error || metadata?.failureNote || "").toString().toLowerCase();
+  const providerCode = metadata?.providerErrorCode || "";
+
+  // 1. User-led failures
+  if (
+    event.includes("USER_CANCELLED") || 
+    msg.includes("user cancelled") ||
+    providerCode === "5001" // Example Waafi user cancel code
+  ) return "USER";
+
+  // 2. Provider-led failures
+  if (
+    event.includes("PROVIDER") || 
+    msg.includes("provider") || 
+    msg.includes("waafi") ||
+    (providerCode && providerCode !== "0")
+  ) return "PROVIDER";
+
+  // 3. Station-led failures
+  if (
+    event.includes("EJECTION") || 
+    event.includes("UNLOCK") || 
+    event.includes("VERIFICATION") ||
+    msg.includes("station") || 
+    msg.includes("hardware") || 
+    msg.includes("timed out") ||
+    msg.includes("battery")
+  ) return "STATION";
+
+  // 4. System-led failures
+  if (
+    event.includes("RENTAL_CREATION") || 
+    event.includes("DATABASE") ||
+    msg.includes("internal")
+  ) return "SYSTEM";
+
+  return "UNKNOWN";
+}
+
 function summarizeProviderResponse(metadata?: AuditPatch) {
   const providerResponse = metadata?.providerResponse as AuditPatch | undefined;
-  if (!providerResponse) return {};
-
-  const params = providerResponse.params as AuditPatch | undefined;
+  const params = providerResponse?.params as AuditPatch | undefined;
+  
   return {
-    providerErrorCode: providerResponse.errorCode,
-    providerResponseCode: providerResponse.responseCode ?? params?.responseCode,
-    providerResponseMsg: providerResponse.responseMsg ?? params?.responseMsg,
-    providerDescription: params?.description,
-    providerOrderId: params?.orderId,
-    providerResponseId: params?.responseId,
+    providerErrorCode: providerResponse?.errorCode || metadata?.providerErrorCode,
+    providerResponseCode: providerResponse?.responseCode ?? params?.responseCode ?? metadata?.providerResponseCode,
+    providerResponseMsg: providerResponse?.responseMsg ?? params?.responseMsg ?? metadata?.providerResponseMsg,
+    providerDescription: params?.description || metadata?.providerDescription,
+    providerOrderId: params?.orderId || metadata?.providerOrderId,
+    providerRef: params?.transactionId || metadata?.providerRef || metadata?.providerReferenceId,
   };
 }
 
@@ -60,6 +99,7 @@ export function auditPatchFromTransactionPatch(patch: AuditPatch) {
     providerReferenceId: patch.providerReferenceId,
     failureReason: patch.failureReason,
     failureStage: patch.failureStage,
+    failureCategory: patch.failureCategory,
     unlockStarted: patch.unlockStarted,
     unlockCompleted: patch.unlockCompleted,
     unlockFailed: patch.unlockFailed,
@@ -73,6 +113,7 @@ export function auditPatchFromTransactionPatch(patch: AuditPatch) {
     providerCaptureRef: patch.providerCaptureRef,
     rentalCreated: patch.rentalCreated,
     rentalId: patch.rentalId,
+    debugChecklist: patch.debugChecklist,
     finalStep: patch.finalStep,
     processingTimeMs: patch.processingTimeMs,
     eventCount: patch.eventCount,
@@ -113,15 +154,18 @@ export async function recordPaymentAuditEvent(
 ) {
   if (!transactionId) return;
 
+  const level_normalized = level || (event.includes("FAILED") || event.includes("ERROR") ? "CRITICAL" : "IMPORTANT");
+  const category = (event.includes("FAILED") || event.includes("ERROR")) ? categorizeFailure(event, metadata) : undefined;
+
   await updatePaymentAudit(transactionId, {
     lastEvent: event,
-    lastEventLevel: level,
+    lastEventLevel: level_normalized,
     lastEventAt: Date.now(),
     eventCount: FieldValue.increment(1),
+    failureCategory: category,
     ...summarizeProviderResponse(metadata),
     ...(metadata?.phone ? { phone: metadata.phone } : {}),
     ...(metadata?.amount ? { amount: metadata.amount } : {}),
-    ...(metadata?.providerRef ? { providerRef: metadata.providerRef } : {}),
     ...(metadata?.batteryId ? { batteryId: metadata.batteryId } : {}),
     ...(metadata?.slotId ? { slotId: metadata.slotId } : {}),
     ...(metadata?.station ? { stationCode: metadata.station } : {}),

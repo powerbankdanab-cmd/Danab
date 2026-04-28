@@ -1036,11 +1036,27 @@ async function finalizeCaptureRentalStep(
 
       await patchPaymentTransaction({
         id: idempotencyKey,
-        patch: { rentalCreated: true, rentalId },
+        patch: { 
+          rentalCreated: true, 
+          rentalId,
+          debugChecklist: {
+            ejection: "SUCCESS",
+            verification: "SUCCESS",
+            rentalCreated: "SUCCESS",
+            finalState: "SUCCESS"
+          }
+        },
       });
 
       await releaseReservation(imei, batteryId);
       await updateRentalUnlockStatus(rentalId, "unlocked");
+
+      await logTransactionEvent(idempotencyKey, "RENTAL_CREATED", {
+        rentalId,
+        batteryId,
+        slotId,
+        stationCode
+      }, "IMPORTANT");
 
       await logError({
         type: "RENTAL_CREATED",
@@ -1610,7 +1626,7 @@ export async function performEjectionAndVerification(input: {
       reason: "Transaction was started but not completed/failed",
     }, "IMPORTANT");
   } else {
-    await logTransactionEvent(idempotencyKey, "UNLOCK_PROCESS_STARTED", {
+    await logTransactionEvent(idempotencyKey, "EJECTION_STARTED", {
       station: stationCode,
       batteryId: battery.battery_id,
       slotId: battery.slot_id,
@@ -1645,47 +1661,67 @@ export async function performEjectionAndVerification(input: {
 
   const processStartTime = Date.now();
   let lastUnlockStartedAt: number | null = null;
-  for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
-    unlockAttempts = attempt;
-    try {
-      lastUnlockStartedAt = Date.now();
-      await releaseBattery({ imei, batteryId: battery.battery_id, slotId: battery.slot_id });
-      await logTransactionEvent(idempotencyKey, "UNLOCK_SUCCESS", {
-        attempt,
-        batteryId: battery.battery_id,
-        slotId: battery.slot_id,
-      }, "IMPORTANT");
+    for (let attempt = 1; attempt <= MAX_UNLOCK_ATTEMPTS; attempt++) {
+      unlockAttempts = attempt;
+      try {
+        lastUnlockStartedAt = Date.now();
+        await releaseBattery({ imei, batteryId: battery.battery_id, slotId: battery.slot_id });
+        await logTransactionEvent(idempotencyKey, "EJECTION_SUCCESS", {
+          attempt,
+          batteryId: battery.battery_id,
+          slotId: battery.slot_id,
+        }, "IMPORTANT");
 
-      verification = await verifyDeliveryWithConfidence(imei, battery.battery_id, battery.slot_id, {
-        stationCode,
-        phoneNumber,
-        transactionId: idempotencyKey
-      }, lastUnlockStartedAt);
+        verification = await verifyDeliveryWithConfidence(imei, battery.battery_id, battery.slot_id, {
+          stationCode,
+          phoneNumber,
+          transactionId: idempotencyKey
+        }, lastUnlockStartedAt);
 
-      confidence = verification.confidence;
-      if (confidence === "HIGH" || confidence === "MEDIUM") break;
+        confidence = verification.confidence;
 
-      await logError({
-        type: "RETRYING_UNLOCK",
-        transactionId: idempotencyKey,
-        message: `Unlock attempt ${attempt} failed (Confidence: ${confidence}).`,
-        metadata: { verification }
-      });
-    } catch (err) {
-      lastUnlockError = err;
-      const isPermanent = isHardwareFailurePermanent(err);
+        await logTransactionEvent(idempotencyKey, "VERIFICATION_RESULT", {
+          confidence,
+          attempt,
+          phase1: verification.phase1Result,
+          phase2: verification.phase2Result,
+          missingDetectedAt: verification.missingDetectedAt,
+        }, confidence === "HIGH" ? "IMPORTANT" : "CRITICAL");
 
-      await logTransactionEvent(idempotencyKey, "UNLOCK_FAILED", {
-        attempt,
-        error: err instanceof Error ? err.message : String(err),
-        isPermanent,
-      }, "CRITICAL");
+        if (confidence === "HIGH" || confidence === "MEDIUM") break;
 
-      if (isPermanent) {
-        break; // Stop retrying if hardware is definitively broken
+        await logError({
+          type: "RETRYING_UNLOCK",
+          transactionId: idempotencyKey,
+          message: `Unlock attempt ${attempt} failed (Confidence: ${confidence}).`,
+          metadata: { verification }
+        });
+      } catch (err) {
+        lastUnlockError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const isPermanent = isHardwareFailurePermanent(err);
+        const isTimeout = errMsg.toLowerCase().includes("timed out");
+
+        if (isTimeout) {
+          await logTransactionEvent(idempotencyKey, "UNLOCK_TIMEOUT", {
+            attempt,
+            error: errMsg,
+            stage: "release_battery"
+          }, "CRITICAL");
+        }
+
+        await logTransactionEvent(idempotencyKey, "EJECTION_FAILED", {
+          attempt,
+          error: errMsg,
+          isPermanent,
+          isTimeout,
+        }, "CRITICAL");
+
+        if (isPermanent) {
+          break; // Stop retrying if hardware is definitively broken
+        }
       }
     }
-  }
 
   // Final Decision
   if (confidence === "MEDIUM") {
