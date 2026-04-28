@@ -128,12 +128,21 @@ export function PaymentCard({
   return (
     <main
       className={cn(
-        "relative mx-auto w-full max-w-md rounded-3xl border p-4 shadow-lg sm:p-5",
+        "relative mx-auto w-full max-w-md rounded-[30px] border p-4 shadow-2xl sm:p-5",
         darkMode
-          ? "border-white/[0.08] bg-white/[0.06] text-white shadow-2xl shadow-violet-500/10 backdrop-blur-xl"
-          : "border-gray-200 bg-white text-slate-800",
+          ? "border-white/10 bg-white/[0.07] text-white shadow-[0_24px_70px_-25px_rgba(139,92,246,0.55)] backdrop-blur-2xl"
+          : "border-white/70 bg-white/90 text-slate-800 shadow-[0_26px_70px_-24px_rgba(30,41,59,0.22)] backdrop-blur-xl",
       )}
     >
+      <div
+        className={cn(
+          "pointer-events-none absolute inset-0 rounded-[30px]",
+          darkMode
+            ? "bg-[linear-gradient(145deg,rgba(255,255,255,0.12),rgba(255,255,255,0.02)_42%,rgba(16,185,129,0.08))]"
+            : "bg-[linear-gradient(145deg,rgba(14,165,233,0.08),rgba(255,255,255,0.72)_45%,rgba(99,102,241,0.08))]",
+        )}
+      />
+      <div className="relative">
       <PaymentHeader darkMode={darkMode} onToggleTheme={onToggleTheme} />
 
       <section className="rounded-3xl pb-6">
@@ -169,8 +178,8 @@ export function PaymentCard({
 
       <footer
         className={cn(
-          "mt-6 px-4 py-3 text-center text-xs sm:text-sm",
-          darkMode ? "text-gray-400" : "text-gray-600",
+          "mt-5 rounded-2xl border px-4 py-3 text-center text-xs sm:text-sm",
+          darkMode ? "border-white/10 bg-white/[0.03] text-gray-300" : "border-slate-200 bg-slate-50/70 text-gray-600",
         )}
       >
         Call us any feedback or problem{" "}
@@ -180,6 +189,7 @@ export function PaymentCard({
           616586503 / 616251068
         </span>
       </footer>
+      </div>
     </main>
   );
 }

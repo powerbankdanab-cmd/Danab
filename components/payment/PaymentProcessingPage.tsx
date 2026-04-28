@@ -32,9 +32,9 @@ type StatusResponse = {
   | "failed";
   reason_code?:
   | "STATION_OFFLINE"
-    | "INSUFFICIENT_FUNDS"
-    | "USER_CANCELLED"
-    | "PROVIDER_DECLINED"
+  | "INSUFFICIENT_FUNDS"
+  | "USER_CANCELLED"
+  | "PROVIDER_DECLINED"
   | "LOW_BATTERY"
   | "NO_BATTERIES"
   | "PAYMENT_TIMEOUT"
@@ -74,9 +74,9 @@ function mapBackendStatusToUi(status?: StatusResponse["status"]): UIState {
 
 const ERROR_MAP: Record<string, Record<string, string>> = {
   precheck: {
-    STATION_OFFLINE: "Station-kan ma shaqeynayo",
-    NO_BATTERIES: "Ma jiro battery diyaar ah",
-    LOW_BATTERY: "Battery-yadu wali way dallacayaan",
+    STATION_OFFLINE: "Station-kan ma shaqeynayo waa Offline",
+    NO_BATTERIES: "Ma jiro battery diyaar ah station-kan",
+    LOW_BATTERY: "Battery-yadu wali wuu charging.. , diyaar ma ahan",
   },
   payment: {
     USER_CANCELLED: "Waad joojisay bixinta",
@@ -363,25 +363,54 @@ export function PaymentProcessingPage() {
     };
   })();
 
+  const tone =
+    uiState === "success"
+      ? "success"
+      : uiState === "failed"
+        ? "danger"
+        : uiState === "manual_required"
+          ? "warning"
+          : "active";
+
   return (
-    <div className="relative min-h-screen flex items-center justify-center p-4 bg-[#f8fafc]">
+    <div className="relative min-h-screen flex items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_top,_#dcf2ff_0%,_#eef4ff_44%,_#f8fafc_100%)] p-4">
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute -left-24 top-10 h-72 w-72 rounded-full bg-cyan-200/50 blur-3xl" />
+        <div className="absolute right-0 top-1/3 h-80 w-80 rounded-full bg-indigo-200/40 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-violet-100/50 blur-3xl" />
+      </div>
       <div className="relative w-full max-w-md">
-        <main className="overflow-hidden rounded-[32px] border border-white bg-white/90 p-6 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.14)]">
-          <div className="space-y-6 py-4 text-center">
-            <p className="text-xs uppercase tracking-widest text-slate-400">
+        <main className="relative overflow-hidden rounded-[32px] border border-white/80 bg-white/90 p-6 shadow-[0_32px_70px_-16px_rgba(15,23,42,0.28)] backdrop-blur-xl">
+          <div className="pointer-events-none absolute inset-0 rounded-[32px] bg-[linear-gradient(150deg,rgba(14,165,233,0.08),rgba(255,255,255,0.62)_44%,rgba(99,102,241,0.10))]" />
+          <div className="relative space-y-6 py-4 text-center">
+            <div className="mx-auto h-2 w-16 rounded-full bg-gradient-to-r from-cyan-400 via-indigo-500 to-emerald-400" />
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">
               {transactionId ? `TX: ${transactionId}` : "Danab Payment"}
             </p>
-            <h1 className="text-xl font-bold text-slate-900">{content.title}</h1>
-            <p className="text-sm text-slate-600">{content.subtitle}</p>
+            <div
+              className={`mx-auto inline-flex rounded-full px-3 py-1 text-xs font-semibold ${
+                tone === "success"
+                  ? "bg-emerald-100 text-emerald-700"
+                  : tone === "danger"
+                    ? "bg-rose-100 text-rose-700"
+                    : tone === "warning"
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-sky-100 text-sky-700"
+              }`}
+            >
+              {uiState.replaceAll("_", " ").toUpperCase()}
+            </div>
+            <h1 className="text-2xl font-extrabold leading-tight text-slate-900">{content.title}</h1>
+            <p className="mx-auto max-w-[28ch] text-sm leading-relaxed text-slate-600">{content.subtitle}</p>
 
             {infoMessage ? (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+              <div className="rounded-2xl border border-amber-200 bg-amber-50/90 p-4">
                 <p className="text-sm font-medium text-amber-800">{infoMessage}</p>
               </div>
             ) : null}
 
             {uiState === "success" && (batteryInfo.batteryId || batteryInfo.slotId) ? (
-              <div className="rounded-xl border-2 border-emerald-200 bg-emerald-50 p-4">
+              <div className="rounded-2xl border-2 border-emerald-200 bg-emerald-50/90 p-4">
                 <p className="text-sm font-semibold text-emerald-700">
                   Slot: {batteryInfo.slotId || "-"} - ID: {batteryInfo.batteryId || "-"}
                 </p>
@@ -389,7 +418,7 @@ export function PaymentProcessingPage() {
             ) : null}
 
             {uiState === "failed" ? (
-              <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+              <div className="rounded-2xl border border-rose-200 bg-rose-50/90 p-4">
                 <p className="text-sm font-medium text-rose-700">{errorMessage}</p>
               </div>
             ) : null}
@@ -400,7 +429,7 @@ export function PaymentProcessingPage() {
                   type="button"
                   onClick={() => void confirmManualResult(true)}
                   disabled={confirmBusy}
-                  className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white disabled:opacity-60"
+                  className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-emerald-500/30 disabled:opacity-60"
                 >
                   Yes / Haa
                 </button>
@@ -408,7 +437,7 @@ export function PaymentProcessingPage() {
                   type="button"
                   onClick={() => void confirmManualResult(false)}
                   disabled={confirmBusy}
-                  className="rounded-2xl bg-rose-600 px-4 py-3 text-sm font-bold text-white disabled:opacity-60"
+                  className="rounded-2xl bg-rose-600 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-rose-500/30 disabled:opacity-60"
                 >
                   No / Maya
                 </button>
@@ -418,7 +447,7 @@ export function PaymentProcessingPage() {
             {(uiState === "success" || uiState === "failed") ? (
               <Link
                 href="/"
-                className="inline-flex w-full items-center justify-center rounded-2xl bg-slate-900 px-6 py-4 text-lg font-bold text-white hover:bg-slate-800"
+                className="inline-flex w-full items-center justify-center rounded-2xl bg-gradient-to-r from-slate-900 via-indigo-900 to-slate-900 px-6 py-4 text-lg font-bold text-white shadow-xl shadow-slate-900/30 hover:brightness-110"
               >
                 {uiState === "success" ? "Finish" : "Dib u isku day"}
               </Link>

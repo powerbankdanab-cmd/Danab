@@ -13,17 +13,30 @@ export function PaymentScreen() {
       className={cn(
         "relative min-h-screen overflow-hidden px-3 py-6 transition-colors sm:px-4 sm:py-12",
         darkMode
-          ? "bg-gradient-to-b from-[#1a1333] via-[#1e1b2e] to-[#151520]"
-          : "bg-gray-100",
+          ? "bg-[radial-gradient(circle_at_top,_#2e1e57_0%,_#171428_45%,_#11121d_100%)]"
+          : "bg-[radial-gradient(circle_at_top,_#dff2ff_0%,_#f4f7ff_42%,_#f7fafc_100%)]",
       )}
     >
-      {darkMode && (
-        <div className="pointer-events-none absolute inset-0 overflow-hidden">
-          <div className="absolute -left-32 -top-20 h-[420px] w-[420px] rounded-full bg-violet-600/20 blur-[100px]" />
-          <div className="absolute -right-24 top-[40%] h-[300px] w-[300px] rounded-full bg-emerald-500/12 blur-[90px]" />
-          <div className="absolute -bottom-16 left-[20%] h-[260px] w-[260px] rounded-full bg-indigo-500/15 blur-[80px]" />
-        </div>
-      )}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div
+          className={cn(
+            "absolute -left-28 -top-16 h-[360px] w-[360px] rounded-full blur-[110px]",
+            darkMode ? "bg-violet-500/25" : "bg-cyan-300/35",
+          )}
+        />
+        <div
+          className={cn(
+            "absolute -right-20 top-[34%] h-[300px] w-[300px] rounded-full blur-[100px]",
+            darkMode ? "bg-emerald-400/16" : "bg-indigo-300/30",
+          )}
+        />
+        <div
+          className={cn(
+            "absolute -bottom-20 left-[20%] h-[280px] w-[280px] rounded-full blur-[100px]",
+            darkMode ? "bg-sky-500/12" : "bg-violet-200/40",
+          )}
+        />
+      </div>
       <PaymentCard
         darkMode={darkMode}
         onToggleTheme={() => setDarkMode((prev) => !prev)}
