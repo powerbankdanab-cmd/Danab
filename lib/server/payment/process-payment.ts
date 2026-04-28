@@ -1549,6 +1549,7 @@ export async function performEjectionAndVerification(input: {
   preauthAudit: Record<string, unknown>;
   phoneAuthority: string;
   canonicalPhoneNumber: string;
+  skipMarkStarted?: boolean;
 }) {
   const {
     idempotencyKey,
@@ -1565,9 +1566,19 @@ export async function performEjectionAndVerification(input: {
   const currentBattery = battery;
 
   // ── Atomic exactly-once guard ──────────────────────────────
-  const startResult = await markUnlockStarted(idempotencyKey);
+  let startResult: "SUCCESS" | "ALREADY_STARTED" | "ALREADY_COMPLETED" | "ALREADY_FAILED" | "MAX_RETRIES_EXCEEDED" | "RATE_LIMITED" = "SUCCESS";
+  
+  if (!input.skipMarkStarted) {
+    startResult = await markUnlockStarted(idempotencyKey);
+  } else {
+    // If skipped, we assume it was already started successfully by the caller
+    startResult = "ALREADY_STARTED";
+  }
   
   if (startResult === "MAX_RETRIES_EXCEEDED") {
+     await logTransactionEvent(idempotencyKey, "MAX_RETRIES_EXCEEDED", {
+       reason: "Maximum hardware resume attempts exceeded",
+     }, "CRITICAL");
      await logError({
        type: CRITICAL_ERROR_TYPES.DELIVERY_VERIFICATION,
        transactionId: idempotencyKey,
@@ -1579,12 +1590,22 @@ export async function performEjectionAndVerification(input: {
      return;
   }
 
+  if (startResult === "RATE_LIMITED") {
+     await logTransactionEvent(idempotencyKey, "UNLOCK_RATE_LIMITED", {
+       reason: "Too many unlock attempts in a short period",
+     }, "CRITICAL");
+     return;
+  }
+
   if (startResult === "ALREADY_COMPLETED" || startResult === "ALREADY_FAILED") {
+    await logTransactionEvent(idempotencyKey, "UNLOCK_ALREADY_TERMINAL", {
+      status: startResult,
+    }, "IMPORTANT");
     console.info("unlock_already_terminal_skipping", { idempotencyKey, startResult });
     return;
   }
 
-  if (startResult === "ALREADY_STARTED") {
+  if (startResult === "ALREADY_STARTED" || input.skipMarkStarted) {
     await logTransactionEvent(idempotencyKey, "AUTO_RESUME_UNLOCK_RECOVERY", {
       reason: "Transaction was started but not completed/failed",
     }, "IMPORTANT");

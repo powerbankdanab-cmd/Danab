@@ -285,6 +285,7 @@ export async function triggerUnlockIfNeeded(
       preauthAudit: refreshed.waafiAudit as Record<string, unknown>,
       phoneAuthority: refreshed.delivery.phoneAuthority,
       canonicalPhoneNumber: refreshed.delivery.canonicalPhoneNumber,
+      skipMarkStarted: true,
     });
 
     return {
@@ -293,6 +294,11 @@ export async function triggerUnlockIfNeeded(
       reason: wasAlreadyStarted ? "RESUMED_ALREADY_STARTED" : undefined,
     };
   } catch (error) {
+    await logTransactionEvent(refreshed.id, "UNLOCK_TRIGGER_FAILED", {
+      status: refreshed.status,
+      error: error instanceof Error ? error.message : String(error),
+    }, "CRITICAL");
+
     await logError({
       type: "UNLOCK_TRIGGER_FAILED",
       transactionId: refreshed.id,

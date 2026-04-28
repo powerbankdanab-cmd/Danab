@@ -183,6 +183,12 @@ export async function POST(request: NextRequest) {
         },
       });
 
+      await logTransactionEvent(transaction.id, "PROVIDER_HOLD_DETECTED", {
+        phone: parsed.phone,
+        amount: parsed.amount,
+        providerRef: providerIds.transactionId,
+      }, "IMPORTANT");
+
       // Eagerly acquire delivery context if we have a stationCode
       if (parsed.stationCode) {
         const delivery = await ensureDeliveryContext({
@@ -194,15 +200,15 @@ export async function POST(request: NextRequest) {
 
         // Immediate Execution Contract: Trigger unlock right away
         if (delivery) {
-          await triggerUnlockIfNeeded(transaction.id);
+          const unlockResult = await triggerUnlockIfNeeded(transaction.id);
+          if (!unlockResult.started) {
+            await logTransactionEvent(transaction.id, "UNLOCK_TRIGGER_SKIPPED", {
+              reason: unlockResult.reason,
+              attempt: unlockResult.attempt,
+            }, "IMPORTANT");
+          }
         }
       }
-
-      await logTransactionEvent(transaction.id, "PROVIDER_HOLD_DETECTED", {
-        phone: parsed.phone,
-        amount: parsed.amount,
-        providerRef: providerIds.transactionId,
-      }, "CRITICAL");
 
       return NextResponse.json({
         transactionId: transaction.id,
