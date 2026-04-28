@@ -19,12 +19,6 @@ export function PayButton({
         {loading ? "Fadlan sug..." : "Bixi oo Qaado Power Bank"}
         {!loading && <ArrowRightIcon className="h-5 w-5" />}
       </button>
-      <p className="mt-3 text-center text-xs text-slate-500 font-medium leading-relaxed">
-        Lacagta waxaa marka hore lagu hayn doonaa, waxaana laga jari doonaa kaliya marka qalabka la xaqiijiyo.
-      </p>
-      <p className="text-center text-[10px] text-slate-400 leading-relaxed">
-        A hold is placed first. You are only charged after the power bank is confirmed.
-      </p>
     </div>
   );
 }

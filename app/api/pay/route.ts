@@ -18,6 +18,7 @@ import {
   isStationHealthy 
 } from "@/lib/server/payment/status";
 import { logError } from "@/lib/server/alerts/log-error";
+import { paymentFailed } from "@/lib/server/payment/response";
 import { checkUserRestrictions } from "@/lib/server/payment/rentals";
 import { getStationConfigByCode } from "@/lib/server/station-config";
 
@@ -27,30 +28,6 @@ type PaymentRequestBody = {
   amount?: number;
   stationCode?: string;
 };
-
-function failedPaymentResponse(
-  reason:
-    | "USER_CANCELLED"
-    | "INSUFFICIENT_FUNDS"
-    | "PROVIDER_DECLINED"
-    | "PROVIDER_ERROR"
-    | "ACTIVE_RENTAL_OVERDUE"
-    | "ACTIVE_RENTAL_LOST"
-    | "STATION_OFFLINE",
-  error: string,
-  status: number,
-  stage: "precheck" | "payment" | "delivery" | "system" = "payment",
-) {
-  return NextResponse.json(
-    {
-      status: "failed",
-      reason_code: reason,
-      stage,
-      error,
-    },
-    { status },
-  );
-}
 
 function parseAndValidateBody(body: PaymentRequestBody) {
   const rawPhone =
@@ -98,29 +75,47 @@ export async function POST(request: NextRequest) {
   try {
     body = (await request.json()) as PaymentRequestBody;
   } catch {
-    return failedPaymentResponse("PROVIDER_ERROR", "Invalid JSON body", 400, "system");
+    return paymentFailed(
+      {
+        status: "failed",
+        stage: "system",
+        reason_code: "INVALID_REQUEST",
+        error: "Invalid JSON body",
+        fault: "system",
+      },
+      400,
+    );
   }
 
   const parsed = parseAndValidateBody(body);
 
   if ("error" in parsed) {
-    return failedPaymentResponse(
-      "PROVIDER_ERROR",
-      parsed.error || "Missing valid phone and amount",
+    return paymentFailed(
+      {
+        status: "failed",
+        stage: "precheck",
+        reason_code: "INVALID_REQUEST",
+        error: parsed.error || "Missing valid phone and amount",
+        fault: "user",
+      },
       400,
-      "precheck",
     );
   }
 
   const restriction = await checkUserRestrictions(parsed.phone);
   if (restriction.restricted) {
-    return failedPaymentResponse(
-      restriction.reason!,
-      restriction.reason === "ACTIVE_RENTAL_OVERDUE"
-        ? "You have an overdue battery. Please return it before renting again."
-        : "Your account is blocked due to a lost battery. Please contact support.",
+    return paymentFailed(
+      {
+        status: "failed",
+        stage: "precheck",
+        reason_code: "PROVIDER_ERROR",
+        error:
+          restriction.reason === "ACTIVE_RENTAL_OVERDUE"
+            ? "You have an overdue battery. Please return it before renting again."
+            : "Your account is blocked due to a lost battery. Please contact support.",
+        fault: "user",
+      },
       403,
-      "precheck",
     );
   }
 
@@ -128,11 +123,24 @@ export async function POST(request: NextRequest) {
   if (parsed.stationCode) {
     const healthy = await isStationHealthy(parsed.stationCode);
     if (!healthy) {
-      return failedPaymentResponse(
-        "STATION_OFFLINE",
-        "This station is currently unavailable. Please try another station.",
+      await logError({
+        type: "PAYMENT_GUARD_BLOCK",
+        message: "Payment blocked by backend station health gate",
+        metadata: {
+          stage: "precheck",
+          reason_code: "STATION_OFFLINE",
+          stationCode: parsed.stationCode,
+        },
+      });
+      return paymentFailed(
+        {
+          status: "failed",
+          stage: "precheck",
+          reason_code: "STATION_OFFLINE",
+          error: "This station is currently unavailable. Please try another station.",
+          fault: "system",
+        },
         409,
-        "precheck",
       );
     }
   }
@@ -241,11 +249,29 @@ export async function POST(request: NextRequest) {
           },
         });
 
-        return NextResponse.json(
+        await logError({
+          type: "PAYMENT_FAILED",
+          transactionId: transaction.id,
+          message: "Provider explicit payment failure",
+          metadata: {
+            stage: "payment",
+            reason_code: failureReason,
+            fault:
+              failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
+                ? "user"
+                : "system",
+          },
+        });
+
+        return paymentFailed(
           {
             status: "failed",
             reason_code: failureReason,
             stage: "payment",
+            fault:
+              failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
+                ? "user"
+                : "system",
             error:
               failureReason === "INSUFFICIENT_FUNDS"
                 ? "Insufficient balance"
@@ -253,7 +279,7 @@ export async function POST(request: NextRequest) {
                   ? "Payment declined"
                   : "Payment cancelled by user",
           },
-          { status: 409 },
+          409,
         );
       }
 
@@ -318,14 +344,15 @@ export async function POST(request: NextRequest) {
         },
       });
 
-      return NextResponse.json(
+      return paymentFailed(
         {
           status: "failed",
           reason_code: "PROVIDER_ERROR",
           stage: "payment",
           error: "Payment provider error",
+          fault: "system",
         },
-        { status: 502 },
+        502,
       );
     }
 
@@ -363,14 +390,15 @@ export async function POST(request: NextRequest) {
       }
     });
 
-    return NextResponse.json(
+    return paymentFailed(
       {
         status: "failed",
         reason_code: "PROVIDER_ERROR",
         stage: "payment",
         error: "Payment provider error",
+        fault: "system",
       },
-      { status: 502 },
+      502,
     );
   }
 }

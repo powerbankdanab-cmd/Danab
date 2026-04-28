@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { isHttpError } from "@/lib/server/payment/errors";
+import { paymentFailed } from "@/lib/server/payment/response";
 import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
 
 export async function GET(request: NextRequest) {
@@ -9,14 +10,15 @@ export async function GET(request: NextRequest) {
     const transactionId = searchParams.get("transactionId");
 
     if (!transactionId) {
-      return NextResponse.json(
+      return paymentFailed(
         {
           status: "failed",
           stage: "system",
-          reason_code: "PROVIDER_ERROR",
+          reason_code: "INVALID_REQUEST",
           error: "Missing transactionId",
+          fault: "user",
         },
-        { status: 400 },
+        400,
       );
     }
 
@@ -33,26 +35,28 @@ export async function GET(request: NextRequest) {
     }
 
     if (isHttpError(error)) {
-      return NextResponse.json(
+      return paymentFailed(
         {
           status: "failed",
           stage: "system",
           reason_code: "PROVIDER_ERROR",
           error: error.message,
+          fault: "system",
         },
-        { status: error.status },
+        error.status,
       );
     }
 
     console.error("Payment status endpoint error:", error);
-    return NextResponse.json(
+    return paymentFailed(
       {
         status: "failed",
         stage: "system",
         reason_code: "PROVIDER_ERROR",
         error: "Internal server error",
+        fault: "system",
       },
-      { status: 500 },
+      500,
     );
   }
 }

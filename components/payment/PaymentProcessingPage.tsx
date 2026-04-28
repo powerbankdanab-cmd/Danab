@@ -20,26 +20,27 @@ type UIState =
 type StatusResponse = {
   stage?: "precheck" | "payment" | "delivery" | "unlock" | "verification" | "capture" | "system";
   status?:
-    | "pending_payment"
-    | "held"
-    | "paid"
-    | "processing"
-    | "verifying"
-    | "verified"
-    | "confirm_required"
-    | "capture_in_progress"
-    | "captured"
-    | "failed";
+  | "pending_payment"
+  | "held"
+  | "paid"
+  | "processing"
+  | "verifying"
+  | "verified"
+  | "confirm_required"
+  | "capture_in_progress"
+  | "captured"
+  | "failed";
   reason_code?:
-    | "STATION_OFFLINE"
+  | "STATION_OFFLINE"
     | "INSUFFICIENT_FUNDS"
     | "USER_CANCELLED"
-    | "LOW_BATTERY"
-    | "NO_BATTERIES"
-    | "PAYMENT_TIMEOUT"
-    | "PROVIDER_ERROR"
-    | "VERIFICATION_FAILED"
-    | "UNLOCK_FAILED";
+    | "PROVIDER_DECLINED"
+  | "LOW_BATTERY"
+  | "NO_BATTERIES"
+  | "PAYMENT_TIMEOUT"
+  | "PROVIDER_ERROR"
+  | "VERIFICATION_FAILED"
+  | "UNLOCK_FAILED";
   message?: string;
   transactionId?: string;
   battery_id?: string;
@@ -71,46 +72,34 @@ function mapBackendStatusToUi(status?: StatusResponse["status"]): UIState {
   }
 }
 
-function friendlyError(reason?: StatusResponse["reason_code"], fallback?: string) {
-  switch (reason) {
-    case "STATION_OFFLINE":
-      return "Station-kan ma shaqeynayo";
-    case "NO_BATTERIES":
-      return "Ma jiro battery diyaar ah";
-    case "LOW_BATTERY":
-      return "Battery-yadu wali way dallacayaan";
-    case "USER_CANCELLED":
-      return "Waad joojisay bixinta. Lacag lagama jarin.";
-    case "INSUFFICIENT_FUNDS":
-      return "Haraaga kuma filna.";
-    default:
-      return fallback || "Wax khalad ah ayaa dhacay. Fadlan mar kale isku day.";
-  }
-}
+const ERROR_MAP: Record<string, Record<string, string>> = {
+  precheck: {
+    STATION_OFFLINE: "Station-kan ma shaqeynayo",
+    NO_BATTERIES: "Ma jiro battery diyaar ah",
+    LOW_BATTERY: "Battery-yadu wali way dallacayaan",
+  },
+  payment: {
+    USER_CANCELLED: "Waad joojisay bixinta",
+    PROVIDER_DECLINED: "Waad joojisay bixinta",
+    INSUFFICIENT_FUNDS: "Haraaga kuma filna",
+    PAYMENT_TIMEOUT: "Waqtiga bixintu wuu dhammaaday",
+    PROVIDER_ERROR: "Cilad ayaa ka jirta bixinta",
+  },
+};
 
 function stageAwareMessage(
   stage?: StatusResponse["stage"],
   reason?: StatusResponse["reason_code"],
   fallback?: string,
 ) {
-  if (stage === "precheck") {
-    if (reason === "STATION_OFFLINE") return "Station-kan ma shaqeynayo";
-    if (reason === "NO_BATTERIES") return "Ma jiro battery diyaar ah";
-    if (reason === "LOW_BATTERY") return "Battery-yadu wali way dallacayaan";
-  }
-
-  if (stage === "payment") {
-    if (reason === "USER_CANCELLED") return "Waad joojisay bixinta";
-    if (reason === "INSUFFICIENT_FUNDS") return "Haraaga kuma filna";
-    if (reason === "PAYMENT_TIMEOUT") return "Waqtiga bixintu wuu dhammaaday";
-    if (reason === "PROVIDER_ERROR") return "Cilad ayaa ka jirta bixinta";
-  }
-
   if (stage === "delivery" || stage === "unlock" || stage === "verification" || stage === "capture") {
     return "Lacagta waa la helay, fadlan sug...";
   }
 
-  return friendlyError(reason, fallback);
+  const fromMap = stage && reason ? ERROR_MAP[stage]?.[reason] : undefined;
+  if (fromMap) return fromMap;
+  if (fallback) return fallback;
+  return "Cilad ayaa dhacday, fadlan isku day mar kale";
 }
 
 export function PaymentProcessingPage() {

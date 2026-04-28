@@ -20,6 +20,7 @@ import { logError, CRITICAL_ERROR_TYPES } from "@/lib/server/alerts/log-error";
 import { getAvailableBattery } from "@/lib/server/payment/heycharge";
 import { reserveBattery } from "@/lib/server/payment/battery-lock";
 import { getStationConfigByCode } from "@/lib/server/station-config";
+import type { PaymentReasonCode } from "@/lib/server/payment/response";
 
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 const PROCESSING_TIMEOUT_MS = 30_000;
@@ -40,19 +41,9 @@ export type PaymentStatusResponse = {
   | "captured"
   | "partial_success"
   | "failed";
-  reason_code?:
-  | "USER_CANCELLED"
-  | "INSUFFICIENT_FUNDS"
-  | "PROVIDER_DECLINED"
-  | "PROVIDER_ERROR"
-  | "TIMEOUT"
-  | "UNLOCK_FAILED"
-  | "UNLOCK_TIMEOUT"
-  | "VERIFICATION_FAILED"
-  | "SLA_BREACH"
-  | "INVALID_INITIAL_STATE"
-  | "STATION_OFFLINE";
+  reason_code?: PaymentReasonCode;
   stage?: PaymentStage | "system";
+  fault?: "user" | "system";
   unlockStarted?: boolean;
   recovered?: boolean;
   error?: string;
@@ -69,13 +60,16 @@ function toReasonCode(
     case "PROVIDER_DECLINED":
     case "PROVIDER_ERROR":
     case "TIMEOUT":
+      return "PAYMENT_TIMEOUT";
+    case "PAYMENT_TIMEOUT":
     case "UNLOCK_FAILED":
     case "UNLOCK_TIMEOUT":
     case "VERIFICATION_FAILED":
+    case "VERIFICATION_TIMEOUT":
     case "SLA_BREACH":
     case "INVALID_INITIAL_STATE":
     case "STATION_OFFLINE":
-      return code as PaymentStatusResponse["reason_code"];
+      return code as PaymentReasonCode;
     default:
       return undefined;
   }
@@ -99,7 +93,7 @@ function inferStage(
     case "INSUFFICIENT_FUNDS":
     case "PROVIDER_DECLINED":
     case "PROVIDER_ERROR":
-    case "TIMEOUT":
+    case "PAYMENT_TIMEOUT":
     case "STATION_OFFLINE":
       return "payment";
     case "UNLOCK_FAILED":
@@ -153,13 +147,19 @@ function buildStatusResponse(
         stage: "system",
         recovered,
         error: "System consistency check failed",
+        fault: "system",
       };
     }
+
+    const isUserFault =
+      reasonCode === "USER_CANCELLED" ||
+      reasonCode === "INSUFFICIENT_FUNDS";
 
     return {
       status: isPartialSuccess ? "partial_success" : "failed",
       reason_code: reasonCode,
       stage,
+      fault: isUserFault ? "user" : "system",
       recovered,
       error:
         String(transaction.failureReason || "").trim() ||
@@ -401,7 +401,7 @@ async function handleConfirmRequiredStatus(
     const elapsedMs = Date.now() - confirmRequiredAtMs;
     if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
       await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
-      return { status: "failed", reason_code: "TIMEOUT", stage: "verification" };
+      return { status: "failed", reason_code: "VERIFICATION_TIMEOUT", stage: "verification" };
     }
     return { status: "confirm_required" };
   }
@@ -415,7 +415,7 @@ async function handleConfirmRequiredStatus(
   const elapsedMs = Date.now() - confirmRequiredAtMs;
   if (elapsedMs >= CONFIRM_REQUIRED_TIMEOUT_MS) {
     await cancelHold(transaction.id, "Confirmation timed out (final verification failed)");
-    return { status: "failed", reason_code: "TIMEOUT", stage: "verification" };
+    return { status: "failed", reason_code: "VERIFICATION_TIMEOUT", stage: "verification" };
   }
 
   return { status: "confirm_required" };
@@ -467,11 +467,11 @@ async function performProviderReconciliation(
       const status = await completePhase2Transaction({
         id: transactionId,
         status: "failed",
-        failureReason: "TIMEOUT",
+        failureReason: "PAYMENT_TIMEOUT",
         failureStage: "payment",
       });
 
-      return { status, reason_code: "TIMEOUT", stage: "payment" };
+      return { status, reason_code: "PAYMENT_TIMEOUT", stage: "payment" };
     }
   }
 
