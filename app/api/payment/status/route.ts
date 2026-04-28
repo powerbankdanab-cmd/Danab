@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { isHttpError } from "@/lib/server/payment/errors";
 import { paymentFailed } from "@/lib/server/payment/response";
-import { getProviderDrivenPaymentStatus } from "@/lib/server/payment/status";
+import { reconcileTransactionStatus } from "@/lib/server/payment/status";
 
 export async function GET(request: NextRequest) {
   try {
@@ -22,7 +22,7 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const payload = await getProviderDrivenPaymentStatus(transactionId);
+    const payload = await reconcileTransactionStatus(transactionId);
     return NextResponse.json(payload);
   } catch (error) {
     if (

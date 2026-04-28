@@ -25,6 +25,7 @@ import type { PaymentReasonCode } from "@/lib/server/payment/response";
 const PAYMENT_PENDING_TIMEOUT_MS = 3 * 60_000;
 const PROCESSING_TIMEOUT_MS = 30_000;
 const CONFIRM_REQUIRED_TIMEOUT_MS = 120_000;
+const UNLOCK_RESUME_AFTER_MS = 30_000;
 
 export type PaymentStage = "payment" | "unlock" | "verification" | "capture" | "system";
 
@@ -234,18 +235,15 @@ export async function triggerUnlockIfNeeded(
     console.error("unlock_max_retries_exceeded", { transactionId });
     return { started: false, reason: "MAX_RETRIES_EXCEEDED" };
   }
+  if (result === "RATE_LIMITED") {
+    return { started: false, reason: "RATE_LIMITED" };
+  }
 
   // Fetch the fresh transaction record
   const refreshed = await getPaymentTransaction(transactionId);
   if (!refreshed) return { started: false, reason: "NOT_FOUND" };
 
-  if (result === "ALREADY_STARTED") {
-    return {
-      started: true,
-      attempt: refreshed.unlockRetryCount || 0,
-      reason: "ALREADY_STARTED"
-    };
-  }
+  const wasAlreadyStarted = result === "ALREADY_STARTED";
 
   // 1.5. Station Health Invariant: Don't unlock if station is dead
   if (refreshed.station) {
@@ -291,7 +289,8 @@ export async function triggerUnlockIfNeeded(
 
     return {
       started: true,
-      attempt: refreshed.unlockRetryCount || 1
+      attempt: refreshed.unlockRetryCount || 1,
+      reason: wasAlreadyStarted ? "RESUMED_ALREADY_STARTED" : undefined,
     };
   } catch (error) {
     await logError({
@@ -345,11 +344,22 @@ export async function reconcileTransactionStatus(
          to: "held",
          patch: { heldAt: Date.now() },
        });
+       await triggerUnlockIfNeeded(transaction.id);
        const updated = await getPaymentTransaction(transactionId);
        return buildStatusResponse(updated || transaction);
      } catch (e) {
        // Conflict or error
      }
+  }
+
+  if (transaction.status === "held" && !transaction.unlockCompleted && !transaction.unlockFailed) {
+    const lastAttemptAt = toMillis(transaction.lastUnlockAttemptAt) ?? 0;
+    const shouldResume = !transaction.unlockStarted || Date.now() - lastAttemptAt > UNLOCK_RESUME_AFTER_MS;
+    if (shouldResume) {
+      await triggerUnlockIfNeeded(transaction.id);
+      const updated = await getPaymentTransaction(transactionId);
+      return buildStatusResponse(updated || transaction);
+    }
   }
 
   return buildStatusResponse(transaction);

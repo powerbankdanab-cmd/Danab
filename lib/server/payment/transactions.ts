@@ -2,6 +2,11 @@ import { Timestamp } from "firebase-admin/firestore";
 
 import { getDb } from "@/lib/server/firebase-admin";
 import { HttpError } from "@/lib/server/payment/errors";
+import {
+  auditPatchFromTransactionPatch,
+  recordPaymentAuditEvent,
+  updatePaymentAudit,
+} from "@/lib/server/payment/audit";
 
 export const PAYMENT_TRANSACTIONS_COLLECTION = "transactions";
 
@@ -17,11 +22,13 @@ export type MinimalTransactionRecord = {
   updatedAt: Date | Timestamp | number;
 };
 
-export function toMillis(val: any): number | null {
+export function toMillis(val: unknown): number | null {
   if (val === null || val === undefined) return null;
   if (typeof val === "number") return val;
   if (val instanceof Date) return val.getTime();
-  if (val && typeof val.toMillis === "function") return val.toMillis();
+  if (typeof val === "object" && "toMillis" in val && typeof val.toMillis === "function") {
+    return val.toMillis();
+  }
   return null;
 }
 
@@ -143,6 +150,16 @@ export async function createMinimalTransaction(input: {
     updatedAtTs: Timestamp.now(),
   });
 
+  await updatePaymentAudit(docRef.id, {
+    phone: input.phone,
+    amount: input.amount,
+    stationCode: input.station,
+    status: record.status,
+    outcome: "pending_payment",
+    unlockStarted: false,
+    createdAt: now,
+  });
+
   return {
     id: docRef.id,
     record,
@@ -160,7 +177,7 @@ export async function createOrGetPaymentTransaction(input: {
   const now = Date.now();
   const nowTs = Timestamp.now();
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (snap.exists) {
       const existing = snap.data() as PaymentTransactionRecord;
@@ -188,6 +205,21 @@ export async function createOrGetPaymentTransaction(input: {
 
     return { created: true, record };
   });
+
+  if (result.created) {
+    await updatePaymentAudit(input.id, {
+      phone: input.phone,
+      amount: input.amount,
+      stationCode: input.station,
+      status: result.record.status,
+      outcome: "initiated",
+      unlockStarted: false,
+      rentalCreated: false,
+      createdAt: now,
+    });
+  }
+
+  return result;
 }
 
 export async function getPaymentTransaction(
@@ -217,6 +249,8 @@ export async function patchPhase2Transaction(input: {
       },
       { merge: true },
     );
+
+  await updatePaymentAudit(input.id, auditPatchFromTransactionPatch(input.patch));
 }
 
 export async function completePhase2Transaction(input: {
@@ -228,7 +262,7 @@ export async function completePhase2Transaction(input: {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(input.id);
 
-  return db.runTransaction(async (tx) => {
+  const status = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) {
       throw new HttpError(404, "Transaction record not found", {
@@ -258,6 +292,19 @@ export async function completePhase2Transaction(input: {
 
     return input.status;
   });
+
+  await updatePaymentAudit(input.id, {
+    status,
+    outcome: summarizePhase2Status(status),
+    failureReason: input.failureReason,
+    failureStage: input.failureStage,
+  });
+
+  return status;
+}
+
+function summarizePhase2Status(status: "paid" | "failed") {
+  return status === "failed" ? "failed" : "paid";
 }
 
 export async function ensurePaymentTransactionState(
@@ -286,7 +333,7 @@ export async function markTransactionCancelPending(id: string, reason: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) return;
     const current = snap.data() as PaymentTransactionRecord;
@@ -301,6 +348,14 @@ export async function markTransactionCancelPending(id: string, reason: string) {
       updatedAtTs: Timestamp.now(),
     });
   });
+
+  await updatePaymentAudit(id, {
+    status: "cancel_pending",
+    outcome: "failed",
+    failureReason: reason,
+  });
+
+  return result;
 }
 
 export async function transitionPaymentTransactionState(input: {
@@ -312,7 +367,7 @@ export async function transitionPaymentTransactionState(input: {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(input.id);
 
-  return db.runTransaction(async (tx) => {
+  const updated = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) {
       throw new HttpError(404, "Transaction record not found", {
@@ -343,13 +398,20 @@ export async function transitionPaymentTransactionState(input: {
       ...(nextDoc as JsonObject),
     } as PaymentTransactionRecord;
   });
+
+  await updatePaymentAudit(input.id, auditPatchFromTransactionPatch({
+    ...input.patch,
+    status: input.to,
+  }));
+
+  return updated;
 }
 
 export async function markUnlockStarted(id: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
@@ -391,13 +453,22 @@ export async function markUnlockStarted(id: string) {
 
     return result;
   });
+
+  if (result === "SUCCESS" || result === "ALREADY_STARTED") {
+    await updatePaymentAudit(id, {
+      unlockStarted: true,
+      lastUnlockAttemptAt: Date.now(),
+    });
+  }
+
+  return result;
 }
 
 export async function markCaptureAttempted(id: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
@@ -413,13 +484,22 @@ export async function markCaptureAttempted(id: string) {
 
     return true;
   });
+
+  if (result) {
+    await updatePaymentAudit(id, {
+      captureAttempted: true,
+      captureAttemptedAt: Date.now(),
+    });
+  }
+
+  return result;
 }
 
 export async function markUnlockCompleted(id: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
@@ -432,13 +512,22 @@ export async function markUnlockCompleted(id: string) {
 
     return true;
   });
+
+  if (result) {
+    await updatePaymentAudit(id, {
+      unlockCompleted: true,
+      unlockFailed: false,
+    });
+  }
+
+  return result;
 }
 
 export async function markUnlockFailed(id: string, reason: string) {
   const db = getDb();
   const docRef = db.collection(PAYMENT_TRANSACTIONS_COLLECTION).doc(id);
 
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) throw new HttpError(404, "Transaction not found");
 
@@ -451,6 +540,15 @@ export async function markUnlockFailed(id: string, reason: string) {
 
     return true;
   });
+
+  if (result) {
+    await updatePaymentAudit(id, {
+      unlockFailed: true,
+      failureReason: reason,
+    });
+  }
+
+  return result;
 }
 
 export async function patchPaymentTransaction(input: {
@@ -468,6 +566,8 @@ export async function patchPaymentTransaction(input: {
       },
       { merge: true },
     );
+
+  await updatePaymentAudit(input.id, auditPatchFromTransactionPatch(input.patch));
 }
 
 export type RecoveryFence = {
@@ -981,12 +1081,7 @@ export async function logTransactionEvent(
 
       if (isTerminal && !alreadyTerminal) {
         updatePatch.finalStep = event;
-        updatePatch.processingTimeMs = Date.now() - (
-          typeof data.createdAt === "number" ? data.createdAt :
-            (data.createdAt as any)?.toMillis ? (data.createdAt as any).toMillis() :
-              (data.createdAt as any)?.seconds ? (data.createdAt as any).seconds * 1000 :
-                Date.now()
-        );
+        updatePatch.processingTimeMs = Date.now() - (toMillis(data.createdAt) ?? Date.now());
       } else if (!alreadyTerminal) {
         // Only update progress if we haven't reached a terminal state yet
         updatePatch.finalStep = event;
@@ -994,6 +1089,8 @@ export async function logTransactionEvent(
 
       tx.update(txRef, updatePatch);
     });
+
+    await recordPaymentAuditEvent(transactionId, event, metadata, level);
   } catch (error) {
     console.error(`[LOG_EVENT_FAILED] Tx: ${transactionId}, Event: ${event}:`, error);
   }

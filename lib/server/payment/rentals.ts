@@ -1,6 +1,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 
 import { getDb } from "@/lib/server/firebase-admin";
+import { updatePaymentAudit } from "@/lib/server/payment/audit";
 import { normalizeBatteryId } from "@/lib/server/payment/battery-id";
 import {
   BATTERY_STATE_COLLECTION,
@@ -196,6 +197,22 @@ export async function createRental(params: {
     });
   });
 
+  await updatePaymentAudit(params.transactionId, {
+    rentalId,
+    rentalCreated: true,
+    rentalStatus: "active",
+    phone: params.phone,
+    stationCode: params.stationId,
+    slotId: params.slotId,
+    batteryId: normalizedBatteryId,
+    imei: params.imei,
+    amount: params.amount,
+    providerIssuerRef: params.issuerTransactionId,
+    providerReferenceId: params.referenceId,
+    startedAt: now,
+    dueAt: now + RENTAL_DURATION_MS,
+  });
+
   return rentalId;
 }
 
@@ -242,7 +259,7 @@ export async function markRentalReturned(params: {
   if (params.currentState !== "present") return;
 
   let shouldLogMismatch = false;
-  let logMismatchData: any = null;
+  let logMismatchData: Record<string, unknown> | null = null;
   let shouldLogSuccess = false;
   let transactionIdToLog: string | null = null;
   let rentalIdToLog: string | null = null;
@@ -303,7 +320,7 @@ export async function markRentalReturned(params: {
     }
 
     // 5. TIME-BASED & COUNT-BASED DEBOUNCING
-    let firstSeenAt = batteryData.presentSince?.toMillis ? batteryData.presentSince.toMillis() : batteryData.presentSince;
+    const firstSeenAt = batteryData.presentSince?.toMillis ? batteryData.presentSince.toMillis() : batteryData.presentSince;
 
     // First detection: Initialize stability window timer
     if (!firstSeenAt) {
@@ -354,7 +371,7 @@ export async function markRentalReturned(params: {
   });
 
   // 7. Side Effects (Outside transaction to prevent duplicates on retry)
-  if (shouldLogMismatch && transactionIdToLog) {
+  if (shouldLogMismatch && transactionIdToLog && logMismatchData) {
     await logTransactionEvent(transactionIdToLog, "RETURN_REJECTED_OWNERSHIP_MISMATCH", logMismatchData, "IMPORTANT");
   }
 
@@ -365,6 +382,13 @@ export async function markRentalReturned(params: {
       stationId: params.returnStationId,
       durationMs: now - rentalStartedAt,
     }, "IMPORTANT");
+    await updatePaymentAudit(transactionIdToLog, {
+      rentalId: rentalIdToLog,
+      rentalStatus: "returned",
+      returnedAt: now,
+      returnStationId: params.returnStationId,
+      returnDurationMs: now - rentalStartedAt,
+    });
     console.info(`[RENTAL_RETURNED] Rental: ${rentalIdToLog}, Battery: ${normalizedBatteryId}`);
   }
 }

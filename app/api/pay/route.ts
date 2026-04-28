@@ -4,10 +4,8 @@ import {
   createMinimalTransaction,
   patchPhase2Transaction,
   logTransactionEvent,
-  getPaymentTransaction,
 } from "@/lib/server/payment/transactions";
 import {
-  classifyWaafiPaymentStatus,
   extractWaafiIds,
   requestWaafiPreauthorization,
   detectFailureReason,
@@ -70,6 +68,7 @@ function parseAndValidateBody(body: PaymentRequestBody) {
 
 export async function POST(request: NextRequest) {
   let body: PaymentRequestBody;
+  let transactionId: string | null = null;
 
   try {
     body = (await request.json()) as PaymentRequestBody;
@@ -133,6 +132,7 @@ export async function POST(request: NextRequest) {
       amount: parsed.amount,
       station: parsed.stationCode || undefined,
     });
+    transactionId = transaction.id;
 
     await logTransactionEvent(transaction.id, "PAYMENT_INITIATED", {
       phone: parsed.phone,
@@ -359,14 +359,34 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("WAAFI_PREAUTH_EXCEPTION", error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (transactionId) {
+      await patchPhase2Transaction({
+        id: transactionId,
+        patch: {
+          status: "failed",
+          failureReason: "PROVIDER_ERROR",
+          failureStage: "payment",
+          lastProviderError: errorMessage,
+        },
+      });
+
+      await logTransactionEvent(transactionId, "WAAFI_PREAUTH_EXCEPTION", {
+        phone: parsed.phone,
+        amount: parsed.amount,
+        error: errorMessage,
+      }, "CRITICAL");
+    }
 
     // logError is async but we don't necessarily need to await it before returning 502, 
     // though it's safer to ensure it finishes.
     await logError({
       type: "PROVIDER_REQUEST_FAILED",
+      transactionId: transactionId || undefined,
       message: "Exception during Waafi preauth request",
       metadata: {
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
         phone: parsed.phone,
         amount: parsed.amount
       }
