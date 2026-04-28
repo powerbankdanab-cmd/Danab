@@ -19,7 +19,6 @@ import {
 } from "@/lib/server/payment/status";
 import { logError } from "@/lib/server/alerts/log-error";
 import { paymentFailed } from "@/lib/server/payment/response";
-import { checkUserRestrictions } from "@/lib/server/payment/rentals";
 import { getStationConfigByCode } from "@/lib/server/station-config";
 
 type PaymentRequestBody = {
@@ -99,20 +98,6 @@ export async function POST(request: NextRequest) {
         fault: "user",
       },
       400,
-    );
-  }
-
-  const restriction = await checkUserRestrictions(parsed.phone);
-  if (restriction.restricted) {
-    return paymentFailed(
-      {
-        status: "failed",
-        stage: "precheck",
-        reason_code: "PROVIDER_ERROR",
-        error: "Battery hore ayaa lambarkaan kugu maqan, looma ogola mid kale.",
-        fault: "user",
-      },
-      403,
     );
   }
 
