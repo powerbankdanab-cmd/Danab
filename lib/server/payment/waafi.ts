@@ -291,6 +291,7 @@ export function classifyWaafiPaymentStatus(
     state === "processing" ||
     state === "accepted" ||
     state === "pending_approval" ||
+    state === "forapproval" ||
     message.includes("pending") ||
     message.includes("processing") ||
     message.includes("accepted") ||

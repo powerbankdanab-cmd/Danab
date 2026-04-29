@@ -166,9 +166,8 @@ export async function POST(request: NextRequest) {
       failureReason === "PROVIDER_DECLINED";
 
     const indicatesHold =
-      providerResponse?.responseCode === 2001 ||
-      providerResponse?.params?.state === "APPROVED" ||
-      providerResponse?.params?.state === "FORAPPROVAL";
+      (providerResponse?.responseCode === 2001 || providerResponse?.responseCode === "2001") &&
+      providerResponse?.params?.state === "APPROVED";
 
     const hasTransactionId = !!providerIds.transactionId;
 
