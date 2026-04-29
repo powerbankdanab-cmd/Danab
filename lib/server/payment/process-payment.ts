@@ -1602,7 +1602,7 @@ export async function performEjectionAndVerification(input: {
        message: "MAX_HARDWARE_RETRIES_EXCEEDED: Capping resume attempts to prevent infinite loop.",
      });
      await markUnlockFailed(idempotencyKey, "Maximum hardware resume attempts exceeded");
-     await cancelHold(transactionId, "Hardware flow failed multiple resume attempts");
+     await cancelHold(idempotencyKey, "Hardware flow failed multiple resume attempts");
      return;
   }
 
@@ -1765,8 +1765,7 @@ export async function performEjectionAndVerification(input: {
       }, "CRITICAL");
     }
     await markUnlockFailed(idempotencyKey, `Ejection not verified: ${failureNote}`);
-    await cancelHold(transactionId, "Battery ejection not verified");
-    await markTransactionCancelPending(idempotencyKey, `Ejection not verified: ${failureNote}`);
+    await cancelHold(idempotencyKey, "Battery ejection not verified");
 
     throw new HttpError(502, "Battery could not be released. Payment hold was cancelled.", { transactionId });
   }

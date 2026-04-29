@@ -232,6 +232,16 @@ export function getWaafiLifecycleState(waafiResponse: WaafiResponse): string {
     .toUpperCase();
 }
 
+export function isWaafiPaymentSuccessful(waafiResponse: WaafiResponse): boolean {
+  const code = String(waafiResponse.responseCode || "").trim();
+  const state = getWaafiLifecycleState(waafiResponse);
+  
+  const isApprovedCode = code === "2001";
+  const isSuccessState = state === "APPROVED" || state === "SUCCESS" || state === "COMMITTED";
+  
+  return isApprovedCode && isSuccessState;
+}
+
 export function isWaafiCaptured(waafiResponse: WaafiResponse): boolean {
   const state = getWaafiLifecycleState(waafiResponse);
   return state === "APPROVED" || state === "COMMITTED" || state === "SUCCESS";
@@ -384,7 +394,9 @@ export function detectFailureReason(raw: any): "USER_CANCELLED" | "INSUFFICIENT_
     normalized.includes("dismiss") ||
     normalized.includes("abort") ||
     normalized.includes("user") ||
-    normalized.includes("revers")
+    normalized.includes("revers") ||
+    normalized.includes("unable to send push") ||
+    normalized.includes("e10205")
   ) {
     return "USER_CANCELLED";
   }

@@ -7,8 +7,9 @@ import {
 } from "@/lib/server/payment/transactions";
 import {
   extractWaafiIds,
-  requestWaafiPreauthorization,
+  requestWaafiDirectPayment,
   detectFailureReason,
+  isWaafiPaymentSuccessful,
 } from "@/lib/server/payment/waafi";
 import { 
   ensureDeliveryContext, 
@@ -139,19 +140,48 @@ export async function POST(request: NextRequest) {
       amount: parsed.amount,
     }, "IMPORTANT");
 
-    await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_REQUEST", {
+    // 1.5. Inventory Pre-Check Gate: Don't show PIN pop if station is empty or low
+    const delivery = await ensureDeliveryContext({
+      id: transaction.id,
+      station: parsed.stationCode,
+      phone: parsed.phone,
+      status: "pending_payment",
+    });
+
+    if (!delivery) {
+      await patchPhase2Transaction({
+        id: transaction.id,
+        patch: {
+          status: "failed",
+          failureReason: "STATION_EMPTY_OR_LOW",
+          failureStage: "precheck",
+        },
+      });
+      return paymentFailed(
+        {
+          status: "failed",
+          stage: "precheck",
+          reason_code: "STATION_OFFLINE",
+          error: "No charged batteries available at this station. Please try again later.",
+          fault: "system",
+        },
+        409,
+      );
+    }
+
+    await logTransactionEvent(transaction.id, "WAAFI_PURCHASE_REQUEST", {
       phone: parsed.phone,
       amount: parsed.amount,
     }, "IMPORTANT");
 
-    const providerResponse = await requestWaafiPreauthorization({
+    const providerResponse = await requestWaafiDirectPayment({
       phoneNumber: parsed.phone.replace(/\D/g, ""),
       amount: parsed.amount,
       referenceId: transaction.id,
     });
     const providerIds = extractWaafiIds(providerResponse);
 
-    await logTransactionEvent(transaction.id, "WAAFI_PREAUTH_RESPONSE", {
+    await logTransactionEvent(transaction.id, "WAAFI_PURCHASE_RESPONSE", {
       phone: parsed.phone,
       amount: parsed.amount,
       providerResponse,
@@ -165,128 +195,116 @@ export async function POST(request: NextRequest) {
       failureReason === "INSUFFICIENT_FUNDS" ||
       failureReason === "PROVIDER_DECLINED";
 
-    const indicatesHold =
-      (providerResponse?.responseCode === 2001 || providerResponse?.responseCode === "2001") &&
-      providerResponse?.params?.state === "APPROVED";
-
+    const isSuccessful = isWaafiPaymentSuccessful(providerResponse);
     const hasTransactionId = !!providerIds.transactionId;
 
-    if (indicatesHold && hasTransactionId) {
+    if (isSuccessful && hasTransactionId) {
       await patchPhase2Transaction({
         id: transaction.id,
         patch: {
-          status: "held",
+          status: "paid", // Direct payment successful
           providerRef: providerIds.transactionId,
-          heldAt: Date.now(),
+          paidAt: Date.now(),
           unlockStarted: false,
         },
       });
 
-      await logTransactionEvent(transaction.id, "PROVIDER_HOLD_DETECTED", {
+      await logTransactionEvent(transaction.id, "PROVIDER_PAYMENT_DETECTED", {
         phone: parsed.phone,
         amount: parsed.amount,
         providerRef: providerIds.transactionId,
       }, "IMPORTANT");
 
-      // Eagerly acquire delivery context if we have a stationCode
-      if (parsed.stationCode) {
-        const delivery = await ensureDeliveryContext({
-          id: transaction.id,
-          station: parsed.stationCode,
-          phone: parsed.phone,
-          status: "held",
-        });
-
-        // Immediate Execution Contract: Trigger unlock right away
-        if (delivery) {
-          const unlockResult = await triggerUnlockIfNeeded(transaction.id);
-          if (!unlockResult.started) {
-            await logTransactionEvent(transaction.id, "UNLOCK_TRIGGER_SKIPPED", {
-              reason: unlockResult.reason,
-              attempt: unlockResult.attempt,
-            }, "IMPORTANT");
-          }
-        }
+      // Trigger unlock immediately
+      const unlockResult = await triggerUnlockIfNeeded(transaction.id);
+      if (!unlockResult.started) {
+        await logTransactionEvent(transaction.id, "UNLOCK_TRIGGER_SKIPPED", {
+          reason: unlockResult.reason,
+          attempt: unlockResult.attempt,
+        }, "IMPORTANT");
       }
 
       return NextResponse.json({
         transactionId: transaction.id,
-        status: "held",
+        status: "paid",
       });
     }
 
-    if (!hasTransactionId) {
-      if (hasStrongFailureSignal) {
-        console.log("EXPLICIT_FAILURE_DETECTED:", {
-          transactionId: transaction.id,
+    // ── Failure or Uncertain Path ───────────────────────────────
+    if (hasStrongFailureSignal) {
+      console.log("EXPLICIT_FAILURE_DETECTED:", {
+        transactionId: transaction.id,
+        failureReason,
+      });
+
+      await logTransactionEvent(transaction.id, "EXPLICIT_FAILURE_DETECTED", {
+        phone: parsed.phone,
+        amount: parsed.amount,
+        response: providerResponse,
+      }, "CRITICAL");
+
+      await patchPhase2Transaction({
+        id: transaction.id,
+        patch: {
+          status: "failed",
           failureReason,
-        });
+          providerRef: providerIds.transactionId || null,
+        },
+      });
 
-        await logTransactionEvent(transaction.id, "EXPLICIT_FAILURE_DETECTED", {
-          phone: parsed.phone,
-          amount: parsed.amount,
-          response: providerResponse,
-        }, "CRITICAL");
+      await logError({
+        type: "PAYMENT_FAILED",
+        transactionId: transaction.id,
+        message: "Provider explicit payment failure",
+        metadata: {
+          stage: "payment",
+          reason_code: failureReason,
+          fault:
+            failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
+              ? "user"
+              : "system",
+        },
+      });
 
-        await patchPhase2Transaction({
-          id: transaction.id,
-          patch: {
-            status: "failed",
-            failureReason,
-          },
-        });
+      return paymentFailed(
+        {
+          status: "failed",
+          reason_code: failureReason,
+          stage: "payment",
+          fault:
+            failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
+              ? "user"
+              : "system",
+          error:
+            failureReason === "INSUFFICIENT_FUNDS"
+              ? "Insufficient balance"
+              : failureReason === "PROVIDER_DECLINED"
+                ? "Payment declined"
+                : "Payment cancelled by user",
+        },
+        409,
+      );
+    }
 
-        await logError({
-          type: "PAYMENT_FAILED",
-          transactionId: transaction.id,
-          message: "Provider explicit payment failure",
-          metadata: {
-            stage: "payment",
-            reason_code: failureReason,
-            fault:
-              failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
-                ? "user"
-                : "system",
-          },
-        });
+    if (!hasTransactionId) {
 
-        return paymentFailed(
-          {
-            status: "failed",
-            reason_code: failureReason,
-            stage: "payment",
-            fault:
-              failureReason === "INSUFFICIENT_FUNDS" || failureReason === "USER_CANCELLED"
-                ? "user"
-                : "system",
-            error:
-              failureReason === "INSUFFICIENT_FUNDS"
-                ? "Insufficient balance"
-                : failureReason === "PROVIDER_DECLINED"
-                  ? "Payment declined"
-                  : "Payment cancelled by user",
-          },
-          409,
-        );
-      }
-
-      if (indicatesHold) {
-        console.error("HOLD_WITHOUT_TRANSACTION_ID", {
+      if (isSuccessful) {
+        console.error("PAYMENT_WITHOUT_TRANSACTION_ID", {
           providerResponse,
           transactionId: transaction.id,
         });
 
-        await logTransactionEvent(transaction.id, "UNCERTAIN_HOLD_DETECTED", {
+        await logTransactionEvent(transaction.id, "UNCERTAIN_PAYMENT_DETECTED", {
           phone: parsed.phone,
           amount: parsed.amount,
-          message: "Hold indicated but transactionId missing",
+          message: "Payment indicated but transactionId missing",
           response: providerResponse,
         }, "CRITICAL");
 
         await logError({
           type: "PROVIDER_MISSING_REF",
           transactionId: transaction.id,
-          message: "Hold likely created but transactionId missing",
+          message: "Payment likely successful but transactionId missing",
           metadata: providerResponse,
         });
 
